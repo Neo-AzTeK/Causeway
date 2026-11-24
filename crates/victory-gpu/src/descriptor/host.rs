@@ -428,6 +428,25 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
+/// Where host views of raw buffers start, in bytes
+/// (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`).
+const RAW_ALIGNMENT: u64 = 16;
+
+/// Whether the host views a structured buffer of this stride as raw.
+/// Translated shaders address buffers by byte (`element_byte` in
+/// `victory-shader`): the title reads one view by element and by byte
+/// (scalar loads), and some hosts (NVIDIA) scale accesses by byte by a
+/// structured view's stride, which reads other elements.
+fn raw_view(stride: u32) -> bool {
+    stride > 0 && stride.is_multiple_of(4)
+}
+
+/// What the start of a host view of `element`-byte elements (in a view of
+/// structure `stride`) must be a multiple of in its buffer.
+fn alignment(element: u64, stride: u32) -> u64 {
+    if raw_view(stride) { RAW_ALIGNMENT } else { element }
+}
+
 /// A buffer view of title memory at `address` on its host copy: the first
 /// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
@@ -450,7 +469,8 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
-/// address and length, and the bytes of an element.
+/// address and length, and what its start must be a multiple of in the
+/// host copy.
 pub(crate) fn buffer_view(view: &View) -> Option<(u64, u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
@@ -478,7 +498,7 @@ pub(crate) fn buffer_view(view: &View) -> Option<(u64, u64, u64)> {
     Some((
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
-        element,
+        alignment(element, buffer.StructureByteStride),
     ))
 }
 
@@ -497,7 +517,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64, u64)> {
     Some((
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
-        element,
+        alignment(element, buffer.StructureByteStride),
     ))
 }
 
@@ -505,31 +525,42 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64, u64)> {
 type Kept = Option<ID3D12Resource>;
 
 /// The host copy of title memory at `address` (`len` bytes) for a view of
-/// `count` elements of `element` bytes from the `first` on, and the first
-/// one's index in that copy. Host views start on a whole element of the
-/// buffer; where the memory's copy does not put this one on one (the title
-/// may view memory from any address), a copy that does.
+/// `count` elements of `element` bytes from the `first` on, and the byte the
+/// first one is at in that copy: a multiple of `align`. Where the memory's
+/// copy does not put it on one (the title may view memory from any address),
+/// a copy that does.
 fn element_copy(
     address: u64,
     len: u64,
     element: u64,
     first: u64,
     count: u32,
+    align: u64,
 ) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64)> {
     if element == 0 {
         once!("buffer view without an element size");
         return None;
     }
     let shadow = crate::shadow::find(address, len)?;
-    let offset = shadow.offset(address);
-    if offset.is_multiple_of(element) {
-        return Some((shadow, first + offset / element));
+    let start = address + first * element;
+    let offset = shadow.offset(start);
+    if offset.is_multiple_of(align) {
+        return Some((shadow, offset));
     }
     // The viewed range alone, as draws bring it up to date.
-    let start = address + first * element;
-    let shadow = crate::shadow::find_element(start, u64::from(count) * element, element)?;
-    let first = shadow.offset(start) / element;
-    Some((shadow, first))
+    let shadow = crate::shadow::find_element(start, u64::from(count) * element, align)?;
+    let offset = shadow.offset(start);
+    Some((shadow, offset))
+}
+
+/// The dwords of `count` structures of `stride` bytes, if a view can have
+/// that many.
+fn raw_elements(count: u32, stride: u32) -> Option<u32> {
+    let n = count.checked_mul(stride / 4);
+    if n.is_none() {
+        once!(count, stride, "structured buffer too large for a raw view");
+    }
+    n
 }
 
 fn buffer_srv(
@@ -541,9 +572,19 @@ fn buffer_srv(
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let shadow;
-    (shadow, buffer.FirstElement) =
-        element_copy(address, len, element, buffer.FirstElement, buffer.NumElements)?;
+    let (first, count, stride) =
+        (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+    let align = alignment(element, stride);
+    let (shadow, offset) = element_copy(address, len, element, first, count, align)?;
+    if raw_view(stride) {
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = offset / 4;
+        buffer.NumElements = raw_elements(count, stride)?;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    } else {
+        buffer.FirstElement = offset / element;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -573,9 +614,19 @@ fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    let shadow;
-    (shadow, buffer.FirstElement) =
-        element_copy(address, len, element, buffer.FirstElement, buffer.NumElements)?;
+    let (first, count, stride) =
+        (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+    let align = alignment(element, stride);
+    let (shadow, offset) = element_copy(address, len, element, first, count, align)?;
+    if raw_view(stride) {
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = offset / 4;
+        buffer.NumElements = raw_elements(count, stride)?;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    } else {
+        buffer.FirstElement = offset / element;
+    }
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -969,11 +1020,13 @@ mod tests {
             (desc[4], desc[6], desc[7]) = (1, 4, element);
             (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
             let view = View::Placed(false, resource, desc);
-            let (start, len, size) = buffer_view(&view).unwrap();
-            assert_eq!((start, len), (address + u64::from(element), 4 * u64::from(element)));
-            let (shadow, first) = element_copy(address, 16 * size, size, 1, 4).unwrap();
-            assert_eq!(shadow.offset(start), first * size);
-            let drawn = crate::shadow::find_element(start, len, size).unwrap();
+            let (start, len, align) = buffer_view(&view).unwrap();
+            let size = u64::from(element);
+            assert_eq!((start, len, align), (address + size, 4 * size, RAW_ALIGNMENT));
+            let (shadow, offset) = element_copy(address, 16 * size, size, 1, 4, align).unwrap();
+            assert_eq!(shadow.offset(start), offset);
+            assert!(offset.is_multiple_of(align));
+            let drawn = crate::shadow::find_element(start, len, align).unwrap();
             assert!(std::sync::Arc::ptr_eq(&shadow, &drawn));
             assert_eq!(shadow.update(start as usize, len as usize), len as usize);
             let mut data = std::ptr::null_mut();

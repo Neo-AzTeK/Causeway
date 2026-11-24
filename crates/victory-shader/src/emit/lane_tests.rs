@@ -171,6 +171,35 @@ fn the_record_count_of_a_scalar_loaded_buffer_is_the_hosts() {
 }
 
 #[test]
+fn elements_and_record_counts_are_read_through_the_raw_host_view() {
+    // A lane's element of a structured buffer, plus the record count (word 2
+    // of the descriptor). The host views it as raw.
+    let body = [
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2004,
+        0x8002_0800, // buffer_load_dword v8, v0, s[8:11], 0 idxen offset:4
+        0xBF8C_0000, // s_waitcnt 0
+        0x4A10_100A, // v_add_nc_u32 v8, s10, v8
+    ];
+    let data: Vec<u32> = (0..24).map(|n| 1000 * n).collect();
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_with(&words, ResourceType::Srv, 4, 16, false).unwrap();
+    check(&shader);
+    let view = View::Buffer {
+        data: &data,
+        stride: Stride::Raw,
+    };
+    for (label, out) in run(&shader, &[view, View::RawUav(32)]) {
+        for (lane, &x) in out[0].iter().take(8).enumerate() {
+            let element = data.get(4 * lane + 1).copied().unwrap_or(0);
+            assert_eq!(x, element + 6, "{label} lane {lane}");
+        }
+    }
+}
+
+#[test]
 fn a_second_use_of_a_reused_register_is_told_from_the_first_paths() {
     // The same flag and register again: lanes below 8 set both anew.
     let body = [

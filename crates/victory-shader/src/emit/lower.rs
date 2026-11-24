@@ -2846,11 +2846,8 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            // shortcut: raw, whatever stride the code names for the buffer.
-            // Titles read views that do not have that stride through it
-            // (constants of their menus), which an access by element breaks;
-            // hosts that scale raw accesses by a structured view's stride
-            // read other elements of the views that do have it.
+            // By byte, whatever stride the code names for the buffer: host
+            // views of raw and structured buffers are raw.
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -3060,6 +3057,8 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
+        // Bytes per record of a buffer sized in bytes.
+        let mut records = 1;
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
@@ -3078,9 +3077,13 @@ impl<'a> Lower<'a> {
                     || un.starts_with("buffer_store_format")
                 {
                     (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
                 } else {
+                    // The host view is raw: its size is in bytes.
+                    if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                        records = stride;
+                    } else if stride != 0 {
+                        return Err("a structured buffer of unknown stride");
+                    }
                     (11 | u, 0)
                 };
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
@@ -3167,7 +3170,14 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let mut n = field(self, 0);
+                if records > 1 {
+                    let size = self.s.m.i32(records);
+                    n = self.s.m.bin(c, Bin::UDiv, n, size);
+                }
+                vec![(2, n)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -3376,6 +3386,26 @@ impl<'a> Lower<'a> {
             }
             _ => Ok((0, None)),
         }
+    }
+
+    /// The byte at `off` of element `index` of a structured buffer, whose
+    /// host view is raw (`victory-gpu`'s `raw_view`): scalar and unindexed
+    /// loads address the same views by byte, which hosts scale by a
+    /// structured view's stride.
+    // shortcut: the product wraps at 2^32, where the console reads zeros.
+    fn element_byte(&mut self, src: &Source, index: V, off: V) -> Result<V, Why> {
+        if matches!(src, Source::Built { .. }) {
+            // The stride is the descriptor's own, not the one the table names.
+            return Err("a root UAV or typed root view");
+        }
+        let stride = self.used_kind(src).map_or(0, |u| u.stride);
+        if stride < 4 || !stride.is_multiple_of(4) {
+            return Err("a structured buffer of unknown stride");
+        }
+        let c = self.cur;
+        let stride = self.s.m.i32(stride);
+        let start = self.s.m.bin(c, Bin::Mul, index, stride);
+        Ok(self.s.m.bin(c, Bin::Add, start, off))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -6422,12 +6452,8 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let at = self.element_byte(src, index, off)?;
+                    (self.handle(site, src, false, (11 | u, 0))?, [at, iu, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -6505,12 +6531,9 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
+                        let at = self.element_byte(src, index, off)?;
+                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        args.extend([at, iu]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -6564,34 +6587,19 @@ impl<'a> Lower<'a> {
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
-            match index {
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
-                }
-                None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
-                }
-            }
+            let at = match index {
+                Some(index) => self.element_byte(src, index, off)?,
+                None => off,
+            };
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, iu, mask, align],
+            )
         };
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");

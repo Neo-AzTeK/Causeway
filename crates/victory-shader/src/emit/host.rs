@@ -935,11 +935,10 @@ pub enum View<'a> {
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub enum Stride {
+    /// By byte; the host views of structured buffers are too.
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes.
-    Structured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
 }
@@ -1284,29 +1283,20 @@ impl Host {
                     }
                     View::Buffer { data, stride } => {
                         let b = upload(data)?;
-                        let (format, elements, stride, flags) = match stride {
+                        let (format, elements, flags) = match stride {
                             Stride::Raw => (
                                 DXGI_FORMAT_R32_TYPELESS,
                                 data.len(),
-                                0,
                                 D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
                             Stride::Typed => (
                                 DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 data.len() / 4,
-                                0,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
-                            ),
-                            Stride::Structured(s) => (
-                                DXGI_FORMAT_UNKNOWN,
-                                data.len() * 4 / s as usize,
-                                s,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
                             Stride::Format(f, bytes) => (
                                 f,
                                 data.len() * 4 / bytes as usize,
-                                0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
                         };
@@ -1318,7 +1308,7 @@ impl Host {
                                 Buffer: D3D12_BUFFER_SRV {
                                     FirstElement: 0,
                                     NumElements: elements as u32,
-                                    StructureByteStride: stride,
+                                    StructureByteStride: 0,
                                     Flags: flags,
                                 },
                             },
