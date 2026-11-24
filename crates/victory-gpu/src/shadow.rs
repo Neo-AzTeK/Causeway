@@ -185,19 +185,26 @@ impl Shadow {
     /// title's threads write the same buffers while the GPU runs (its
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    /// records (a fence list read as -1, title+0x4e9b54a). `ranges` are all
+    /// the ones the submission declared for this copy (address, length):
+    /// overlapping ones are joined and each byte is compared once (the world
+    /// declares dozens of overlapping views of its 174 MB heap, which took
+    /// seconds a frame when compared one by one). Returns the bytes written.
+    pub(crate) fn copy_back(&self, ranges: &[(usize, usize)]) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
-        {
-            let before = &before[from - taken..to - taken];
+        let cut: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|&(address, len)| self.inside(address, len))
+            .collect();
+        for (from, to) in join(cut) {
+            let Some((taken, before)) = &mut *snapshot else {
+                break;
+            };
+            if !(*taken <= from && to <= *taken + before.len()) {
+                continue;
+            }
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -209,20 +216,13 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - *taken..at - *taken + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
+                    // takes the title's bytes in turn, and so does the
+                    // snapshot: a later look finds nothing new.
+                    if merge_gpu(title, host, old) {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
@@ -250,7 +250,7 @@ impl Shadow {
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        pending.retain(|&(a, b)| !ranges.contains(&(a, b - a)));
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -542,9 +542,65 @@ pub(crate) fn near(va: u64) -> String {
     text
 }
 
+/// `ranges` (`[from, to)`) with overlapping and touching ones joined, in
+/// order; empty ones go.
+fn join(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.retain(|&(a, b)| a < b);
+    ranges.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in ranges {
+        match joined.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => joined.push((a, b)),
+        }
+    }
+    joined
+}
+
+/// One piece after a submission: `host` is the copy now, `old` what it held
+/// before, `title` title memory now. Puts the bytes the GPU changed
+/// (`host != old`) into `title` where the title has not changed them too,
+/// and makes `host` and `old` equal to `title`. Whether `title` changed.
+fn merge_gpu(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
+    let mut changed = false;
+    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()) {
+        if *h != *o && *t != *h {
+            *t = *h;
+            changed = true;
+        }
+        *h = *t;
+        *o = *t;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Overlapping and touching ranges become one; empty ones go.
+    #[test]
+    fn ranges_are_joined() {
+        assert_eq!(join(vec![(10, 20), (0, 5), (5, 8), (15, 30), (40, 40)]), [(0, 8), (10, 30)]);
+    }
+
+    /// The GPU's bytes reach title memory unless the title changed them
+    /// too; a second look at the same piece finds nothing to do.
+    #[test]
+    fn gpu_bytes_merge_once() {
+        let mut old = vec![1u8, 2, 3, 4];
+        let mut host = vec![1u8, 9, 9, 4];
+        let mut title = vec![7u8, 2, 8, 4];
+        assert!(merge_gpu(&mut title, &mut host, &mut old));
+        assert_eq!(title, [7, 9, 9, 4]);
+        assert_eq!(host, title);
+        assert_eq!(old, title);
+        // The title writes on; nothing of the GPU's is left to put back.
+        title[0] = 5;
+        assert!(host == old);
+        assert!(!merge_gpu(&mut title, &mut host, &mut old));
+        assert_eq!(title[0], 5);
+    }
 
     /// Element-aligned copies stop at their bound, and one refused leaves
     /// room for a smaller one.

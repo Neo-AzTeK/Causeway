@@ -595,9 +595,19 @@ impl Host {
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        // Per copy, all its ranges at once.
+        let mut done: Vec<*const crate::shadow::Shadow> = Vec::new();
+        for (shadow, _, _) in &back {
+            if done.contains(&std::sync::Arc::as_ptr(shadow)) {
+                continue;
+            }
+            done.push(std::sync::Arc::as_ptr(shadow));
+            let ranges: Vec<(usize, usize)> = back
+                .iter()
+                .filter(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow))
+                .map(|&(_, a, l)| (a, l))
+                .collect();
+            let written = shadow.copy_back(&ranges);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         for list in runs {
