@@ -15,7 +15,11 @@ before working there.
   `-R Neo-AzteK/Causeway` to `gh`, whose default for a fork can be the parent.
   Use the original project (`Marvisak/VIctory`) only when the owner asks; code
   taken from it keeps its authorship and licence.
-- Do not push, comment or open PRs unless the owner asks.
+- KISS flow (owner's decision, 2026-11-24): no stacks, no PRs. A task is a
+  short branch (or worktree) off `main`; once its checks pass (below) merge it
+  into `main` directly, and push `main` to `origin` (Neo-AzteK/Causeway) after
+  each merge or at least each milestone. Never force-push, rewrite `main`, or
+  push other branches. Comment on or open PRs only when the owner asks.
 - One task per branch, small diff, no drive-by refactors or formatting
   (`cargo fmt --check` already fails on `main`).
 - Mark a deliberate simplification `// shortcut:` with its limit.
