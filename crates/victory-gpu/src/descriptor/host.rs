@@ -249,7 +249,16 @@ impl HostHeap {
         }
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                let used = taken.iter().filter(|&&t| t).count();
+                tracing::warn!(
+                    n,
+                    used,
+                    of = self.dynamic,
+                    title_slots = self.count,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
         taken[first..first + n].fill(true);
