@@ -272,6 +272,11 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            // shortcut: such a target is left out; its pipelines are refused.
+            if !crate::resource::renderable(texture) {
+                once!("render target in a format the host cannot render to");
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);

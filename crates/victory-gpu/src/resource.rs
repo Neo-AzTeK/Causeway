@@ -795,6 +795,67 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// Resource flags as the host has them.
+#[cfg(windows)]
+const TARGET: u32 = 1;
+#[cfg(windows)]
+const UNORDERED: u32 = 4;
+
+/// `flags` without the uses the host has no support for in `format`: the
+/// console renders to and writes formats a PC GPU may only sample (NVIDIA:
+/// no unordered access to B5G5R5A1, no rendering to B4G4R4A4), and the host
+/// refuses a texture that asks for one. Typeless formats are left alone:
+/// their views name the format.
+/// shortcut: what the title does through a use left out is lost; a copy in
+/// a format the host has would keep it.
+#[cfg(windows)]
+fn supported_flags(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    format: u32,
+    flags: u32,
+) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let typeless = family(format) == format && family(format + 1) == format;
+    if flags & (TARGET | UNORDERED) == 0 || typeless {
+        return flags;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: the query writes its own structure of the given size.
+    let asked = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    if asked.is_err() {
+        return flags;
+    }
+    let lacks = |use_: D3D12_FORMAT_SUPPORT1| support.Support1.0 & use_.0 == 0;
+    let mut left = flags;
+    if lacks(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) {
+        left &= !TARGET;
+    }
+    if lacks(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) {
+        left &= !UNORDERED;
+    }
+    if left != flags {
+        tracing::warn!(format, flags, left, "texture without uses the host lacks in its format");
+    }
+    left
+}
+
+/// Whether the host can render to a title texture's host copy.
+#[cfg(windows)]
+pub(crate) fn renderable(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    // SAFETY: a live resource.
+    unsafe { texture.GetDesc() }.Flags.0 as u32 & TARGET != 0
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -818,7 +879,6 @@ fn host_texture(
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
     const DEPTH: u32 = 2;
-    const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
@@ -834,9 +894,11 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    d.flags = supported_flags(&host.device, d.format, d.flags);
+    const DRAWN: u32 = TARGET | DEPTH;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let clear_value = (!clear.is_null() && d.flags & DRAWN != 0).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -948,6 +1010,15 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+    }
+    // A target the host cannot render to has no contents: title memory, which
+    // the console GPU would have written, does not hold them.
+    #[cfg(windows)]
+    if let Some(host) = &resource.host
+        && desc.flags & (TARGET | UNORDERED) != 0
+        && crate::texture::title_written(&host.texture)
+    {
+        crate::texture::host_written(std::ptr::from_ref::<Resource>(&resource).cast());
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1583,6 +1654,50 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    /// Textures of formats the host cannot render to or write (B5G5R5A1
+    /// with unordered access, B4G4R4A4 as a target: NVIDIA) still get a host
+    /// copy, and clearing one the host cannot render to leaves the device
+    /// alive.
+    #[cfg(windows)]
+    #[test]
+    fn textures_lose_the_uses_the_host_lacks() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        for (format, flags) in [(86, 5), (115, 1), (115, 5), (28, 5)] {
+            let mut desc = texture(64, 64, format, 1);
+            desc.flags = flags;
+            let mut image = null;
+            let clear = [format, 0, 0, 0, 0];
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0x4,
+                    clear.as_ptr().cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut image
+                ),
+                S_OK
+            );
+            let t = host_resource(image).unwrap_or_else(|| panic!("format {format} flags {flags}"));
+            // SAFETY: a live resource.
+            let left = unsafe { t.GetDesc() }.Flags.0 as u32;
+            assert_eq!(left, supported_flags(&host.device, format, flags));
+            assert_eq!(renderable(t), left & TARGET != 0);
+            if format == 28 {
+                assert_eq!(left, flags);
+            }
+            crate::list::tests::clear(image);
+            // SAFETY: a plain query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+            assert_eq!(resource_release(image), 0);
+        }
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,

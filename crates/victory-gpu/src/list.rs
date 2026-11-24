@@ -702,6 +702,9 @@ extern "system" fn clear_rtv(
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        if !crate::resource::renderable(texture) {
+            return;
+        }
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
@@ -1401,9 +1404,37 @@ static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// An open list and its allocator.
+    fn open_list() -> (This, This) {
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        (list, allocator)
+    }
+
+    /// Clears `image` as a render target, in a list that is not submitted.
+    #[cfg(windows)]
+    pub(crate) fn clear(image: This) {
+        let mut record = [0u64; 16];
+        let handle = record.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), image, std::ptr::null(), handle);
+        let (list, allocator) = open_list();
+        clear_rtv(list, handle, &[0.0; 4], 0, std::ptr::null());
+        let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+        assert_eq!(close(list), S_OK);
+        for o in [list, allocator] {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
