@@ -190,8 +190,7 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
-    /// Compute code that scale a raw access to such a view by its stride. (Root views
-            // are raw.) lanes: thread ids follow the host
+    /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
@@ -3044,14 +3043,14 @@ impl<'a> Lower<'a> {
             self.x
                 .res
                 .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first } if load == site => Some((d.site, first)),
+                        _ => None,
+                    })
                 })
-            })
         };
         // Or another load of the same entry: the code loads a descriptor
         // again (in a waterfall loop of its own) for its size.
