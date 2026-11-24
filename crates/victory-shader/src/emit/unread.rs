@@ -62,6 +62,9 @@ impl State {
     }
 }
 
+/// States of a block followed apart.
+const PATHS: usize = 8;
+
 struct Walk<'a, 'b> {
     x: &'b Parts<'a>,
     /// A lane mask's high dword, by its low one.
@@ -104,15 +107,17 @@ impl Walk<'_, '_> {
         let blocks = &self.x.p.blocks;
         let mut before = State::default();
         self.learn(to, n, &mut before);
-        let mut at_entry: Vec<Option<State>> = vec![None; blocks.len()];
+        let mut at_entry: Vec<Vec<State>> = vec![Vec::new(); blocks.len()];
         let first = self.enter(&before, to, n, missing);
-        at_entry[to] = Some(first);
-        let mut work = vec![to];
-        // Each block's state only loses knowledge; the limit bounds the cost.
-        let mut steps = 16 * blocks.len();
-        while let Some(b) = work.pop() {
+        at_entry[to].push(first);
+        // (Block, which of its states.) Paths stay apart up to `PATHS` states
+        // of a block: what a flag says on one tells nothing on another.
+        let mut work = vec![(to, 0)];
+        // The last state only loses knowledge; the limit bounds the cost.
+        let mut steps = 16 * PATHS * blocks.len();
+        while let Some((b, k)) = work.pop() {
             steps = steps.checked_sub(1)?;
-            let mut s = at_entry[b].clone()?;
+            let mut s = at_entry[b][k].clone();
             if s.tainted.is_empty() && !s.bits.values().any(|b| *b == Bit::Tainted) {
                 continue;
             }
@@ -140,15 +145,18 @@ impl Walk<'_, '_> {
             for t in next {
                 for (n, _) in blocks[t].preds.iter().enumerate().filter(|p| *p.1 == b) {
                     let s = self.enter(&s, t, n, &|_| false);
-                    let changed = match &mut at_entry[t] {
-                        Some(old) => old.join(&s),
-                        none => {
-                            *none = Some(s);
-                            true
-                        }
-                    };
-                    if changed && !work.contains(&t) {
-                        work.push(t);
+                    let states = &mut at_entry[t];
+                    if states.contains(&s) {
+                        continue;
+                    }
+                    if states.len() < PATHS {
+                        states.push(s);
+                    } else if !states[PATHS - 1].join(&s) {
+                        continue;
+                    }
+                    let item = (t, states.len() - 1);
+                    if !work.contains(&item) {
+                        work.push(item);
                     }
                 }
             }

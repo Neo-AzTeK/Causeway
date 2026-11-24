@@ -169,3 +169,41 @@ fn the_record_count_of_a_scalar_loaded_buffer_is_the_hosts() {
         assert_eq!(out[0][0], 23_000 + 96, "{label}");
     }
 }
+
+#[test]
+fn a_second_use_of_a_reused_register_is_told_from_the_first_paths() {
+    // The same flag and register again: lanes below 8 set both anew.
+    let body = [
+        &REUSED[..],
+        &[
+            0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> the restore
+            USE,
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7D88_0088, // v_cmp_gt_u32 vcc_lo, 8, v0
+            0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+            0xBF88_0003, // s_cbranch_execz -> the restore
+            0xBE89_03FF,
+            0x0000_00C8, // s_mov_b32 s9, 200
+            0x7E0A_02C1, // v_mov_b32 v5, -1
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0x7D84_0AC1, // v_cmp_eq_u32 vcc_lo, -1, v5
+            0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> the restore
+            USE,
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        ][..],
+    ]
+    .concat();
+    let want: Vec<u32> = (0..32)
+        .map(|l| match l {
+            0..8 => 200 + l,
+            8..16 => 100 + l,
+            _ => 0,
+        })
+        .collect();
+    for (label, got) in stored(&body) {
+        assert_eq!(got, want, "{label}");
+    }
+}
