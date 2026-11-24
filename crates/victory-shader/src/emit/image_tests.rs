@@ -24,6 +24,17 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// s0 (a texture of kind `image` at dword 0, a raw UAV at dword 8) and the
 /// table of samplers at s1; or why it does not translate.
 pub(super) fn translate(body: &[u32], image: ResourceType) -> Result<HostShader, ShaderError> {
+    translate_with(body, image, 8, 0)
+}
+
+/// [`translate`] with another view at dword 0: the dwords of its descriptor
+/// and, of a structured buffer, the stride.
+pub(super) fn translate_with(
+    body: &[u32],
+    image: ResourceType,
+    dwords: u8,
+    stride: u32,
+) -> Result<HostShader, ShaderError> {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -32,12 +43,12 @@ pub(super) fn translate(body: &[u32], image: ResourceType) -> Result<HostShader,
         user_data,
         slot: user_data,
     };
-    let range = |kind, table_offset_dwords, dwords, user_data| UsedResource {
+    let range = |kind, table_offset_dwords, dwords, stride, user_data| UsedResource {
         kind,
         root: RootType::Table,
         table_offset_dwords,
         lower_bound: 0,
-        stride: 0,
+        stride,
         dwords,
         user_data,
         slot: user_data,
@@ -48,9 +59,9 @@ pub(super) fn translate(body: &[u32], image: ResourceType) -> Result<HostShader,
         vgprs: 32,
         layout: vec![table(0), table(1)],
         used: vec![
-            range(image, 0, 8, 0),
-            range(ResourceType::Uav, 8, 4, 0),
-            range(ResourceType::Sampler, 0, 4, 1),
+            range(image, 0, dwords, stride, 0),
+            range(ResourceType::Uav, 8, 4, 0, 0),
+            range(ResourceType::Sampler, 0, 4, 0, 1),
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 2 << 1,
@@ -92,16 +103,20 @@ pub(super) fn translate(body: &[u32], image: ResourceType) -> Result<HostShader,
 /// A program that translates, `validate`d if asked (see [`translate`]).
 pub(super) fn build(body: &[u32], image: ResourceType, validate: bool) -> HostShader {
     let shader = translate(body, image).expect("translate");
-    if !validate {
-        return shader;
+    if validate {
+        check(&shader);
     }
+    shader
+}
+
+/// Has `dxil.dll` validate `shader`.
+pub(super) fn check(shader: &HostShader) {
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation failed");
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
 }
 
 /// Runs `shader` with `views` at heap indices 0.. on the hardware GPU and on

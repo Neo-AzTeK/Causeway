@@ -1,8 +1,8 @@
 //! End-to-end tests of lane masks and scalar values as each lane sees them:
 //! synthetic GFX10 programs of 32 lanes, run as in `image_tests`.
 
-use super::host::View;
-use super::image_tests::{build, run, translate};
+use super::host::{Stride, View};
+use super::image_tests::{build, check, run, translate, translate_with};
 use crate::native::ResourceType;
 
 /// Loads the raw UAV's descriptor to s[40:43] and v16 = 4 × lane.
@@ -128,4 +128,44 @@ fn a_register_reused_on_another_path_is_refused_where_lanes_from_it_read() {
         ])
         .is_err()
     );
+}
+
+#[test]
+fn the_record_count_of_a_scalar_loaded_buffer_is_the_hosts() {
+    // The last element's dword: element s10 - 1 (word 2 of the descriptor)
+    // times the stride; then plus the count itself.
+    let body = |scale: u32| {
+        [
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x810C_C10A, // s_add_i32 s12, s10, -1
+            0x930C_FF0C,
+            scale, // s_mul_i32 s12, s12, scale
+            0xF420_0344,
+            0x1800_0000, // s_buffer_load_dword s13, s[8:11], s12
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x810D_0A0D, // s_add_i32 s13, s13, s10
+            0x7E10_020D, // v_mov_b32 v8, s13
+        ]
+    };
+    let data: Vec<u32> = (0..24).map(|n| 1000 * n).collect();
+    let run_with = |body: &[u32], stride, view| {
+        let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
+        let shader = translate_with(&words, ResourceType::Srv, 4, stride).unwrap();
+        check(&shader);
+        let view = View::Buffer {
+            data: &data,
+            stride: view,
+        };
+        run(&shader, &[view, View::RawUav(32)])
+    };
+    // 6 structures of 16 bytes; 96 raw bytes, the last dword's offset 92
+    // (the load drops the low bits of 95).
+    for (label, out) in run_with(&body(16), 16, Stride::Structured(16)) {
+        assert_eq!(out[0], vec![20_000 + 6; 32], "{label}");
+    }
+    for (label, out) in run_with(&body(1)[..], 0, Stride::Raw) {
+        assert_eq!(out[0][0], 23_000 + 96, "{label}");
+    }
 }

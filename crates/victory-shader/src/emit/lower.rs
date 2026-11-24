@@ -2865,20 +2865,35 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if let Some(u) = kind.filter(|u| u.kind == ResourceType::Srv) {
+            // A structured buffer is addressed by element and byte: hosts
+            // scale a raw access to such a view by its stride.
+            let structured = u.stride >= 4 && u.stride.is_multiple_of(4);
+            let props = if structured { (12, u.stride) } else { (11, 0) };
+            let h = self.handle(site, src, false, props)?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (at, within) = if structured {
+                    // Scalar loads drop the address's low bits.
+                    let (low, n) = (self.s.m.i32(!3), self.s.m.i32(u.stride));
+                    let a = self.s.m.bin(c, Bin::And, a, low);
+                    (
+                        self.s.m.bin(c, Bin::UDiv, a, n),
+                        self.s.m.bin(c, Bin::URem, a, n),
+                    )
+                } else {
+                    (a, self.s.m.undef(self.s.t.i32))
+                };
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let al = self.s.m.i32(4);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, at, within, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -3008,6 +3023,20 @@ impl<'a> Lower<'a> {
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
+                (props, None)
+            }
+            // Read by scalar loads only: raw and structured buffers, whose
+            // stride tells them apart.
+            Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
+                let stride = match used {
+                    Some(u) if u.kind == ResourceType::Srv => u.stride,
+                    _ => return Err("a scalar memory read as data"),
+                };
+                let props = match stride {
+                    0 => (11, 0),
+                    _ if stride >= 4 && stride.is_multiple_of(4) => (12, stride),
+                    _ => return Err("a structured buffer of unknown stride"),
+                };
                 (props, None)
             }
             _ => return Err("a scalar memory read as data"),
