@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -439,7 +439,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// elements, which starts on a whole element of the copy: the buffer's, or
 /// one whose windows start on a multiple of the element from `address`.
 /// shortcut: what shaders write in one of two copies of the same memory
-/// reaches the other through title memory, after the submission.
+/// reaches the other through title memory, after the submission. Copies
+/// that start on an element are kept for good, up to [`ALIGNED`] bytes in
+/// all; views past that are not made. Like the other windows, one is brought
+/// up to date where the memory is written: a write-watched page freed, given
+/// out again and not written since keeps the bytes it had.
 pub(crate) fn find_element(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     let shadow = find(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
@@ -450,7 +454,7 @@ pub(crate) fn find_element(address: u64, len: u64, element: u64) -> Option<Arc<S
         return None;
     }
     let start = address - (address - address % element) % unit;
-    window(start, address.checked_add(len.max(1))?, unit)
+    window(start, address.checked_add(len.max(1))?, unit, true)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -464,15 +468,33 @@ const WINDOW: u64 = 4 << 20;
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    window(address & !(WINDOW - 1), end, WINDOW)
+    window(address & !(WINDOW - 1), end, WINDOW, false)
 }
 
-/// The copy of the windows of `unit` bytes from `start` that reach `end`.
-fn window(start: u64, end: u64, unit: u64) -> Option<Arc<Shadow>> {
+/// The most bytes of copies that start on an element, and those made.
+const ALIGNED: u64 = 256 << 20;
+static ALIGNED_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// Counts `bytes` more into `made` unless that passes `most`.
+fn reserve(made: &AtomicU64, bytes: u64, most: u64) -> bool {
+    made.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        n.checked_add(bytes).filter(|&n| n <= most)
+    })
+    .is_ok()
+}
+
+/// The copy of the windows of `unit` bytes from `start` that reach `end`;
+/// `aligned`: one of those [`ALIGNED`] bounds.
+fn window(start: u64, end: u64, unit: u64, aligned: bool) -> Option<Arc<Shadow>> {
     let len = (end - start).next_multiple_of(unit);
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
+    }
+    if aligned && !reserve(&ALIGNED_MADE, len, ALIGNED) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(len, most = ALIGNED, "no more element-aligned copies"));
+        return None;
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -518,4 +540,23 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Element-aligned copies stop at their bound, and one refused leaves
+    /// room for a smaller one.
+    #[test]
+    fn aligned_copies_are_bounded() {
+        let made = AtomicU64::new(0);
+        assert!(reserve(&made, 6, 10));
+        assert!(!reserve(&made, 5, 10));
+        assert!(reserve(&made, 4, 10));
+        assert!(!reserve(&made, 1, 10));
+        assert!(!reserve(&made, u64::MAX, 10));
+        // A range past the bound gets no copy.
+        assert!(window(16, 16 + ALIGNED + 1, WINDOW, true).is_none());
+    }
 }
