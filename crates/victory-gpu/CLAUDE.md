@@ -23,4 +23,4 @@
 - Layouts the title's inlined code reads are fixed: never reorder their fields
   or table slots.
 - Debug code sits behind `feature = "diagnostics"`: also run clippy with
-  `--all-features`. Its variables are in `README.md`, section Debugging.
+  `--all-features`. Its variables are in `docs/debugging.md`.

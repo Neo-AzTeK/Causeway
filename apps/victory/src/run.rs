@@ -125,7 +125,7 @@ pub fn run(
     Ok(())
 }
 
-/// The debugging aids (README): scheduled stack dumps, watched values and
+/// The debugging aids (docs/debugging.md): scheduled stack dumps, watched values and
 /// memory saved on a crash.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {

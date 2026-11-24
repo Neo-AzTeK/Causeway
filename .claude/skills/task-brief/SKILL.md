@@ -15,6 +15,7 @@ symbol instead of pasting it. Do not repeat `CLAUDE.md`; name it to read.
     Scope: <files it may change; files it must not>
     Constraints: <owner decisions, ordering, compatibility>
     Done when: <commands and expected result; tests to add>
+    Budget: <when to stop and report what is left>
     Return: <format and length; include what was not verified>
 
 Before sending, check that a reader with only this brief and the repository

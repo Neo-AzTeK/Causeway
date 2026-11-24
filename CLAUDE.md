@@ -24,19 +24,46 @@ before working there.
   what they say.
 - Running the title on a real GPU can reset the display driver. Ask first.
 
-## Spending context
+## Spending tokens
 
-- Find with Grep, then Read only that range. Never read a source file over 800
-  lines whole (`lower.rs` is 300 KB). A module's `//!` header gives its design.
-- Skip `target/`, `Cargo.lock`, `LICENSE` and `bcpack-tables.bin`.
-- Read `README.md` only for status, CLI or debug variables, and
+Everything in context is paid for again on every later call, so what enters
+early and stays long costs most. Agents were the largest cost measured
+(64% of one evening, one agent 32%).
+
+Sessions
+- One milestone per session; at its end update `HANDOFF.md` (local, ignored by
+  git; at most 40 lines, current state only) and tell the owner to wipe context.
+- Goals need an end, and a stop where the owner must decide. Waiting on the
+  owner, answer a hook in one line; do not redo or restate work.
+- Ask for launch approvals as a batch ("up to 3 runs, 5 minutes each").
+
+Agents
+- None by default. Only for a large read with a short answer (`scout`) or the
+  independent review of a finished diff (`reviewer`); never to run in parallel
+  what one session can do in order.
+- One small job each with a clear end, such as one refusal type; stop one that
+  drifts. Brief with the `task-brief` skill. Cheap model for lookups, log
+  summaries and mechanical edits.
+
+Reading
+- Grep, then read at most 150 lines. Never read a source file over 800 lines
+  whole (`lower.rs` is 300 KB), nor print its ranges through the shell.
+  A module's `//!` header gives its design. Do not read a file again
+  after an edit.
+- Skip `target/`, `Cargo.lock`, `LICENSE` and `bcpack-tables.bin`. `README.md`
+  only for status, `docs/debugging.md` only for debug variables and smoke runs,
   `docs/architecture.md` only for cross-crate flow or import resolution.
-- Cap output: `gh ... --json <fields> -q <filter>`, `--stat` before a diff,
-  `gh pr diff --name-only` before the full diff.
-- Correctness beats saving tokens: before changing a function, read all of it,
-  its callers and its tests. Grep every match arm of the instruction or API.
-- Delegate only if the result is much smaller than the reading. Brief with the
-  `task-brief` skill: a fresh agent does not see this conversation.
+
+Output
+- At most 60 lines per command: `-q`, `--stat` before a diff, `--name-only`
+  before a full one, `gh ... --json <fields> -q <filter>`. Count and group
+  logs; never print them, nor control-flow listings and disassembly, whole.
+- Images cost about as much as a long file: one contact sheet per run.
+- Batch independent commands in one call. Put edit scripts in a file, not in
+  quoted shell text. A tool built twice belongs in `xtask` or `victory`.
+
+Correctness beats saving tokens: before changing a function, read all of it,
+its callers and its tests, and Grep every match arm of the instruction or API.
 
 ## Checks
 

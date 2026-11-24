@@ -1,0 +1,44 @@
+# Debugging
+
+Reference for diagnostics builds; the [README](../README.md) has the basics.
+A release build has no debugging aids. Build them in with
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+```
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
+| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_KEYS=30:Enter,12-280/4:Enter,285-300:W` | presses keys at those seconds, every 4 s in a range, or holds them through one, focus or not |
+| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer |
+| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+Every build appends crashes and host GPU failures to `crashes.log` in the
+title's data folder.
+
+## Smoke runs
+
+`cargo xtask smoke --exe <title exe> --out <folder outside the repository>`
+runs a title unattended with this build (300 s, `--seconds`), skips its menus
+with `VICTORY_KEYS` (`--keys` replaces them; they do nothing while an XInput pad is
+connected), and judges each graphics area in `report.txt` and `report.json`.
+`--log <file>` judges an existing log instead. It exits with an error when an
+area failed; what a log does not show is "unknown".
+
+On a real GPU this can reset the display driver. The default keys press
+through the title's first-start screens and can tick its legal terms: where
+that is not wanted, pass a `--data-dir` already set up, and `--keys` that
+leave time to look at each screen.
