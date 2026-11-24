@@ -435,7 +435,8 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    let wave = wave_mismatch(&code_bytes(&code(0)), wave_lanes(&host.device));
+                    tracing::warn!(error = %e, ?shaders, wave, "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -610,6 +611,54 @@ fn mesh_pipeline(
     )
 }
 
+/// The wave sizes (least, most) a shader's container requires, from its
+/// runtime information (`PSV0`); `None` if any will do.
+fn required_waves(container: &[u8]) -> Option<(u32, u32)> {
+    let word = |at: usize| -> Option<u32> {
+        let bytes = container.get(at..at.checked_add(4)?)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+    // After the hash, version and size: the parts' count and offsets.
+    let part = (0..word(28)? as usize)
+        .map_while(|i| Some(word(32 + 4 * i)? as usize))
+        .find(|&at| word(at) == Some(u32::from_le_bytes(*b"PSV0")))?;
+    // The part's name and size, the information's size, the information.
+    if word(part + 8)? < 24 {
+        return None;
+    }
+    let range = (word(part + 12 + 16)?, word(part + 12 + 20)?);
+    (range != (0, u32::MAX)).then_some(range)
+}
+
+/// The wave sizes (least, most) the host GPU may run shaders at.
+fn wave_lanes(device: &ID3D12Device) -> Option<(u32, u32)> {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the query writes its own structure of the given size.
+    unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .ok()?
+    };
+    Some((options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+/// For the log, why a host with wave sizes `host` refuses a shader that
+/// requires one: a console wave64 program whose result depends on its lanes
+/// cannot run on a GPU with waves of 32.
+fn wave_mismatch(container: &[u8], host: Option<(u32, u32)>) -> Option<String> {
+    let (need, have) = (required_waves(container)?, host?);
+    (need.0 > have.1 || need.1 < have.0).then(|| {
+        format!(
+            "requires waves of {} to {} lanes, the host has {} to {}",
+            need.0, need.1, have.0, have.1
+        )
+    })
+}
+
 /// The bytes of shader code (none for an absent stage).
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
@@ -663,5 +712,46 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A container whose runtime information requires `min` to `max` lanes.
+    fn container(min: u32, max: u32) -> Vec<u8> {
+        let mut c = b"DXBC".to_vec();
+        c.resize(28, 0);
+        // Two parts: an empty one, then the runtime information.
+        for n in [2u32, 40, 48] {
+            c.extend(n.to_le_bytes());
+        }
+        c.extend(b"SFI0\0\0\0\0PSV0");
+        c.extend(52u32.to_le_bytes());
+        c.extend(48u32.to_le_bytes());
+        let info = c.len();
+        c.resize(info + 48, 0);
+        c[info + 16..info + 20].copy_from_slice(&min.to_le_bytes());
+        c[info + 20..info + 24].copy_from_slice(&max.to_le_bytes());
+        c
+    }
+
+    /// A refused pipeline's log line says so when its shader requires a
+    /// wave size the host lacks, and only then.
+    #[test]
+    fn wave_sizes_the_host_lacks_are_named() {
+        let wave64 = container(64, 64);
+        assert_eq!(
+            wave_mismatch(&wave64, Some((32, 32))).as_deref(),
+            Some("requires waves of 64 to 64 lanes, the host has 32 to 32")
+        );
+        assert_eq!(wave_mismatch(&wave64, Some((32, 64))), None);
+        assert_eq!(wave_mismatch(&container(0, u32::MAX), Some((32, 32))), None);
+        assert_eq!(wave_mismatch(&wave64, None), None);
+        for n in 0..wave64.len() {
+            // Cut short: no panic.
+            let _ = required_waves(&wave64[..n]);
+        }
     }
 }
