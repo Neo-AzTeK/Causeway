@@ -2,14 +2,6 @@
 
 use std::process::ExitCode;
 
-fn num(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    match s.strip_prefix("0x") {
-        Some(h) => u64::from_str_radix(h, 16),
-        None => s.parse(),
-    }
-    .map_err(|e| format!("{s}: {e}"))
-}
 
 fn run(args: &[String]) -> Result<(), String> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -22,9 +14,10 @@ fn run(args: &[String]) -> Result<(), String> {
         ["hle", "call", dll, name, rest @ ..] => {
             let ints = rest
                 .iter()
-                .map(|s| num(s).map(|v| v as usize))
+                .map(|s| victory_testbed::parse_num(s).map(|v| v as usize))
                 .collect::<Result<Vec<_>, _>>()?;
-            let r = victory_testbed::call_export(dll, name, &ints)?;
+            // SAFETY: the owner picks the export; the help says to call only ones that need no title.
+            let r = unsafe { victory_testbed::call_export(dll, name, &ints)? };
             println!("{r} (0x{r:x})");
         }
         #[cfg(windows)]
@@ -37,9 +30,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 match s {
                     "--in" => {
                         let v = it.next().ok_or("--in needs a,b,c,d")?;
-                        for (i, p) in v.split(',').take(4).enumerate() {
-                            inputs[i] = num(p)? as u32;
-                        }
+                        inputs = victory_testbed::parse_inputs(v)?;
                     }
                     "--hardware" => warp = false,
                     w => words.push(

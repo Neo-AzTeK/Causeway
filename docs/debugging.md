@@ -54,5 +54,5 @@ leave time to look at each screen.
 
 `alu` takes GFX10 instruction words in hex. They run as one thread after a
 prologue that copies the four `--in` dwords to `v1..v4`; the result is `v0`.
-WARP is the default, `--hardware` uses the GPU. `hle call` passes up to four
+WARP is the default; `--hardware` runs on the real GPU (CLAUDE.md: ask the owner first). `hle call` passes up to four
 integers: call only exports that need no running title.
