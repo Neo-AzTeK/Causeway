@@ -2944,6 +2944,89 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether two scalar loads read the same address: the same parameter
+    /// and offset, and the same computed index.
+    fn same_entry(&self, a: Site, b: Site) -> bool {
+        match (self.scalar.get(&a), self.scalar.get(&b)) {
+            (Some(x), Some(y)) if x.param == y.param && x.offset == y.offset => {
+                match (x.dynamic, y.dynamic) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => self.same_value(x, y, 8),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `a` and `b` are the same computation of the same values, up
+    /// to the lane a first-lane read picks: each lane that reaches both
+    /// uses names one descriptor.
+    fn same_value(&self, a: Value, b: Value, depth: u32) -> bool {
+        let def = |v: Value| {
+            let &block = self.def_block.get(&v)?;
+            self.x.p.blocks[block]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+        };
+        let first_lane = |v: Value| match def(v) {
+            Some(i) if i.name() == "v_readfirstlane_b32" => i
+                .reads
+                .iter()
+                .find(|r| matches!(r.0, Reg::V(_)))
+                .map_or(v, |r| r.1),
+            _ => v,
+        };
+        let (a, b) = (first_lane(a), first_lane(b));
+        if a == b {
+            return true;
+        }
+        let (Some(x), Some(y)) = (def(a), def(b)) else {
+            return false;
+        };
+        let place = |i: &Inst, v: Value| i.writes.iter().position(|w| w.1 == v);
+        // Scalar instructions that only compute, encoded alike apart from
+        // the registers.
+        let pure = x.name().starts_with("s_buffer_load")
+            || matches!(x.fields, Fields::Sop { .. })
+                && !x.reads.iter().any(|r| matches!(r.0, Reg::Scc))
+                && !x.name().contains("exec");
+        let constants = |i: &Inst| -> Vec<Operand> {
+            let keep = |o: Operand| match o {
+                Operand::Scalar { code, dwords } if code != NULL => {
+                    Operand::Scalar { code: 0, dwords }
+                }
+                o => o,
+            };
+            match &i.fields {
+                Fields::Sop { src, imm, .. } => src
+                    .iter()
+                    .copied()
+                    .map(keep)
+                    .chain(imm.map(|x| Operand::Literal(u32::from(x))))
+                    .collect(),
+                Fields::Smem {
+                    offset, soffset, ..
+                } => [*soffset, Operand::Literal(*offset as u32)]
+                    .into_iter()
+                    .map(keep)
+                    .collect(),
+                _ => vec![],
+            }
+        };
+        depth > 0
+            && pure
+            && x.name() == y.name()
+            && place(x, a) == place(y, b)
+            && constants(x) == constants(y)
+            && x.reads.len() == y.reads.len()
+            && x.reads
+                .iter()
+                .zip(&y.reads)
+                .all(|(p, q)| self.same_value(p.1, q.1, depth - 1))
+    }
+
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
@@ -2974,10 +3057,10 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         // How the program uses the descriptor tells the view's kind.
-        let use_at = self
-            .x
-            .res
-            .descriptors
+        let use_of = |site: Site| {
+            self.x
+                .res
+                .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
             .find_map(|d| {
@@ -2985,8 +3068,18 @@ impl<'a> Lower<'a> {
                     Source::Loaded { load, first } if load == site => Some((d.site, first)),
                     _ => None,
                 })
-            });
-        let Some((at, first)) = use_at else {
+            })
+        };
+        // Or another load of the same entry: the code loads a descriptor
+        // again (in a waterfall loop of its own) for its size.
+        let Some((at, first)) = use_of(site).or_else(|| {
+            self.x
+                .res
+                .scalar
+                .iter()
+                .filter(|s| s.0 != site && self.same_entry(s.0, site))
+                .find_map(|s| use_of(s.0))
+        }) else {
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
