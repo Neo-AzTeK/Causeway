@@ -137,6 +137,17 @@ pub(super) fn check(shader: &HostShader) {
 /// WARP (each skipped without a device) and returns the UAVs' dwords per one
 /// that ran.
 pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+    let out = run_on(shader, views, &[("hardware", false), ("warp", true)]);
+    assert!(!out.is_empty());
+    out
+}
+
+/// [`run`] on these adapters (a name, and whether it is WARP).
+pub(super) fn run_on(
+    shader: &HostShader,
+    views: &[View],
+    adapters: &[(&'static str, bool)],
+) -> Vec<(&'static str, Vec<Vec<u32>>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -150,7 +161,7 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    for (label, warp) in [("hardware", false), ("warp", true)] {
+    for &(label, warp) in adapters {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -174,7 +185,6 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         out.push((label, words));
     }
-    assert!(!out.is_empty());
     out
 }
 

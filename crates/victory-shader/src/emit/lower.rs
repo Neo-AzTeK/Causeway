@@ -373,13 +373,16 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            // Swizzles stay inside 32 lanes, DPP inside a row of 16.
+            let local = insts().any(|i| {
+                i.name().starts_with("ds_swizzle")
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+            });
+            let global = insts().any(|i| {
                 let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
+                n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
@@ -406,9 +409,16 @@ impl<'a> Lower<'a> {
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            let threads = cs.threads.iter().product::<u32>();
+            let one_wave = threads <= wave;
+            console_lanes = local || global;
             if console_lanes {
-                s.wave_size = Some(wave);
+                // Waves of 32 do where a wave of 64 holds no more lanes, or
+                // where no lane reads beyond its 32 and none needs the
+                // others' LDS accesses in step.
+                let apart = !global && !(one_wave && s.lds_dwords > 0);
+                let enough = threads <= 32 || apart;
+                s.wave_size = Some(if enough { 32 } else { wave });
             } else if one_wave && s.lds_dwords > 0 {
                 // Hosts may lack waves of 64; barriers do as well.
                 match super::lockstep::barriers(&p.blocks).filter(|_| wave == 64) {

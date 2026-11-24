@@ -1,8 +1,8 @@
 //! End-to-end tests of lane masks and scalar values as each lane sees them:
 //! synthetic GFX10 programs of 32 lanes, run as in `image_tests`.
 
-use super::host::{Stride, View};
-use super::image_tests::{build, check, run, translate, translate_group, translate_with};
+use super::host::{Host, Stride, View};
+use super::image_tests::{build, check, run, run_on, translate, translate_group, translate_with};
 use crate::native::ResourceType;
 
 /// Loads the raw UAV's descriptor to s[40:43] and v16 = 4 × lane.
@@ -494,6 +494,29 @@ fn a_group_of_one_wave64_shares_lds_on_hosts_with_waves_of_32() {
     let dummy = [[0.0f32; 4]];
     for (label, out) in run(&shader, &[View::Texture(1, 1, &dummy), View::RawUav(64)]) {
         let want: Vec<u32> = (0..64).map(|l| 64 - l).collect();
+        assert_eq!(out[0], want, "{label}");
+    }
+}
+
+#[test]
+fn wave64_lanes_that_stay_inside_32_run_on_hosts_with_waves_of_32() {
+    // Each lane takes its neighbour's id, within a pair.
+    let swap = [
+        0xD8D4_041F,
+        0x0800_0000, // ds_swizzle_b32 v8, v0 offset: and 31, or 0, xor 1
+        0xBF8C_0000, // s_waitcnt 0
+    ];
+    let words = [&STORE_SETUP[..], &swap, &STORE[..]].concat();
+    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 64, 0).unwrap();
+    check(&shader);
+    // WARP runs no fixed wave size of 32.
+    if !Host::new(false).is_ok_and(|h| h.has_waves_of(32)) {
+        return;
+    }
+    let dummy = [[0.0f32; 4]];
+    let views = [View::Texture(1, 1, &dummy), View::RawUav(64)];
+    for (label, out) in run_on(&shader, &views, &[("hardware", false)]) {
+        let want: Vec<u32> = (0..64).map(|l| l ^ 1).collect();
         assert_eq!(out[0], want, "{label}");
     }
 }

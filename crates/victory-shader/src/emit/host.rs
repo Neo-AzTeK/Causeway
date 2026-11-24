@@ -63,6 +63,21 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
+    /// Whether compute shaders may require waves of `lanes`.
+    #[cfg(test)]
+    pub fn has_waves_of(&self, lanes: u32) -> bool {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the structure the feature names, and its size.
+        let asked = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                std::ptr::from_mut(&mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        };
+        asked.is_ok() && (o.WaveLaneCountMin..=o.WaveLaneCountMax).contains(&lanes)
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
