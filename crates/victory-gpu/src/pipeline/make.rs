@@ -16,6 +16,7 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -157,16 +158,51 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Pipelines by size and the number they were added as.
+type Waiting = BTreeMap<(usize, u64), Arc<Pending>>;
+
+/// Pipelines waiting for a worker: the smallest containers first (the oldest
+/// among equals), as the biggest compute programs take seconds to compile
+/// and would hold up all that came after them.
+// shortcut: size stands in for compile time.
+#[derive(Default)]
+struct Queue {
+    /// How many were ever added, and those waiting.
+    waiting: Mutex<(u64, Waiting)>,
+    added: Condvar,
+}
+
+impl Queue {
+    fn push(&self, p: Arc<Pending>) {
+        let size = p.shaders.iter().map(|s| s.container.len()).sum();
+        let mut held = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        held.0 += 1;
+        let number = held.0;
+        held.1.insert((size, number), p);
+        self.added.notify_one();
+    }
+
+    fn pop(&self) -> Arc<Pending> {
+        let mut held = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some((_, p)) = held.1.pop_first() {
+                return p;
+            }
+            held = self.added.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
 fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
+    static QUEUE: OnceLock<(Arc<Queue>, bool)> = OnceLock::new();
+    let (queue, working) = QUEUE.get_or_init(|| {
+        let queue = Arc::new(Queue::default());
+        let mut working = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let receiver = receiver.clone();
+            let queue = queue.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
@@ -177,9 +213,7 @@ fn queue(p: Arc<Pending>) {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
+                        queue.pop().make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -187,15 +221,18 @@ fn queue(p: Arc<Pending>) {
                         }
                     }
                 });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
+            match spawned {
+                Ok(_) => working = true,
+                Err(e) => tracing::warn!(error = %e, "no pipeline worker"),
             }
         }
-        sender
+        (queue, working)
     });
-    if let Err(e) = sender.send(p) {
+    if *working {
+        queue.push(p);
+    } else {
         // No worker: made here instead.
-        e.0.make();
+        p.make();
         WAITING.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -221,6 +258,23 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Big pipelines do not hold up small ones queued after them.
+    #[test]
+    fn the_smallest_pipeline_is_made_first() {
+        let pending = |bytes: usize| {
+            let shader = crate::pipeline::shader("compute", &vec![0; bytes]);
+            Arc::new(Pending::new(vec![shader], None))
+        };
+        let (big, small, same) = (pending(900), pending(10), pending(10));
+        let queue = Queue::default();
+        for p in [&big, &small, &same] {
+            queue.push(p.clone());
+        }
+        for p in [&small, &same, &big] {
+            assert!(Arc::ptr_eq(&queue.pop(), p));
+        }
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
