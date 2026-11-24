@@ -107,6 +107,8 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                #[cfg(feature = "diagnostics")]
+                self.dump();
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(
@@ -126,6 +128,53 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Shader {
+    /// With `VICTORY_DUMP_SHADERS=<dir>`: the program's root layout, used
+    /// resources and decoded instructions as `<hash>.txt` there, for the
+    /// hashes in `VICTORY_DUMP_HASHES` (comma list; all when unset). Derived
+    /// from the title: keep the folder outside the repository.
+    fn dump(&self) {
+        use std::fmt::Write as _;
+        let Some(dir) = std::env::var_os("VICTORY_DUMP_SHADERS") else {
+            return;
+        };
+        if let Ok(only) = std::env::var("VICTORY_DUMP_HASHES")
+            && !only.split(',').any(|h| h.trim() == self.hash)
+        {
+            return;
+        }
+        let Some(program) = victory_shader::Container::parse(&self.container)
+            .ok()
+            .and_then(|c| {
+                let part = c.part(victory_shader::FourCC::DXIL)?;
+                victory_shader::native_programs(part.data).ok()
+            })
+            .and_then(|all| all.into_iter().next())
+        else {
+            return;
+        };
+        let mut text = format!("{:?} wave64={} vgprs={}\n", program.stage, program.wave64, program.vgprs);
+        for p in &program.layout {
+            let _ = writeln!(text, "  {p:?}");
+        }
+        for u in &program.used {
+            let _ = writeln!(text, "  {u:?}");
+        }
+        match victory_shader::gfx10::decode(&program.code) {
+            Ok(list) => {
+                for i in &list {
+                    let _ = writeln!(text, "{:5x}: {}", i.offset, i.text(program.wave64));
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(text, "undecodable: {e}");
+            }
+        }
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{}.txt", self.hash)), text);
     }
 }
 
