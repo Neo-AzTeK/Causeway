@@ -78,7 +78,7 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation or its failure out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
@@ -94,8 +94,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        Ok(encode_entry(&(self.translate)(&input[32..])))
     }
 }
 
@@ -111,10 +110,15 @@ fn cached(
         ran: AtomicBool::new(false),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => {
+                // The store failed, not the translation.
+                tracing::warn!(error = format!("{e:#}"), "shader cache entry not written");
+                break;
+            }
+        };
+        if let Some(result) = std::fs::read(&path).ok().and_then(|b| decode_entry(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
@@ -122,7 +126,7 @@ fn cached(
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return result;
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
@@ -131,6 +135,27 @@ fn cached(
     (converter.translate)(container)
 }
 
+/// A translation or the reason there is none, after the BLAKE3 of the rest.
+fn encode_entry(result: &Result<HostShader, String>) -> Vec<u8> {
+    let body = match result {
+        Ok(shader) => encode(shader),
+        Err(why) => [&FAILED[..], why.as_bytes()].concat(),
+    };
+    [&blake3::hash(&body).as_bytes()[..], &body].concat()
+}
+
+fn decode_entry(bytes: &[u8]) -> Option<Result<HostShader, String>> {
+    let (hash, body) = bytes.split_at_checked(32)?;
+    if hash != &blake3::hash(body).as_bytes()[..] {
+        return None;
+    }
+    match body.strip_prefix(FAILED) {
+        Some(why) => Some(Err(String::from_utf8(why.to_vec()).ok()?)),
+        None => decode(body).map(Ok),
+    }
+}
+
+const FAILED: &[u8; 4] = b"VSHF";
 const MAGIC: &[u8; 4] = b"VSH1";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
@@ -330,10 +355,53 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
 
-        // Failures are not stored.
-        let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
-        assert!(cached(&cache, &build, b"other", fail).is_err());
+    #[test]
+    fn failures_come_back_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let get = || {
+            cached(&cache, &[7; 32], b"container", |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Err("an opcode is not supported".to_owned())
+            })
+        };
+        let failure = Err("an opcode is not supported".to_owned());
+        assert_eq!(get(), failure);
+        assert_eq!(get(), failure);
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
+
+        // Damaged (here in the reason only), it is translated again.
+        let files = walk(dir.path());
+        let mut bytes = std::fs::read(&files[0]).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&files[0], &bytes).unwrap();
+        assert_eq!(get(), failure);
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        // Truncated or emptied, too.
+        for len in [0, 31, 32, bytes.len() - 1] {
+            std::fs::write(&files[0], &bytes[..len]).unwrap();
+            assert_eq!(get(), failure);
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 6);
+        assert_eq!(get(), failure);
+        assert_eq!(runs.load(Ordering::Relaxed), 6, "stored again");
+    }
+
+    #[test]
+    fn a_store_failure_neither_fails_the_shader_nor_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let get = || cached(&cache, &[7; 32], b"container", |_| Ok(shader()));
+        assert_eq!(get(), Ok(shader()));
+        // A folder in the entry's place cannot be written over.
+        let path = walk(dir.path()).remove(0);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(get(), Ok(shader()));
+        assert!(walk(dir.path()).is_empty());
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -382,5 +450,10 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+
+        let mut entry = encode_entry(&Ok(shader()));
+        assert_eq!(decode_entry(&entry), Some(Ok(shader())));
+        entry[60] ^= 1; // in the DXIL
+        assert_eq!(decode_entry(&entry), None);
     }
 }
