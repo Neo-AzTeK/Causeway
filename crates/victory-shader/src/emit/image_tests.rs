@@ -23,7 +23,7 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// Lowers a wave32 compute program of 32 threads with the table of views at
 /// s0 (a texture of kind `image` at dword 0, a raw UAV at dword 8) and the
 /// table of samplers at s1; `validate`s it if asked.
-fn build(body: &[u32], image: ResourceType, validate: bool) -> HostShader {
+pub(super) fn build(body: &[u32], image: ResourceType, validate: bool) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -103,7 +103,7 @@ fn build(body: &[u32], image: ResourceType, validate: bool) -> HostShader {
 /// Runs `shader` with `views` at heap indices 0.. on the hardware GPU and on
 /// WARP (each skipped without a device) and returns the UAVs' dwords per one
 /// that ran.
-fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<Vec<u32>>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
