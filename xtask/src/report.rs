@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 /// Draws and dispatches asked for per frame that mean the menus draw. The
 /// title's first screens ask for 3 to 7.
 const MENU_DRAWS: f64 = 20.0;
+/// Saved frames it takes to judge what the menus show.
+const MENU_FRAMES: usize = 5;
 /// The same for the world: menus ask for 60 at most, the world thousands.
 const WORLD_DRAWS: f64 = 300.0;
 /// World log lines (one per 5 s or slower) that anything passes from.
@@ -502,6 +504,19 @@ impl Log {
         };
         add("flat frames", (status, format!("{n} of {} frames saved in the world", judged.len())));
 
+        // The first half holds the black frames of the start.
+        let early: Vec<_> = self.captures.iter().filter(|c| !c.1).collect();
+        let shown: Vec<bool> =
+            early[early.len() / 2..].iter().filter_map(|c| flat(&c.0)).collect();
+        let n = shown.iter().filter(|&&f| f).count();
+        let status = match n {
+            _ if shown.len() < MENU_FRAMES => Status::Unknown,
+            n if 2 * n > shown.len() => Status::Fail,
+            _ => Status::Pass,
+        };
+        let detail = format!("{n} of the last {} frames saved before the world are flat", shown.len());
+        add("menu picture", (status, detail));
+
         add("unimplemented graphics", set(&self.methods, &["victory_gpu::object", "victory_gpu::list"]));
         // Not graphics (and from any module, so heard in no other log), so never a failure, but a missing call explains much.
         add("unimplemented other", match set(&self.other_methods, &[]) {
@@ -785,7 +800,8 @@ mod tests {
     fn a_healthy_run_passes_and_a_silent_log_is_unknown() {
         for a in judge(&healthy(), Some(End::TimedOut)) {
             // No frame was saved, so nothing shows that they are not flat.
-            let wanted = if a.name == "flat frames" { Status::Unknown } else { Status::Pass };
+            let unknown = ["flat frames", "menu picture"].contains(&a.name);
+            let wanted = if unknown { Status::Unknown } else { Status::Pass };
             assert_eq!(a.status, wanted, "{}: {}", a.name, a.detail);
         }
         for a in judge("", None) {
@@ -913,6 +929,24 @@ mod tests {
         assert_eq!(flat(&["frame-2.png"]), Status::Warn);
         assert_eq!(flat(&["frame-2.png", "frame-3.png"]), Status::Fail);
         assert_eq!(status(&log.judge(None, |_| None), "flat frames"), Status::Unknown);
+    }
+
+    /// Menus that draw but show nothing: the last frames are flat, not only
+    /// those of the start.
+    #[test]
+    fn flat_menus_fail() {
+        let saved = |n: u32| gpu("INFO", &format!("capture: frame saved path=/a/frame-{n}.png"));
+        let picture = |frames: u32, flat_to: u32| {
+            let text = rate(30.0, 39, 0, 0) + &(1..=frames).map(saved).collect::<String>();
+            let flat = |p: &Path| {
+                let n: u32 = p.file_stem()?.to_str()?.strip_prefix("frame-")?.parse().ok()?;
+                Some(n <= flat_to)
+            };
+            status(&Log::parse(&text).judge(None, flat), "menu picture")
+        };
+        assert_eq!(picture(20, 10), Status::Pass);
+        assert_eq!(picture(20, 19), Status::Fail);
+        assert_eq!(picture(4, 4), Status::Unknown);
     }
 
     #[test]
