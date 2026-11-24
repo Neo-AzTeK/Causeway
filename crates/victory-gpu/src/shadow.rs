@@ -435,6 +435,24 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// The copy of `[address, address + len)` for a view of `element`-byte
+/// elements, which starts on a whole element of the copy: the buffer's, or
+/// one whose windows start on a multiple of the element from `address`.
+/// shortcut: what shaders write in one of two copies of the same memory
+/// reaches the other through title memory, after the submission.
+pub(crate) fn find_element(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
+    let shadow = find(address, len)?;
+    if element == 0 || shadow.offset(address).is_multiple_of(element) {
+        return Some(shadow);
+    }
+    let unit = WINDOW / element * element;
+    if unit == 0 {
+        return None;
+    }
+    let start = address - (address - address % element) % unit;
+    window(start, address.checked_add(len.max(1))?, unit)
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
@@ -446,8 +464,12 @@ const WINDOW: u64 = 4 << 20;
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    window(address & !(WINDOW - 1), end, WINDOW)
+}
+
+/// The copy of the windows of `unit` bytes from `start` that reach `end`.
+fn window(start: u64, end: u64, unit: u64) -> Option<Arc<Shadow>> {
+    let len = (end - start).next_multiple_of(unit);
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());

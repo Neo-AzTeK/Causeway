@@ -443,9 +443,15 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// The title memory a buffer shader or unordered access view reads: its
-/// address and length.
+/// [`buffer_view`]'s address and length.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+    buffer_view(view).map(|(address, len, _)| (address, len))
+}
+
+/// The title memory a buffer shader or unordered access view reads: its
+/// address and length, and the bytes of an element.
+pub(crate) fn buffer_view(view: &View) -> Option<(u64, u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
@@ -472,11 +478,12 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     Some((
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
+        element,
     ))
 }
 
-/// [`buffer_range`] of an unordered access view of memory at `base`.
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
+/// [`buffer_view`] of an unordered access view of memory at `base`.
+fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64, u64)> {
     let desc = uav_desc(words);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
@@ -490,11 +497,40 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     Some((
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
+        element,
     ))
 }
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
+
+/// The host copy of title memory at `address` (`len` bytes) for a view of
+/// `count` elements of `element` bytes from the `first` on, and the first
+/// one's index in that copy. Host views start on a whole element of the
+/// buffer; where the memory's copy does not put this one on one (the title
+/// may view memory from any address), a copy that does.
+fn element_copy(
+    address: u64,
+    len: u64,
+    element: u64,
+    first: u64,
+    count: u32,
+) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64)> {
+    if element == 0 {
+        once!("buffer view without an element size");
+        return None;
+    }
+    let shadow = crate::shadow::find(address, len)?;
+    let offset = shadow.offset(address);
+    if offset.is_multiple_of(element) {
+        return Some((shadow, first + offset / element));
+    }
+    // The viewed range alone, as draws bring it up to date.
+    let start = address + first * element;
+    let shadow = crate::shadow::find_element(start, u64::from(count) * element, element)?;
+    let first = shadow.offset(start) / element;
+    Some((shadow, first))
+}
 
 fn buffer_srv(
     address: u64,
@@ -502,20 +538,12 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
-        once!(
-            offset,
-            element,
-            "buffer view not on an element of its host copy"
-        );
-        return None;
-    }
-    buffer.FirstElement += offset / element;
+    let shadow;
+    (shadow, buffer.FirstElement) =
+        element_copy(address, len, element, buffer.FirstElement, buffer.NumElements)?;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -536,13 +564,6 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
-        return None;
-    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -552,12 +573,15 @@ fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    let offset = shadow.offset(address);
-    if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+    let shadow;
+    (shadow, buffer.FirstElement) =
+        element_copy(address, len, element, buffer.FirstElement, buffer.NumElements)?;
+    // SAFETY: a live buffer.
+    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+        once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -922,6 +946,49 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view of memory whose host copy does not put it on a multiple of its
+    /// element is made all the same, on the copy draws bring up to date, and
+    /// that copy holds the memory it views.
+    #[test]
+    fn views_start_on_an_element_of_a_host_copy() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let memory: Vec<u32> = (0..1024).collect();
+        let at = (memory.as_ptr() as u64).next_multiple_of(32);
+        for (address, element) in [(at, 32), (at + 16, 32), (at + 20, 48), (at + 4, 12)] {
+            // Four elements from the second on, of a buffer of sixteen.
+            let mut resource = [0u32; 14];
+            (resource[0], resource[4]) = (1, 16 * element);
+            let mut desc = [0u32; 16];
+            (desc[1], desc[2]) = (1, 0x1688);
+            (desc[4], desc[6], desc[7]) = (1, 4, element);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            let view = View::Placed(false, resource, desc);
+            let (start, len, size) = buffer_view(&view).unwrap();
+            assert_eq!((start, len), (address + u64::from(element), 4 * u64::from(element)));
+            let (shadow, first) = element_copy(address, 16 * size, size, 1, 4).unwrap();
+            assert_eq!(shadow.offset(start), first * size);
+            let drawn = crate::shadow::find_element(start, len, size).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&shadow, &drawn));
+            assert_eq!(shadow.update(start as usize, len as usize), len as usize);
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a mappable buffer, the range inside it and the memory.
+            unsafe {
+                shadow.buffer.Map(0, None, Some(&mut data)).unwrap();
+                let bytes = |p: *const u8| std::slice::from_raw_parts(p, len as usize);
+                let copy = data.cast::<u8>().add(shadow.offset(start) as usize);
+                assert_eq!(bytes(copy), bytes(start as *const u8));
+            }
+            assert!(make(&view, heap.cpu(0)).is_some());
+        }
+        // SAFETY: a plain device query.
+        assert!(unsafe { host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
