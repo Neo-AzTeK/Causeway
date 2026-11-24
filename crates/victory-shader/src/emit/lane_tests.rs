@@ -160,11 +160,11 @@ fn the_record_count_of_a_scalar_loaded_buffer_is_the_hosts() {
         };
         run(&shader, &[view, View::RawUav(32)])
     };
-    // 6 structures of 16 bytes; 96 raw bytes, the last dword's offset 92
-    // (the load drops the low bits of 95).
-    for (label, out) in run_with(&body(16), 16, Stride::Structured(16)) {
-        assert_eq!(out[0], vec![20_000 + 6; 32], "{label}");
-    }
+    // Refused with a stride: the view the title makes may be raw.
+    let words = [&STORE_SETUP[..], &body(16), &STORE[..]].concat();
+    assert!(translate_with(&words, ResourceType::Srv, 4, 16, false).is_err());
+    // 96 raw bytes, the last dword's offset 92 (the load drops the low
+    // bits of 95).
     for (label, out) in run_with(&body(1)[..], 0, Stride::Raw) {
         assert_eq!(out[0][0], 23_000 + 96, "{label}");
     }
@@ -420,5 +420,27 @@ fn a_typed_buffer_is_not_sized_as_a_raw_one() {
     };
     for (label, out) in run(&shader, &[view, View::RawUav(32)]) {
         assert_eq!(out[0], vec![6; 32], "{label}");
+    }
+}
+
+/// Titles read raw views by scalar loads the code names a stride for.
+#[test]
+fn a_scalar_load_reads_a_raw_view_whatever_the_stride_named() {
+    let body = [
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF420_0344,
+        0xFA00_0054, // s_buffer_load_dword s13, s[8:11], 0x54
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E10_020D, // v_mov_b32 v8, s13
+    ];
+    let data: Vec<u32> = (0..32).map(|n| 1000 * n).collect();
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_with(&words, ResourceType::Srv, 4, 64, false).unwrap();
+    check(&shader);
+    let view = View::Buffer { data: &data, stride: Stride::Raw };
+    for (label, out) in run(&shader, &[view, View::RawUav(32)]) {
+        assert_eq!(out[0], vec![21_000; 32], "{label}");
     }
 }
