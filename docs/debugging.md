@@ -43,3 +43,16 @@ On a real GPU this can reset the display driver. The default keys press
 through the title's first-start screens and can tick its legal terms: where
 that is not wanted, pass a `--data-dir` already set up, and `--keys` that
 leave time to look at each screen.
+
+## Testbed (no game, no title run)
+
+`victory-testbed` checks the translation layer headlessly:
+
+    cargo run -q -p victory-testbed -- hle list
+    cargo run -q -p victory-testbed -- hle call xmem.dll XMemIsToolsMemAvailable
+    cargo run -q -p victory-testbed -- alu 4a000302 --in 40,2,0,0 [--hardware]
+
+`alu` takes GFX10 instruction words in hex. They run as one thread after a
+prologue that copies the four `--in` dwords to `v1..v4`; the result is `v0`.
+WARP is the default, `--hardware` uses the GPU. `hle call` passes up to four
+integers: call only exports that need no running title.
