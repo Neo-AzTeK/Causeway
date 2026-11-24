@@ -1011,8 +1011,10 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
-    // A target the host cannot render to has no contents: title memory, which
-    // the console GPU would have written, does not hold them.
+    // A target or written texture whose host copy lost that use stays as
+    // those that keep it: not filled from title memory.
+    // shortcut: what the CPU writes into such a texture is not uploaded
+    // either way; nothing tells it from memory the GPU was to write.
     #[cfg(windows)]
     if let Some(host) = &resource.host
         && desc.flags & (TARGET | UNORDERED) != 0
@@ -1719,6 +1721,9 @@ pub(crate) mod tests {
             assert_eq!(renderable(t), left & TARGET != 0);
             if format == 28 {
                 assert_eq!(left, flags);
+            }
+            if format != 28 && left == flags {
+                eprintln!("format {format} flags {flags}: the host has every use, nothing tested");
             }
             crate::list::tests::clear(image);
             // SAFETY: a plain query.

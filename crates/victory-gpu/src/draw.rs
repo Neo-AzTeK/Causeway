@@ -272,7 +272,8 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
-            // shortcut: such a target is left out; its pipelines are refused.
+            // shortcut: left out, as a target without a host copy is above:
+            // later targets move up a slot.
             if !crate::resource::renderable(texture) {
                 once!("render target in a format the host cannot render to");
                 continue;
