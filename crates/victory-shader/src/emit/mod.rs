@@ -85,6 +85,7 @@ pub mod host;
 mod image_tests;
 #[cfg(all(test, windows))]
 mod lane_tests;
+mod lockstep;
 mod lower;
 mod sampler;
 mod shader;

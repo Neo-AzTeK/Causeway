@@ -2,7 +2,7 @@
 //! synthetic GFX10 programs of 32 lanes, run as in `image_tests`.
 
 use super::host::{Stride, View};
-use super::image_tests::{build, check, run, translate, translate_with};
+use super::image_tests::{build, check, run, translate, translate_group, translate_with};
 use crate::native::ResourceType;
 
 /// Loads the raw UAV's descriptor to s[40:43] and v16 = 4 × lane.
@@ -471,5 +471,29 @@ fn a_scalar_load_reads_a_raw_view_whatever_the_stride_named() {
     let view = View::Buffer { data: &data, stride: Stride::Raw };
     for (label, out) in run(&shader, &[view, View::RawUav(32)]) {
         assert_eq!(out[0], vec![21_000; 32], "{label}");
+    }
+}
+
+#[test]
+fn a_group_of_one_wave64_shares_lds_on_hosts_with_waves_of_32() {
+    // Lane l writes l + 1 and reads lane 63 - l's dword, which the console
+    // needs no barrier for.
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xD834_0000,
+        0x0000_0110, // ds_write_b32 v16, v1
+        0x4C22_00BF, // v_sub_nc_u32 v17, 63, v0
+        0x3422_2282, // v_lshlrev_b32 v17, 2, v17
+        0xD8D8_0000,
+        0x0800_0011, // ds_read_b32 v8, v17
+        0xBF8C_0000, // s_waitcnt 0
+    ];
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 64, 1).unwrap();
+    check(&shader);
+    let dummy = [[0.0f32; 4]];
+    for (label, out) in run(&shader, &[View::Texture(1, 1, &dummy), View::RawUav(64)]) {
+        let want: Vec<u32> = (0..64).map(|l| 64 - l).collect();
+        assert_eq!(out[0], want, "{label}");
     }
 }

@@ -36,6 +36,19 @@ pub(super) fn translate_with(
     stride: u32,
     wave64: bool,
 ) -> Result<HostShader, ShaderError> {
+    translate_group(body, (image, dwords, stride), wave64, 32, 0)
+}
+
+/// [`translate_with`] for a group of `threads` with `lds` blocks of 512
+/// bytes; `view` is its kind, dwords and stride.
+pub(super) fn translate_group(
+    body: &[u32],
+    view: (ResourceType, u8, u32),
+    wave64: bool,
+    threads: u32,
+    lds: u32,
+) -> Result<HostShader, ShaderError> {
+    let (image, dwords, stride) = view;
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -65,8 +78,8 @@ pub(super) fn translate_with(
             range(ResourceType::Sampler, 0, 4, 0, 1),
         ],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 2 << 1,
-            threads: [32, 1, 1],
+            rsrc2: lds << 15 | 2 << 1,
+            threads: [threads, 1, 1],
         }),
         code: TABLES
             .iter()

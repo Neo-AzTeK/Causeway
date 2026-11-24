@@ -197,6 +197,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Where barriers the console does without go (see [`super::lockstep`]).
+    lockstep: HashSet<(usize, usize)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -364,6 +366,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut lockstep = HashSet::new();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -404,8 +407,14 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes {
                 s.wave_size = Some(wave);
+            } else if one_wave && s.lds_dwords > 0 {
+                // Hosts may lack waves of 64; barriers do as well.
+                match super::lockstep::barriers(&p.blocks).filter(|_| wave == 64) {
+                    Some(at) => lockstep.extend(at),
+                    None => s.wave_size = Some(wave),
+                }
             }
         }
         let mut no_barrier = HashSet::new();
@@ -492,6 +501,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat: None,
             no_barrier,
+            lockstep,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -886,9 +896,11 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                self.lockstep_barrier(b, i);
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
+                        self.lockstep_barrier(b, j);
                         self.section_inst(b, j, i);
                     }
                     i = end;
@@ -896,6 +908,7 @@ impl<'a> Lower<'a> {
                 }
                 i += 1;
             }
+            self.lockstep_barrier(b, i);
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
@@ -2244,6 +2257,17 @@ impl<'a> Lower<'a> {
     }
 
     // ---- instructions ----
+
+    /// The barrier before instruction `i` of block `b`, if the console's
+    /// waves do without one there.
+    fn lockstep_barrier(&mut self, b: usize, i: usize) {
+        if self.lockstep.contains(&(b, i)) {
+            let mode = self.s.m.i32(1 | 8);
+            let void = self.s.t.void;
+            self.s
+                .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        }
+    }
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
