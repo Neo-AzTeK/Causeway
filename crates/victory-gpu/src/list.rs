@@ -331,6 +331,12 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             first: if b.first.is_null() {
                 b.first
             } else {
+                // No shader writes a texture whose host copy lost that use.
+                const UNORDERED: u32 = 0x8;
+                let texture = crate::resource::host_resource(b.first)?;
+                if crate::host::legal_state(texture, UNORDERED) == 0 {
+                    return None;
+                }
                 host(b.first)?
             },
             ..*b
@@ -1582,6 +1588,45 @@ pub(crate) mod tests {
         let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
         assert_eq!(hr, S_OK);
         (list, allocator)
+    }
+
+    /// Barriers on a texture whose host copy lacks unordered access and
+    /// rendering: no unordered access barrier, and transitions to those
+    /// states leave those states out.
+    #[cfg(windows)]
+    #[test]
+    fn barriers_respect_the_uses_the_host_copy_has() {
+        use crate::resource::tests as made;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const UNORDERED: u32 = 0x8;
+        const TARGET: u32 = 0x4;
+        for (flags, uses) in [(0, 0), (1, TARGET), (4, UNORDERED), (5, TARGET | UNORDERED)] {
+            let desc = made::flagged(made::texture(16, 8, 28, 1), flags);
+            let image = made::committed(&desc, COPY_DEST);
+            let (list, allocator) = open_list();
+            let host = host_list(list).unwrap();
+            let uav = Barrier { first: image, ..UAV_BARRIER };
+            assert_eq!(host_barrier(host, &uav).is_some(), uses & UNORDERED != 0);
+            assert!(host_barrier(host, &UAV_BARRIER).is_some());
+            ensure_state(host, image, COPY_DEST);
+            for state in [TARGET, COPY_SOURCE, UNORDERED] {
+                let to = Barrier {
+                    kind: 0,
+                    flags: 0,
+                    first: image,
+                    second: 0xffff_ffff,
+                    last: u64::from(state),
+                };
+                let made = host_barrier(host, &to).unwrap();
+                let legal = if state == COPY_SOURCE { state } else { state & uses };
+                assert_eq!(made.last, u64::from(legal), "flags {flags} state {state:#x}");
+            }
+            for o in [list, allocator, image] {
+                slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            }
+        }
     }
 
     /// A box of a texture, filled from a buffer, read back into another: its

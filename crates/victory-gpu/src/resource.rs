@@ -1465,6 +1465,12 @@ pub(crate) mod tests {
         }
     }
 
+    /// `desc` with resource flags.
+    #[cfg(windows)]
+    pub(crate) fn flagged(desc: ResourceDesc, flags: u32) -> ResourceDesc {
+        ResourceDesc { flags, ..desc }
+    }
+
     /// A committed resource.
     #[cfg(windows)]
     pub(crate) fn committed(desc: &ResourceDesc, state: u32) -> This {
