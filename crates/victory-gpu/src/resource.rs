@@ -1465,6 +1465,16 @@ pub(crate) mod tests {
         }
     }
 
+    /// A 3D texture.
+    #[cfg(windows)]
+    pub(crate) fn volume(width: u64, height: u32, depth: u16, format: u32) -> ResourceDesc {
+        ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: depth,
+            ..texture(width, height, format, 1)
+        }
+    }
+
     /// `desc` with resource flags.
     #[cfg(windows)]
     pub(crate) fn flagged(desc: ResourceDesc, flags: u32) -> ResourceDesc {

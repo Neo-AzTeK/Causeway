@@ -672,32 +672,42 @@ fn texture_to_buffer(
     if left >= right || top >= bottom || front >= back {
         return Ok(()); // an empty box copies nothing
     }
-    let part = [left, top, front, right, bottom, back]
-        != [0, 0, 0, whole.Width, whole.Height, whole.Depth];
-    if part && depth {
-        return Err("part of a depth texture, which the host copies whole");
-    }
     if right > whole.Width || bottom > whole.Height || back > whole.Depth {
         return Err("a box outside the subresource");
-    }
-    let f = &dst.footprint;
-    let size = [right - left, bottom - top, back - front];
-    let fits = |n: usize, bound: u32| at[n].checked_add(size[n]).is_some_and(|end| end <= bound);
-    if !fits(0, f.width) || !fits(1, f.height) || !fits(2, f.depth) {
-        return Err("a box outside the footprint");
     }
     let block = block as u32;
     if at.iter().take(2).any(|n| n % block != 0) || [left, top].iter().any(|n| n % block != 0) {
         return Err("a box not on a block");
     }
-    // The box alone, packed into host memory of the list's own.
+    // A box to the edge of a mip that ends inside a block takes the block
+    // whole (the host's extents, checked above, are whole blocks).
+    let (right, bottom) = (right.next_multiple_of(block), bottom.next_multiple_of(block));
+    let f = &dst.footprint;
+    let size = [right - left, bottom - top, back - front];
+    let fits = |n: usize, bound: u32| at[n].checked_add(size[n]).is_some_and(|end| end <= bound);
+    if !fits(0, f.width.next_multiple_of(block))
+        || !fits(1, f.height.next_multiple_of(block))
+        || !fits(2, f.depth)
+    {
+        return Err("a box outside the footprint");
+    }
+    // Depth is only copied whole, and compressed boxes have edge rules of
+    // their own: for these the host copies the whole subresource.
+    let all = depth || block > 1 || size == [whole.Width, whole.Height, whole.Depth];
+    let (copied, origin) = if all {
+        ([whole.Width, whole.Height, whole.Depth], [left, top, front])
+    } else {
+        (size, [0; 3])
+    };
     let (row, rows) = (
-        u64::from(size[0].div_ceil(block)) * element,
-        u64::from(size[1].div_ceil(block)),
+        u64::from(size[0] / block) * element,
+        u64::from(size[1] / block),
     );
-    let pitch = row.next_multiple_of(u64::from(PITCH));
+    // In host memory of the list's own: the copied box's rows.
+    let lines = u64::from(copied[1] / block);
+    let pitch = (u64::from(copied[0] / block) * element).next_multiple_of(u64::from(PITCH));
     let (buffer, data) = host
-        .shared_buffer(pitch * rows * u64::from(size[2]))
+        .shared_buffer(pitch * lines * u64::from(copied[2]))
         .ok_or("no host memory")?;
     list.keep(&buffer);
     // Where its rows go: offset of the first, then by row and by slice.
@@ -726,9 +736,9 @@ fn texture_to_buffer(
         footprint: crate::resource::PlacedFootprint {
             offset: 0,
             format: whole.Format.0 as u32,
-            width: size[0].next_multiple_of(block),
-            height: size[1].next_multiple_of(block),
-            depth: size[2],
+            width: copied[0],
+            height: copied[1],
+            depth: copied[2],
             row_pitch: pitch as u32,
         },
     };
@@ -744,16 +754,20 @@ fn texture_to_buffer(
             0,
             0,
             (&raw const from).cast(),
-            part.then_some(&raw const host_box),
+            (!all).then_some(&raw const host_box),
         )
     };
-    let (to, data) = (to as usize + first as usize, data as usize);
+    // The box's first row in host memory.
+    let start = data as u64
+        + (u64::from(origin[2]) * lines + u64::from(origin[1] / block)) * pitch
+        + u64::from(origin[0] / block) * element;
+    let to = to as usize + first as usize;
     list.defer_read_back(move || {
         crate::watch::writing(to, (span - first) as usize);
         for z in 0..u64::from(size[2]) {
             for y in 0..rows {
                 let out = to as u64 + z * title_slice + y * title_pitch;
-                let from = data as u64 + (z * rows + y) * pitch;
+                let from = start + (z * lines + y) * pitch;
                 crate::host::write_mapped(out as *mut u8, from as *const u8, row as usize);
             }
         }
@@ -1672,12 +1686,7 @@ pub(crate) mod tests {
         // Columns 4 to 12 of rows 2 to 5, to column 1 of row 3.
         copy_texture_region(list, &part, 1, 3, 0, &texture, &[4, 2, 0, 12, 5, 1]);
         copy_texture_region(list, &all, 0, 0, 0, &texture, null);
-        let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
-        assert_eq!(close(list), S_OK);
-        let mut queue = null.cast();
-        let desc = [0u32; 4];
-        crate::queue::create(null.cast(), desc.as_ptr().cast(), &QUEUE_IID, &mut queue);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        submit(list);
 
         let mut expected = vec![0xee; 8192];
         for y in 0..3 {
@@ -1689,7 +1698,156 @@ pub(crate) mod tests {
             expected[to..to + 64].copy_from_slice(&bytes(source, 4096)[from..from + 64]);
         }
         assert!(bytes(target, 8192) == expected);
-        for o in [list, allocator, queue, image, source, target] {
+        for o in [list, allocator, image, source, target] {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        }
+    }
+
+    /// Closes a list and runs it.
+    #[cfg(windows)]
+    fn submit(list: This) {
+        let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+        assert_eq!(close(list), S_OK);
+        let mut queue = std::ptr::null();
+        let desc = [0u32; 4];
+        crate::queue::create(queue, desc.as_ptr().cast(), &QUEUE_IID, &mut queue);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        slot::<extern "system" fn(This) -> u32>(queue, 0x10)(queue);
+    }
+
+    /// Read-back of shapes other than a plain 2D box: a compressed texture's
+    /// inner box and its edge, mips smaller than a block (with a box and
+    /// without), and a box of a 3D texture.
+    #[cfg(windows)]
+    #[test]
+    fn compressed_mips_and_volumes_are_read_back() {
+        use crate::resource::{PlacedFootprint, buffer_bytes, tests as made};
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const BC1: u32 = 71;
+        struct Case {
+            sub: u64,
+            /// Footprint, in texels.
+            footprint: [u32; 3],
+            at: [u32; 3],
+            source_box: Option<[u32; 6]>,
+            /// First byte in a row, row and slice, and their counts: source,
+            /// then target.
+            from: [usize; 3],
+            to: [usize; 3],
+            count: [usize; 3],
+        }
+        let bc = |sub, n, at, source_box, from, to, count| Case {
+            sub,
+            footprint: [n, n, 1],
+            at,
+            source_box,
+            from,
+            to,
+            count,
+        };
+        let cases = [
+            // BC1 20x20 (mip 1 is 10x10, mip 3 is 2x2, mip 4 is 1x1).
+            bc(0, 20, [4, 8, 0], Some([8, 4, 0, 16, 12, 1]), [16, 1, 0], [8, 2, 0], [16, 2, 1]),
+            bc(1, 12, [0; 3], Some([4, 4, 0, 10, 10, 1]), [8, 1, 0], [0; 3], [16, 2, 1]),
+            bc(3, 4, [0; 3], Some([0, 0, 0, 2, 2, 1]), [0; 3], [0; 3], [8, 1, 1]),
+            bc(4, 4, [0; 3], None, [0; 3], [0; 3], [8, 1, 1]),
+            // RGBA 8x8x4.
+            Case {
+                sub: 0,
+                footprint: [8, 8, 4],
+                at: [1, 2, 1],
+                source_box: Some([2, 3, 1, 6, 5, 3]),
+                from: [8, 3, 1],
+                to: [4, 2, 1],
+                count: [16, 2, 2],
+            },
+        ];
+        for (n, case) in cases.iter().enumerate() {
+            let volume = case.footprint[2] > 1;
+            let format = if volume { 28 } else { BC1 };
+            let mut desc = made::texture(20, 20, BC1, 5);
+            if volume {
+                desc = made::volume(8, 8, 4, 28);
+            }
+            let image = made::committed(&desc, COPY_DEST);
+            let source = made::committed(&made::buffer(16384), 0);
+            let target = made::committed(&made::buffer(16384), 0);
+            // SAFETY: the buffers hold this many bytes.
+            let bytes = |b: This| unsafe {
+                std::slice::from_raw_parts_mut(buffer_bytes(b).unwrap().0, 16384)
+            };
+            for (i, b) in bytes(source).iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            bytes(target).fill(0xee);
+            let [width, height, depth] = case.footprint;
+            let footprint =
+                PlacedFootprint { offset: 0, format, width, height, depth, row_pitch: 256 };
+            let buffer_at = |resource| CopyLocation { resource, kind: 1, footprint };
+            let texture = CopyLocation {
+                resource: image,
+                kind: 0,
+                footprint: PlacedFootprint { offset: case.sub, ..footprint },
+            };
+            let (list, allocator) = open_list();
+            let null = std::ptr::null();
+            copy_texture_region(list, &texture, 0, 0, 0, &buffer_at(source), null);
+            let source_box = case.source_box.as_ref().map_or(null, std::ptr::from_ref);
+            let [x, y, z] = case.at;
+            copy_texture_region(list, &buffer_at(target), x, y, z, &texture, source_box);
+            submit(list);
+            let lines = (if volume { height } else { height / 4 }) as usize;
+            let mut expected = vec![0xee; 16384];
+            for z in 0..case.count[2] {
+                for y in 0..case.count[1] {
+                    let at = |p: [usize; 3]| ((p[2] + z) * lines + p[1] + y) * 256 + p[0];
+                    let (from, to) = (at(case.from), at(case.to));
+                    expected[to..to + case.count[0]]
+                        .copy_from_slice(&bytes(source)[from..from + case.count[0]]);
+                }
+            }
+            assert!(bytes(target) == expected, "case {n}");
+            for o in [list, allocator, image, source, target] {
+                slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            }
+        }
+        // SAFETY: a plain query.
+        assert!(unsafe { crate::host::host().unwrap().device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Part of a depth texture, which the host only copies whole.
+    #[cfg(windows)]
+    #[test]
+    fn part_of_a_depth_texture_is_read_back() {
+        use crate::resource::{PlacedFootprint, buffer_bytes, tests as made};
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let image = made::committed(&made::flagged(made::texture(16, 8, 55, 1), 2), 0x10);
+        let target = made::committed(&made::buffer(4096), 0);
+        // SAFETY: the buffer holds this many bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(buffer_bytes(target).unwrap().0, 4096) };
+        bytes.fill(0xee);
+        let footprint =
+            PlacedFootprint { offset: 0, format: 55, width: 16, height: 8, depth: 1, row_pitch: 256 };
+        let texture = CopyLocation { resource: image, kind: 0, footprint };
+        let buffer = CopyLocation { resource: target, kind: 1, footprint };
+        let mut record = [0u64; 16];
+        let handle = record.as_mut_ptr() as u64;
+        crate::descriptor::create_dsv(std::ptr::null(), image, std::ptr::null(), handle);
+        let (list, allocator) = open_list();
+        clear_dsv(list, handle, 1, 1.0, 0, 0, std::ptr::null());
+        copy_texture_region(list, &buffer, 0, 1, 0, &texture, &[4, 2, 0, 8, 4, 1]);
+        submit(list);
+        let mut expected = vec![0xee; 4096];
+        for y in 1..3 {
+            expected[y * 256..y * 256 + 8].fill(0xff);
+        }
+        assert!(*bytes == expected[..]);
+        for o in [list, allocator, image, target] {
             slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         }
     }
