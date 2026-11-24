@@ -1,6 +1,8 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod report;
+mod smoke;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,12 +28,16 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Run a title unattended with the diagnostics build, skip its menus and
+    /// judge each graphics area. On a real GPU this can reset the driver.
+    Smoke(smoke::Smoke),
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Smoke(args) => smoke::run(&root, &args),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
