@@ -45,6 +45,10 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute
 Saves, settings and `crashes.log` are in `%LOCALAPPDATA%\victory\data` by
 default. `victory --help` lists the other commands.
 
+The host uses the high-performance GPU (the first hardware adapter DXGI ranks
+so). `VICTORY_D3D12_ADAPTER=<index|name>` picks another one, by 0-based DXGI
+index or a case-insensitive part of its name.
+
 `victory translate --cache [--pipelines]` translates every shader the title
 can ask for ahead of time (minutes, about 1.3 GB; again after a change of the
 translator), and with `--pipelines` also makes the 27,000 pipelines of its
