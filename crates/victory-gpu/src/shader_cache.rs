@@ -1,13 +1,18 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
-//! `victory-pipeline`'s content-addressed cache, which writes them
-//! atomically; an entry that does not read back is translated again.
+//! cache folder, keyed by the container's content and by what its
+//! translation depends on: the translator's build
+//! ([`victory_shader::BUILD_HASH`]), the loop limit and this file, which
+//! encodes the entries. A rebuild that changes none of these keeps the
+//! cache. Entries go through `victory-pipeline`'s content-addressed cache,
+//! which writes them atomically; an entry that does not read back is
+//! translated again.
 //!
-//! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to `encode` and `decode` too (entries of older builds
-//! are ignored anyway).
+//! Shaders that do not translate are kept too, with the reason: translation
+//! is a pure function of the container, so they fail again. Failures to
+//! read or write the cache are never kept.
+//!
+//! The entry is our own encoding of [`HostShader`], after its BLAKE3: a
+//! field added to it must be added to `encode` and `decode` too.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -36,13 +41,10 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// What a translation depends on beside the container.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -50,21 +52,19 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
+        build_key(victory_shader::BUILD_HASH, limit)
     })
+}
+
+/// The BLAKE3 of the translator's build hash, the loop limit (which a
+/// diagnostics build can change at run time) and this file.
+fn build_key(translator: &str, loop_limit: u32) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&(translator.len() as u64).to_le_bytes());
+    h.update(translator.as_bytes());
+    h.update(&loop_limit.to_le_bytes());
+    h.update(include_bytes!("shader_cache.rs"));
+    *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
@@ -346,6 +346,33 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn the_build_key_follows_the_loop_limit_and_the_translator() {
+        let key = build_key("a", 1 << 20);
+        assert_eq!(build_key("a", 1 << 20), key, "same source, same key");
+        assert_ne!(build_key("a", 1 << 19), key);
+        assert_ne!(build_key("b", 1 << 20), key);
+        assert_eq!(victory_shader::BUILD_HASH.len(), 64);
+    }
+
+    #[test]
+    fn same_source_hits_and_another_loop_limit_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let get = |limit| {
+            let key = build_key(victory_shader::BUILD_HASH, limit);
+            cached(&cache, &key, b"container", |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Ok(shader())
+            })
+        };
+        for (limit, expected) in [(64, 1), (64, 1), (65, 2), (64, 2)] {
+            assert_eq!(get(limit), Ok(shader()));
+            assert_eq!(runs.load(Ordering::Relaxed), expected);
+        }
     }
 
     #[test]
