@@ -1241,6 +1241,38 @@ mod tests {
     }
 
     #[test]
+    fn a_spilled_wave64_mask_is_read_back_as_itself() {
+        let p = build_words(
+            &[
+                0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+                0xD761_0005,
+                0x0001_506A, // v_writelane_b32 v5, vcc_lo, 40
+                0xD761_0005,
+                0x0001_106B, // v_writelane_b32 v5, vcc_hi, 8
+                0xD760_0006,
+                0x0001_5105, // v_readlane_b32 s6, v5, 40
+                0xD760_0007,
+                0x0001_1105, // v_readlane_b32 s7, v5, 8
+                0xD501_0008,
+                0x0019_0280, // v_cndmask_b32 v8, 0, 1, s[6:7]
+                0xE070_0000,
+                0x8000_0800, // buffer_store_dword v8, off, s[0:3], 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let insts = &p.blocks[0].insts;
+        let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names[..2], ["v_cmp_gt_u32", "v_cndmask_b32"], "{names:?}");
+        for half in 0..2 {
+            assert_eq!(
+                insts[1].read(Reg::S(6 + half)),
+                insts[0].write(Reg::S(VCC + half))
+            );
+        }
+    }
+
+    #[test]
     fn joins_get_phis_only_where_values_differ() {
         let code = [
             0xBF06_0100, // s_cmp_eq_u32 s0, s1

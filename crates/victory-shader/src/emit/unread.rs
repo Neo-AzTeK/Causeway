@@ -240,12 +240,7 @@ impl Walk<'_, '_> {
         self.decide(s, b, &mut HashMap::new())
     }
 
-    fn decide(
-        &self,
-        s: &State,
-        b: Bool,
-        memo: &mut HashMap<Bool, Option<Bit>>,
-    ) -> Option<Bit> {
+    fn decide(&self, s: &State, b: Bool, memo: &mut HashMap<Bool, Option<Bit>>) -> Option<Bit> {
         if b == Bool::TRUE || b == Bool::FALSE {
             return Some(Bit::Known(b == Bool::TRUE));
         }
@@ -331,13 +326,12 @@ impl Walk<'_, '_> {
                 None => &v,
             };
             s.tainted.contains(&v)
-                || self.x.st.masks.contains_key(mask)
-                    && self.bit_of(s, *mask) == Some(Bit::Tainted)
-                || !self.x.st.masks.contains_key(mask)
-                    && s.bits.get(&v) == Some(&Bit::Tainted)
+                || self.x.st.masks.contains_key(mask) && self.bit_of(s, *mask) == Some(Bit::Tainted)
+                || !self.x.st.masks.contains_key(mask) && s.bits.get(&v) == Some(&Bit::Tainted)
         };
         // EXEC of a vector instruction is its guard.
-        let reads = |r: &(Reg, Value)| sop || !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1);
+        let reads =
+            |r: &(Reg, Value)| sop || !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1);
         let mut tainted = inst.reads.iter().filter(|r| reads(r)).any(|r| taints(r.1));
         let guard = match self.x.st.guards[b][i] {
             None => Some(Bit::Known(true)),
@@ -366,7 +360,9 @@ impl Walk<'_, '_> {
             && ["image_sample", "image_gather4", "image_get_lod"]
                 .iter()
                 .any(|p| name.starts_with(p))
-            && !name.split('_').any(|t| matches!(t, "lz" | "l" | "d" | "cd"));
+            && !name
+                .split('_')
+                .any(|t| matches!(t, "lz" | "l" | "d" | "cd"));
         let memory = matches!(
             inst.fields,
             Fields::Image { .. } | Fields::Buffer { .. } | Fields::Ds { .. } | Fields::Flat { .. }
@@ -419,7 +415,10 @@ impl Walk<'_, '_> {
                 if plain(inst)
                     && let Some(Bit::Known(k)) = bit
                 {
-                    result = v.src.get(usize::from(k)).and_then(|o| self.value(s, inst, o));
+                    result = v
+                        .src
+                        .get(usize::from(k))
+                        .and_then(|o| self.value(s, inst, o));
                 }
             } else if name == "v_mov_b32" && plain(inst) {
                 result = v.src.first().and_then(|o| self.value(s, inst, o));
