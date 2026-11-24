@@ -911,5 +911,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "miniz_oxide",
+ "victory-core",
  "walkdir",
+ "windows-sys",
 ]

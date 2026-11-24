@@ -128,6 +128,13 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
+`cargo xtask smoke --exe <title exe> --out <folder outside the repository>`
+runs a title unattended with this build (300 s, `--seconds`), skips its menus
+with `VICTORY_KEYS` (`--keys` replaces them; they do nothing while an XInput pad is
+connected), and judges each graphics area in `report.txt` and `report.json`.
+`--log <file>` judges an existing log instead. It exits with an error when an
+area failed; what a log does not show is "unknown".
+
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 

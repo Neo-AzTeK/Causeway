@@ -1,0 +1,831 @@
+//! What a run's log says about each graphics area. Everything is read from
+//! the log (and the frames it names), so a log can be judged again later;
+//! what a log does not show is "unknown", never a pass.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+/// Draws and dispatches asked for per frame that mean the menus draw. The
+/// title's first screens ask for 3 to 7.
+const MENU_DRAWS: f64 = 20.0;
+/// The same for the world: menus ask for 60 at most, the world thousands.
+const WORLD_DRAWS: f64 = 300.0;
+/// World log lines (one per 5 s or slower) that anything passes from.
+const WORLD_LINES: usize = 3;
+/// The console's frame rate, less measuring noise; then playable.
+const FPS_PASS: f64 = 27.0;
+const FPS_WARN: f64 = 15.0;
+/// Share of the draws and dispatches asked for that were dropped.
+const DROPPED_PASS: f64 = 0.001;
+const DROPPED_WARN: f64 = 0.05;
+/// Distinct problems of one kind that still warn instead of failing.
+const FEW: usize = 3;
+/// Frames before this one are black while the title starts.
+const STARTUP_FRAMES: u64 = 60;
+/// Black frames in an otherwise drawn run that cuts and fades explain.
+const BLACK_WARN: usize = 5;
+/// A channel range this small over a whole frame is one flat color.
+const FLAT_RANGE: u8 = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Status {
+    Pass,
+    Warn,
+    Fail,
+    Unknown,
+}
+
+impl Status {
+    fn name(self) -> &'static str {
+        match self {
+            Status::Pass => "pass",
+            Status::Warn => "warn",
+            Status::Fail => "fail",
+            Status::Unknown => "unknown",
+        }
+    }
+}
+
+pub struct Area {
+    pub name: &'static str,
+    pub status: Status,
+    pub detail: String,
+}
+
+/// How the process ended, when we ran it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum End {
+    /// Still running when its time was up.
+    TimedOut,
+    Exited(Option<i32>),
+}
+
+/// The log's "fps, ms/frame" line.
+#[derive(Clone, PartialEq, Debug, Default)]
+struct Rate {
+    time: String,
+    fps: f64,
+    ms: f64,
+    preparing: f64,
+    gpu: f64,
+    copy_back: f64,
+    draws: f64,
+    dropped: f64,
+    making: f64,
+    indirect: f64,
+}
+
+impl Rate {
+    fn parse(line: &str) -> Option<Rate> {
+        Some(Rate {
+            time: line.split_whitespace().next()?.to_owned(),
+            fps: before(line, " fps, ")?,
+            ms: before(line, " ms/frame (")?,
+            preparing: before(line, " preparing: ")?,
+            gpu: before(line, " on the GPU; ")?,
+            copy_back: before(line, " copying back ")?,
+            draws: before(line, " draws/frame, dropped ")?,
+            dropped: before(line, " without a host pipeline (")?,
+            making: before(line, " being made)")?,
+            indirect: before(line, " indirect")?,
+        })
+    }
+
+    fn asked(&self) -> f64 {
+        self.draws + self.dropped + self.indirect
+    }
+
+    fn dropped_share(&self) -> f64 {
+        (self.dropped + self.indirect) / self.asked().max(1.0)
+    }
+}
+
+/// The number that ends where `marker` starts.
+fn before(line: &str, marker: &str) -> Option<f64> {
+    let head = &line[..line.find(marker)?];
+    let start = head.rfind(|c: char| !c.is_ascii_digit() && c != '.').map_or(0, |i| i + 1);
+    // A space or bracket: one byte.
+    head.get(start..)?.parse().ok()
+}
+
+/// The value of a `key=value` field; quotes and brackets are kept whole.
+fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let start = line.find(&format!(" {key}="))? + key.len() + 2;
+    let rest = &line[start..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return quoted.split('"').next();
+    }
+    if rest.starts_with('[') {
+        return Some(&rest[..=rest.find(']')?]);
+    }
+    rest.split_whitespace().next()
+}
+
+/// Without terminal escape sequences (`ESC [ ... letter`).
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find("\x1b[") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 2..];
+        rest = rest.find(|c: char| c.is_ascii_alphabetic()).map_or("", |end| &rest[end + 1..]);
+    }
+    out.push_str(rest);
+    out
+}
+
+#[derive(Default)]
+pub struct Log {
+    rates: Vec<Rate>,
+    /// The highest frame a line names.
+    frames: u64,
+    /// A host device, and a diagnostics build, were seen.
+    device: bool,
+    diagnostics: bool,
+    /// Run on the software adapter; the log does not say.
+    pub warp: bool,
+    removed: Vec<String>,
+    crashes: Vec<String>,
+    /// Shaders: the error.
+    refused: BTreeMap<String, String>,
+    /// Shader hash: stage, error.
+    untranslated: BTreeMap<String, (String, String)>,
+    black: Vec<u64>,
+    methods: BTreeSet<String>,
+    other_methods: BTreeSet<String>,
+    resources: BTreeSet<String>,
+    /// Frames saved, and whether the world had been reached.
+    captures: Vec<(PathBuf, bool)>,
+    /// The stand-in pad, and a real one, were connected.
+    stand_in: bool,
+    pad: bool,
+}
+
+/// Messages of `victory_gpu` about a resource or view that was not made.
+const NOT_MADE: &[&str] = &[
+    "no host texture",
+    "no size for this resource",
+    "no footprint for this resource",
+    "placed resource does not fit",
+    "no host descriptor heap",
+    "title slot past the host heap",
+    "no free dynamic descriptor slots",
+    "no upload buffer",
+    "no shared buffer",
+    "no swap chain",
+    "cannot present this format",
+    "texture not detiled",
+    "view the host does not allow",
+    "view format of another family",
+    "view not on an element of its host copy",
+    "unordered access to a buffer whose host copy shaders cannot write",
+    "constant buffer not 256-byte aligned",
+    "texture view not mirrored",
+];
+
+impl Log {
+    pub fn parse(text: &str) -> Log {
+        let mut log = Log::default();
+        for line in text.lines() {
+            log.line(&plain(line));
+        }
+        log
+    }
+
+    fn line(&mut self, line: &str) {
+        if line.contains("VIctory: unhandled exception")
+            || (line.contains("VIctory: unimplemented import") && line.contains(" called"))
+            || (line.starts_with("thread '") && line.contains(" panicked at"))
+        {
+            self.crashes.push(line.to_owned());
+        }
+        if line.contains(" ERROR victory_gpu::host:") || line.contains("device removed:") {
+            self.removed.push(line.to_owned());
+        }
+        let warn = line.contains(" WARN ");
+        if !warn && !line.contains(" INFO ") {
+            return;
+        }
+        if line.contains("victory_gpu::host: ")
+            && let Some(rate) = Rate::parse(line)
+        {
+            self.rates.push(rate);
+            return;
+        }
+        if line.contains("victory_hle::modules::gameinput: input device device=")
+            && line.contains("connected=true")
+        {
+            // Devices 0 to 3 are the XInput slots, 4 the stand-in pad.
+            match field(line, "device").and_then(|d| d.parse::<u32>().ok()) {
+                Some(0..4) => self.pad = true,
+                Some(4) => self.stand_in = true,
+                _ => {}
+            }
+        }
+        if line.contains("victory_gpu::capture: frame saved") {
+            // The line's last field: a path may hold spaces.
+            if let Some((_, path)) = line.split_once(" path=") {
+                let world = self.world().next().is_some();
+                self.captures.push((path.trim().into(), world));
+            }
+            return;
+        }
+        if !line.contains(" victory_gpu::") {
+            if warn && line.contains("implemented") {
+                self.other_methods.insert(message(line));
+            }
+            return;
+        }
+        if let Some(frame) = field(line, "frame").and_then(|f| f.parse().ok()) {
+            self.frames = self.frames.max(frame);
+        }
+        self.device |= line.contains("host D3D12 device ready");
+        self.diagnostics |= line.contains("copies per frame: ");
+        if !warn {
+            return;
+        }
+        if line.contains("no host D3D12 device") || line.contains("no host GPU runs them") {
+            self.removed.push(line.to_owned());
+        } else if line.contains("pipeline refused") || line.contains("root signature refused") {
+            let shaders = field(line, "shaders").unwrap_or("?").to_owned();
+            self.refused.insert(shaders, error(line));
+        } else if line.contains("no host pipeline: ") {
+            let shaders = field(line, "shaders").unwrap_or("?").to_owned();
+            self.refused.insert(shaders, message(line));
+        } else if line.contains("shader does not translate") {
+            let get = |key| field(line, key).unwrap_or("?").to_owned();
+            self.untranslated.insert(get("hash"), (get("stage"), error(line)));
+        } else if line.contains("a black frame after a frame that was not") {
+            self.black.extend(field(line, "frame").and_then(|f| f.parse::<u64>().ok()));
+        } else if line.contains("implemented") {
+            self.methods.insert(message(line));
+        } else if NOT_MADE.iter().any(|m| line.contains(m)) {
+            self.resources.insert(message(line));
+        }
+    }
+
+    fn world(&self) -> impl Iterator<Item = &Rate> {
+        self.rates.iter().filter(|r| r.asked() >= WORLD_DRAWS)
+    }
+
+    /// The report's areas. `flat` says whether a saved frame is one color
+    /// (`None`: it cannot be read).
+    pub fn judge(&self, end: Option<End>, flat: impl Fn(&Path) -> Option<bool>) -> Vec<Area> {
+        let world: Vec<&Rate> = self.world().collect();
+        // A clean log of less of the world than this shows nothing yet.
+        let settled = world.len() >= WORLD_LINES;
+        let mut areas = Vec::new();
+        let mut add = |name, (status, detail)| areas.push(Area { name, status, detail });
+
+        add("menu reached", match self.rates.iter().find(|r| r.asked() >= MENU_DRAWS) {
+            Some(r) => (Status::Pass, format!("drawing at {} (inferred from draw counts)", r.time)),
+            None if self.rates.is_empty() => (Status::Unknown, "no frame-rate lines".into()),
+            None => (Status::Fail, "never more draws than the first screens".into()),
+        });
+
+        let most = self.rates.iter().map(Rate::asked).fold(0.0, f64::max);
+        add("world reached", match world.first() {
+            Some(r) => (
+                Status::Pass,
+                format!("at {}, {} lines (inferred from draw counts)", r.time, world.len()),
+            ),
+            None if self.rates.is_empty() => (Status::Unknown, "no frame-rate lines".into()),
+            None => (Status::Fail, format!("at most {most:.0} draws/frame asked for")),
+        });
+
+        add("crash", match (self.crashes.first(), end) {
+            (Some(first), _) => (Status::Fail, clip(first)),
+            (None, Some(End::TimedOut)) => {
+                (Status::Pass, "running until its time was up".into())
+            }
+            (None, Some(End::Exited(code))) => {
+                let code = code.map_or("no code".into(), |c| format!("{c:#x}"));
+                (Status::Fail, format!("ended by itself, exit code {code}"))
+            }
+            (None, None) => {
+                (Status::Unknown, "no crash line; the log does not say how it ended".into())
+            }
+        });
+
+        add("device removed", match self.removed.first() {
+            Some(first) => (Status::Fail, clip(first)),
+            None if !self.device => (Status::Unknown, "no host device line".into()),
+            None if !settled => (Status::Unknown, "no, but too little of the world ran".into()),
+            None => (Status::Pass, "no".into()),
+        });
+
+        add("world frame rate", match median(&world, |r| r.fps) {
+            None => (Status::Unknown, "no world frames".into()),
+            Some(r) => {
+                let few = !settled;
+                let status = match r.fps {
+                    _ if few => Status::Unknown,
+                    fps if fps >= FPS_PASS => Status::Pass,
+                    fps if fps >= FPS_WARN => Status::Warn,
+                    _ => Status::Fail,
+                };
+                let detail = format!(
+                    "{:.1} fps, {:.1} ms: {:.1} preparing, {:.1} GPU, {:.1} copying back \
+                     (median of {} world lines{})",
+                    r.fps,
+                    r.ms,
+                    r.preparing,
+                    r.gpu,
+                    r.copy_back,
+                    world.len(),
+                    if few { ", too few to judge" } else { "" }
+                );
+                (status, detail)
+            }
+        });
+
+        add("drawn vs dropped", self.drops(&world));
+
+        
+        let count = |n: usize, detail: String| match n {
+            0 if settled => (Status::Pass, "none".into()),
+            0 => (Status::Unknown, "none, but too little of the world ran".into()),
+            n if n <= FEW => (Status::Warn, format!("{n}: {detail}")),
+            n => (Status::Fail, format!("{n}: {detail}")),
+        };
+        let set = |s: &BTreeSet<String>| count(s.len(), tally(s.iter().map(String::as_str)));
+
+        let reasons = tally(self.refused.values().map(String::as_str));
+        add("pipelines refused", count(self.refused.len(), reasons));
+
+        const STAGES: [(&str, &str); 4] = [
+            ("vertex", "untranslated vertex"),
+            ("pixel", "untranslated pixel"),
+            ("mesh", "untranslated mesh"),
+            ("compute", "untranslated compute"),
+        ];
+        let untranslated = |keep: &dyn Fn(&str) -> bool| {
+            let errors = self.untranslated.values().filter(|(s, _)| keep(s));
+            let errors: Vec<&str> = errors.map(|(_, e)| e.as_str()).collect();
+            count(errors.len(), tally(errors.iter().copied()))
+        };
+        for (stage, name) in STAGES {
+            add(name, untranslated(&|s| s == stage));
+        }
+        add("untranslated other", untranslated(&|s| STAGES.iter().all(|(stage, _)| s != *stage)));
+
+        let black: Vec<u64> =
+            self.black.iter().copied().filter(|&f| f >= STARTUP_FRAMES).collect();
+        add("black frames", match black.len() {
+            0 if !self.diagnostics => (Status::Unknown, "not a diagnostics build's log".into()),
+            0 if !settled => (Status::Unknown, "none, but too little of the world ran".into()),
+            0 => (Status::Pass, "none".into()),
+            n => (
+                if n <= BLACK_WARN { Status::Warn } else { Status::Fail },
+                format!("{n} after a drawn frame (cuts, fades or glitches): {}", list(&black)),
+            ),
+        });
+
+        let judged: Vec<bool> =
+            self.captures.iter().filter(|c| c.1).filter_map(|c| flat(&c.0)).collect();
+        let n = judged.iter().filter(|&&f| f).count();
+        let status = match n {
+            _ if judged.is_empty() => Status::Unknown,
+            0 => Status::Pass,
+            n if 2 * n <= judged.len() => Status::Warn,
+            _ => Status::Fail,
+        };
+        add("flat frames", (status, format!("{n} of {} frames saved in the world", judged.len())));
+
+        add("unimplemented graphics", set(&self.methods));
+        // Not graphics, so never a failure, but a missing call explains much.
+        add("unimplemented other", match set(&self.other_methods) {
+            (Status::Fail, detail) => (Status::Warn, detail),
+            other => other,
+        });
+        add("textures/views not made", set(&self.resources));
+        areas
+    }
+
+    fn drops(&self, world: &[&Rate]) -> (Status, String) {
+        let detail = |r: &Rate| {
+            format!(
+                "{:.0} drawn, {:.0} dropped without a pipeline ({:.0} pipelines being made), \
+                 {:.0} indirect dropped per frame ({:.1}%)",
+                r.draws,
+                r.dropped,
+                r.making,
+                r.indirect,
+                100.0 * r.dropped_share()
+            )
+        };
+        if let Some(r) = median(world, Rate::dropped_share) {
+            let status = match r.dropped_share() {
+                share if share > DROPPED_WARN => Status::Fail,
+                share if share > DROPPED_PASS => Status::Warn,
+                _ if world.len() >= WORLD_LINES => Status::Pass,
+                _ => Status::Unknown,
+            };
+            return (status, detail(r));
+        }
+        let worst = |a: &&Rate, b: &&Rate| a.dropped_share().total_cmp(&b.dropped_share());
+        match self.rates.iter().max_by(worst) {
+            // Of the menus the worst line: what they drop for a moment is
+            // worth a look, not a failure.
+            Some(r) if r.dropped_share() > DROPPED_PASS => {
+                (Status::Warn, format!("menus at worst: {}", detail(r)))
+            }
+            Some(_) => (Status::Unknown, "none dropped, but only menus were drawn".into()),
+            None => (Status::Unknown, "no frame-rate lines".into()),
+        }
+    }
+
+    /// Scripted keys become pad buttons only through the stand-in pad.
+    fn pad(&self) -> &'static str {
+        match (self.pad, self.stand_in) {
+            (true, _) => "connected: scripted keys did not become buttons while it was",
+            (false, true) => "none: the stand-in pad took the keys",
+            (false, false) => "unknown: the log names no pad",
+        }
+    }
+
+    fn adapter(&self) -> &'static str {
+        if self.warp {
+            "software (VICTORY_D3D12_WARP)"
+        } else {
+            "unknown: the log does not name it"
+        }
+    }
+
+    pub fn text(&self, areas: &[Area]) -> String {
+        let count = |s| areas.iter().filter(|a| a.status == s).count();
+        let mut out = format!(
+            "{} fail, {} warn, {} unknown, {} pass; last frame named {}\n",
+            count(Status::Fail),
+            count(Status::Warn),
+            count(Status::Unknown),
+            count(Status::Pass),
+            self.frames
+        );
+        let _ = writeln!(out, "XInput pad: {}", self.pad());
+        let _ = writeln!(out, "adapter: {}", self.adapter());
+        for a in areas {
+            let _ = writeln!(out, "{:<8} {:<24} {}", a.status.name(), a.name, a.detail);
+        }
+        out
+    }
+
+    pub fn json(&self, areas: &[Area]) -> String {
+        let objects = |rows: Vec<Vec<(&str, &str)>>| {
+            let rows = rows.iter().map(|row| {
+                let fields: Vec<_> =
+                    row.iter().map(|(k, v)| format!("{}: {}", quote(k), quote(v))).collect();
+                format!("\n    {{{}}}", fields.join(", "))
+            });
+            rows.collect::<Vec<_>>().join(",")
+        };
+        let judged = areas.iter().map(|a| {
+            vec![("area", a.name), ("status", a.status.name()), ("detail", a.detail.as_str())]
+        });
+        let untranslated = self.untranslated.iter().map(|(hash, (stage, error))| {
+            vec![("hash", hash.as_str()), ("stage", stage), ("error", error)]
+        });
+        let refused = self.refused.iter().map(|(shaders, error)| {
+            vec![("shaders", shaders.as_str()), ("error", error)]
+        });
+        format!(
+            "{{\n  \"frames\": {},\n  \"xinput_pad\": {},\n  \"adapter\": {},\n  \"areas\": \
+             [{}\n  ],\n  \"untranslated\": [{}\n  ],\n  \"refused\": [{}\n  ]\n}}\n",
+            self.frames,
+            quote(self.pad()),
+            quote(self.adapter()),
+            objects(judged.collect()),
+            objects(untranslated.collect()),
+            objects(refused.collect())
+        )
+    }
+}
+
+fn median<'a>(rates: &[&'a Rate], by: impl Fn(&Rate) -> f64) -> Option<&'a Rate> {
+    let mut sorted = rates.to_vec();
+    sorted.sort_by(|a, b| by(a).total_cmp(&by(b)));
+    sorted.get(sorted.len() / 2).copied()
+}
+
+/// What follows the target, without the time.
+fn message(line: &str) -> String {
+    let start = line.find(" victory_").unwrap_or(0);
+    let rest = line[start..].trim();
+    clip(rest.split_once(": ").map_or(rest, |(_, m)| m))
+}
+
+/// The `error` field, without the place in the code or the fields after.
+fn error(line: &str) -> String {
+    let Some((_, text)) = line.split_once(" error=") else {
+        return "?".into();
+    };
+    let text = text.split_once(" shaders=").map_or(text, |(e, _)| e);
+    let text = match text.split_once(" code at 0x") {
+        Some((_, rest)) => rest.split_once(": ").map_or(text, |(_, e)| e),
+        None => text,
+    };
+    clip(text)
+}
+
+fn clip(text: &str) -> String {
+    const LONGEST: usize = 200;
+    match text.char_indices().nth(LONGEST) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_owned(),
+    }
+}
+
+/// The most common entries, with their counts.
+fn tally<'a>(entries: impl Iterator<Item = &'a str>) -> String {
+    const SHOWN: usize = 4;
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for e in entries {
+        *counts.entry(e).or_default() += 1;
+    }
+    let mut counts: Vec<_> = counts.into_iter().collect();
+    counts.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    let shown = counts.iter().take(SHOWN).map(|(e, n)| match n {
+        1 => (*e).to_owned(),
+        n => format!("{n}x {e}"),
+    });
+    let mut text = shown.collect::<Vec<_>>().join("; ");
+    if counts.len() > SHOWN {
+        let _ = write!(text, "; {} more kinds", counts.len() - SHOWN);
+    }
+    text
+}
+
+fn list(frames: &[u64]) -> String {
+    const SHOWN: usize = 10;
+    let shown: Vec<_> = frames.iter().take(SHOWN).map(u64::to_string).collect();
+    shown.join(", ") + if frames.len() > SHOWN { ", ..." } else { "" }
+}
+
+/// A JSON string.
+fn quote(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' | '\\' => out.extend(['\\', c]),
+            c if c < ' ' => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Whether a frame saved by the diagnostics build is one color; `None` for
+/// anything but the 8-bit RGB, filter 0, single chunk files it writes.
+pub fn flat_png(png: &[u8]) -> Option<bool> {
+    let mut rest = png.strip_prefix(b"\x89PNG\r\n\x1a\n")?;
+    let (mut width, mut data) = (0, None);
+    while rest.len() >= 12 {
+        let len = u32::from_be_bytes(rest[..4].try_into().ok()?) as usize;
+        let body = rest.get(8..8usize.checked_add(len)?)?;
+        match &rest[4..8] {
+            b"IHDR" => {
+                width = u32::from_be_bytes(body.get(..4)?.try_into().ok()?) as usize;
+                if body.get(8..13)? != [8, 2, 0, 0, 0] {
+                    return None;
+                }
+            }
+            b"IDAT" if data.is_none() => data = Some(body),
+            b"IDAT" => return None,
+            _ => {}
+        }
+        rest = rest.get(len.checked_add(12)?..)?;
+    }
+    let row = width.checked_mul(3)?.checked_add(1)?;
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(data?).ok()?;
+    if width == 0 || raw.is_empty() || raw.len() % row != 0 {
+        return None;
+    }
+    let (mut low, mut high) = ([u8::MAX; 3], [0; 3]);
+    for line in raw.chunks_exact(row) {
+        if line[0] != 0 {
+            return None;
+        }
+        for pixel in line[1..].as_chunks::<3>().0 {
+            for c in 0..3 {
+                low[c] = low[c].min(pixel[c]);
+                high[c] = high[c].max(pixel[c]);
+            }
+        }
+    }
+    Some((0..3).all(|c| high[c] - low[c] <= FLAT_RANGE))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rate(fps: f64, draws: u32, dropped: u32, indirect: u32) -> String {
+        format!(
+            "2026-01-01T00:00:00Z \x1b[32m INFO\x1b[0m victory_gpu::host: {fps:.1} fps, 33.3 \
+             ms/frame (1.5 preparing: copies 0.1 ms 0.2 MB, textures 5.4 ms 12.7 MB; 3.9 on the \
+             GPU; 0.4 copying back 0.0 MB), {draws} draws/frame, dropped {dropped} without a host \
+             pipeline (7 being made) and {indirect} indirect\n"
+        )
+    }
+
+    fn gpu(level: &str, text: &str) -> String {
+        format!("2026-01-01T00:00:00Z {level} victory_gpu::{text}\n")
+    }
+
+    fn judge(text: &str, end: Option<End>) -> Vec<Area> {
+        Log::parse(text).judge(end, |_| None)
+    }
+
+    fn status(areas: &[Area], name: &str) -> Status {
+        areas.iter().find(|a| a.name == name).unwrap().status
+    }
+
+    fn healthy() -> String {
+        gpu("INFO", "host: host D3D12 device ready")
+            + &gpu("INFO", "copystat: copies per frame: 1.0 submissions; 1 title copies")
+            + &rate(30.0, 39, 0, 0)
+            + &rate(29.9, 2000, 0, 0).repeat(3)
+    }
+
+    #[test]
+    fn a_rate_line_is_read_whole() {
+        let r = Rate::parse(&plain(&rate(24.3, 598, 1867, 3264))).unwrap();
+        assert_eq!((r.fps, r.ms, r.preparing, r.gpu, r.copy_back), (24.3, 33.3, 1.5, 3.9, 0.4));
+        assert_eq!((r.draws, r.dropped, r.making, r.indirect), (598.0, 1867.0, 7.0, 3264.0));
+        assert_eq!(Rate::parse("x INFO victory_gpu::host: 1.0 fps, whatever"), None);
+    }
+
+    #[test]
+    fn a_healthy_run_passes_and_a_silent_log_is_unknown() {
+        for a in judge(&healthy(), Some(End::TimedOut)) {
+            // No frame was saved, so nothing shows that they are not flat.
+            let wanted = if a.name == "flat frames" { Status::Unknown } else { Status::Pass };
+            assert_eq!(a.status, wanted, "{}: {}", a.name, a.detail);
+        }
+        for a in judge("", None) {
+            assert_eq!(a.status, Status::Unknown, "{}", a.name);
+        }
+    }
+
+    #[test]
+    fn menus_alone_pass_nothing_about_the_world() {
+        for a in judge(&rate(30.0, 39, 0, 0).repeat(9), None) {
+            let wanted = match a.name {
+                "menu reached" => Status::Pass,
+                "world reached" => Status::Fail,
+                _ => Status::Unknown,
+            };
+            assert_eq!(a.status, wanted, "{}", a.name);
+        }
+        let first = judge(&rate(30.0, 6, 0, 0), None);
+        assert_eq!(status(&first, "menu reached"), Status::Fail);
+        let drops = judge(&rate(30.0, 39, 5, 0), None);
+        assert_eq!(status(&drops, "drawn vs dropped"), Status::Warn);
+    }
+
+    #[test]
+    fn rates_and_drops_are_judged_by_the_median() {
+        let run = |fps: [f64; 3], dropped: u32| {
+            let lines: String = fps.iter().map(|&f| rate(f, 1000, dropped, 0)).collect();
+            judge(&lines, None)
+        };
+        let fps = |fps| status(&run(fps, 0), "world frame rate");
+        assert_eq!(fps([1.0, 30.0, 30.0]), Status::Pass);
+        assert_eq!(fps([30.0, 20.0, 1.0]), Status::Warn);
+        assert_eq!(fps([30.0, 2.0, 1.0]), Status::Fail);
+        let one = judge(&rate(1.0, 1000, 0, 0), None);
+        assert_eq!(status(&one, "world frame rate"), Status::Unknown);
+        assert_eq!(status(&run([30.0; 3], 10), "drawn vs dropped"), Status::Warn);
+        assert_eq!(status(&run([30.0; 3], 100), "drawn vs dropped"), Status::Fail);
+        // A world of which nothing is drawn is still the world.
+        let undrawn = judge(&rate(2.0, 0, 0, 900), None);
+        assert_eq!(status(&undrawn, "drawn vs dropped"), Status::Fail);
+    }
+
+    #[test]
+    fn crashes_and_a_removed_device_fail() {
+        for line in [
+            "VIctory: unhandled exception 0xc0000005 at title+0x1 (read 0x0: unmapped)\n",
+            "VIctory: unimplemented import a.dll!Missing called\n",
+            "thread 'main' panicked at src/x.rs:1:2:\n",
+        ] {
+            let areas = judge(&(healthy() + line), Some(End::TimedOut));
+            assert_eq!(status(&areas, "crash"), Status::Fail, "{line}");
+        }
+        let first_chance = healthy() + "VIctory: first-chance exception 0x1 at title+0x1\n";
+        let crash = |text: &str, end| status(&judge(text, end), "crash");
+        assert_eq!(crash(&first_chance, Some(End::TimedOut)), Status::Pass);
+        assert_eq!(crash(&healthy(), Some(End::Exited(Some(0)))), Status::Fail);
+        assert_eq!(crash(&healthy(), None), Status::Unknown);
+        let removed = healthy() + &gpu("ERROR", "host: host GPU device removed after a submission");
+        assert_eq!(status(&judge(&removed, None), "device removed"), Status::Fail);
+    }
+
+    #[test]
+    fn problems_are_counted_once_each() {
+        let refused = "pipeline::host: host pipeline refused error=The parameter is incorrect. \
+                       (0x80070057) shaders=[compute 01]";
+        let untranslated = |hash: &str| {
+            let text = format!(
+                "pipeline: shader does not translate; its pipelines' draws are dropped \
+                 stage=\"pixel\" hash={hash} error=GFX10 code at 0x1{hash}: op is not supported"
+            );
+            gpu("WARN", &text)
+        };
+        let text = healthy()
+            + &gpu("WARN", refused).repeat(5)
+            + &["a", "b", "c", "d"].map(untranslated).concat()
+            + &gpu("WARN", "object: method not implemented object=\"device\" slot=0x218")
+            + &gpu("WARN", "resource: no host texture error=x desc=ResourceDesc { width: 1 }")
+            + &gpu("WARN", "descriptor::host: view the host does not allow format=3");
+        let log = Log::parse(&text);
+        let areas = log.judge(None, |_| None);
+        for (name, wanted, detail) in [
+            ("pipelines refused", Status::Warn, "1: The parameter is incorrect. (0x80070057)"),
+            ("untranslated pixel", Status::Fail, "4: 4x op is not supported"),
+            ("untranslated compute", Status::Pass, "none"),
+            ("textures/views not made", Status::Warn, "2: "),
+            ("unimplemented graphics", Status::Warn, "1: method not implemented"),
+        ] {
+            let a = areas.iter().find(|a| a.name == name).unwrap();
+            assert_eq!(a.status, wanted, "{name}");
+            assert!(a.detail.starts_with(detail), "{name}: {}", a.detail);
+        }
+        let json = log.json(&areas);
+        assert!(json.contains(r#"{"shaders": "[compute 01]", "error": "The parameter"#), "{json}");
+        assert!(json.contains(r#"object=\"device\""#), "{json}");
+    }
+
+    #[test]
+    fn black_frames_are_judged_past_startup() {
+        let black = |frame: u64| {
+            let text =
+                format!("queue: a black frame after a frame that was not frame={frame} draws=1");
+            gpu("WARN", &text)
+        };
+        let with = |lines: &str| status(&judge(&(healthy() + lines), None), "black frames");
+        assert_eq!(with(&black(1)), Status::Pass);
+        assert_eq!(with(&black(900)), Status::Warn);
+        assert_eq!(with(&(900..910).map(black).collect::<String>()), Status::Fail);
+        // A release build does not look for them.
+        let release = judge(&rate(30.0, 2000, 0, 0), None);
+        assert_eq!(status(&release, "black frames"), Status::Unknown);
+    }
+
+    #[test]
+    fn only_frames_saved_in_the_world_are_looked_at() {
+        let saved = |name: &str| {
+            gpu("INFO", &format!("capture: frame saved path=/a b/{name}.png"))
+        };
+        let log = Log::parse(&(saved("menu") + &healthy() + &saved("one") + &saved("two")));
+        let flat = |flat: &[&str]| {
+            let areas = log.judge(None, |p| Some(flat.iter().any(|f| p.ends_with(f))));
+            status(&areas, "flat frames")
+        };
+        assert_eq!(flat(&["menu.png"]), Status::Pass);
+        assert_eq!(flat(&["one.png"]), Status::Warn);
+        assert_eq!(flat(&["one.png", "two.png"]), Status::Fail);
+        assert_eq!(status(&log.judge(None, |_| None), "flat frames"), Status::Unknown);
+    }
+
+    #[test]
+    fn flat_pictures_are_told_apart() {
+        let png = |raw: &[u8]| {
+            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+            let zlib = miniz_oxide::deflate::compress_to_vec_zlib(raw, 3);
+            let header = [0, 0, 0, 2, 0, 0, 0, 1, 8, 2, 0, 0, 0];
+            for (kind, data) in [(b"IHDR", &header[..]), (b"IDAT", &zlib), (b"IEND", &[])] {
+                png.extend((data.len() as u32).to_be_bytes());
+                png.extend(kind);
+                png.extend(data);
+                png.extend([0; 4]);
+            }
+            png
+        };
+        assert_eq!(flat_png(&png(&[0, 9, 200, 9, 12, 201, 9])), Some(true));
+        assert_eq!(flat_png(&png(&[0, 9, 200, 9, 90, 200, 9])), Some(false));
+        assert_eq!(flat_png(&png(&[1, 9, 200, 9, 9, 200, 9])), None);
+        assert_eq!(flat_png(b"\x89PNG\r\n\x1a\n\xff\xff\xff\xffIDAT----"), None);
+        assert_eq!(flat_png(b"junk"), None);
+    }
+
+    #[test]
+    fn the_pad_that_took_the_keys_is_named() {
+        let pad = |devices: &[u32]| {
+            let lines = devices.iter().map(|i| {
+                format!(
+                    "T  INFO victory_hle::modules::gameinput: input device device={i} \
+                     connected=true\n"
+                )
+            });
+            Log::parse(&lines.collect::<String>()).pad()
+        };
+        assert!(pad(&[4, 5]).starts_with("none"));
+        assert!(pad(&[0, 5]).starts_with("connected"));
+        assert!(pad(&[5]).starts_with("unknown"));
+    }
+}
