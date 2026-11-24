@@ -250,7 +250,6 @@ fn a_descriptor_loaded_again_for_its_size_has_the_first_loads_kind() {
         0x3420_0082, // v_lshlrev_b32 v16, 2, v0
         0x7E04_0280, // v_mov_b32 v2, 0
         0x7E06_0280, // v_mov_b32 v3, 0
-        0x7E10_0280, // v_mov_b32 v8, 0
         0x360E_0081, // v_and_b32 v7, 1, v0
         0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
         0xBE98_037E, // s_mov_b32 s24, exec_lo
@@ -518,5 +517,106 @@ fn wave64_lanes_that_stay_inside_32_run_on_hosts_with_waves_of_32() {
     for (label, out) in run_on(&shader, &views, &[("hardware", false)]) {
         let want: Vec<u32> = (0..64).map(|l| l ^ 1).collect();
         assert_eq!(out[0], want, "{label}");
+    }
+}
+
+/// Runs `body` as one console wave of 64 whose first `threads` lanes exist,
+/// on the hardware if its waves are 32 wide: what each thread stored.
+fn on_waves_of_32(body: &[u32], threads: u32) -> Option<Vec<u32>> {
+    let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
+    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, threads, 0).unwrap();
+    check(&shader);
+    // WARP runs no fixed wave size of 32.
+    if !Host::new(false).is_ok_and(|h| h.has_waves_of(32)) {
+        return None;
+    }
+    let dummy = [[0.0f32; 4]];
+    let views = [View::Texture(1, 1, &dummy), View::RawUav(64)];
+    let mut out = run_on(&shader, &views, &[("hardware", false)]);
+    Some(out.remove(0).1.remove(0)[..threads as usize].to_vec())
+}
+
+#[test]
+fn wave64_lane_numbers_and_ballots_run_on_two_waves_of_32() {
+    let lane = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0008,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v8, -1, v1
+    ];
+    // s[24:25] = lanes below 40.
+    let ballot = [0xD4C4_0018, 0x0002_00A8];
+    let count = [
+        0xBE8A_1018, // s_bcnt1_i32_b64 s10, s[24:25]
+        0x7E10_020A, // v_mov_b32 v8, s10
+    ];
+    let below = [
+        0xD765_0001,
+        0x0001_0018, // v_mbcnt_lo_u32_b32 v1, s24, 0
+        0xD766_0008,
+        0x0002_0219, // v_mbcnt_hi_u32_b32 v8, s25, v1
+    ];
+    // Lanes 48 and up have their EXEC bit clear.
+    for threads in [64, 48] {
+        let n = threads as usize;
+        let want: [(&[u32], Vec<u32>); 3] = [
+            (&lane, (0..n as u32).collect()),
+            (&[&ballot[..], &count].concat(), vec![40; n]),
+            (&[&ballot[..], &below].concat(), (0..n as u32).map(|l| l.min(40)).collect()),
+        ];
+        for (body, want) in want {
+            if let Some(got) = on_waves_of_32(body, threads) {
+                assert_eq!(got, want, "{threads} threads, {body:x?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_wave64_sum_runs_on_two_waves_of_32() {
+    // The lanes' v0 added through lane reads inside a whole-wave section.
+    let mut body = vec![
+        0xBE96_25C1, // s_or_saveexec_b64 s[22:23], -1
+        0xD501_0001,
+        0x005A_0080, // v_cndmask_b32 v1, 0, v0, s[22:23]
+        0x7E10_0280, // v_mov_b32 v8, 0
+    ];
+    for k in 0..64 {
+        body.extend([
+            0xD760_0004,
+            0x101 | (128 + k) << 9, // v_readlane_b32 s4, v1, k
+            0x4A10_1004,            // v_add_nc_u32 v8, s4, v8
+        ]);
+    }
+    body.push(0xBEFE_0416); // s_mov_b64 exec, s[22:23]
+    if let Some(got) = on_waves_of_32(&body, 64) {
+        assert_eq!(got, vec![2016; 64]);
+    }
+}
+
+#[test]
+fn wave64_lane_reads_run_on_two_waves_of_32() {
+    let lane = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0008,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v8, -1, v1
+    ];
+    let mov = 0x7E10_020A; // v_mov_b32 v8, s10
+    let reads: [(Vec<u32>, u32); 3] = [
+        // v_readlane_b32 s10, v8, 40 (the upper wave's lane 8)
+        (vec![0xD760_000A, 0x0001_5108, mov], 40),
+        // v_readlane_b32 s10, v8, 33
+        (vec![0xD760_000A, 0x0001_4308, mov], 33),
+        // v_readfirstlane_b32 s10, v8
+        (vec![0x7E14_0508, mov], 0),
+    ];
+    for threads in [64, 48] {
+        for (read, want) in &reads {
+            let body = [&lane[..], read].concat();
+            if let Some(got) = on_waves_of_32(&body, threads) {
+                assert_eq!(got, vec![*want; threads as usize], "{threads} threads, {read:x?}");
+            }
+        }
     }
 }

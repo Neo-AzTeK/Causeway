@@ -76,6 +76,9 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// Dwords after those, which the translator uses to exchange values
+    /// between the host's waves.
+    pub lds_extra: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -127,6 +130,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            lds_extra: 0,
             lds: None,
             main,
             entry,
@@ -139,7 +143,7 @@ impl Shader {
         if let Some(g) = self.lds {
             return g;
         }
-        let arr = self.m.array(self.lds_dwords, self.t.i32);
+        let arr = self.m.array(self.lds_dwords + self.lds_extra, self.t.i32);
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
         g

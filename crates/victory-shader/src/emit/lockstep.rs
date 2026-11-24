@@ -65,22 +65,26 @@ fn reach(blocks: &[Block], from: usize, without: Option<usize>) -> Vec<bool> {
     seen
 }
 
+/// Blocks every lane runs exactly once: on every path to an end, and on no
+/// loop. A barrier there is reached by every lane.
+pub(super) fn common(blocks: &[Block]) -> Vec<bool> {
+    let ends = |b: usize| blocks[b].exit.successors().is_empty();
+    (0..blocks.len())
+        .map(|b| {
+            let on_every_path = b == 0 || {
+                let around = reach(blocks, 0, Some(b));
+                !ends(0) && !(0..blocks.len()).any(|e| around[e] && ends(e))
+            };
+            on_every_path && !reach(blocks, b, None)[b]
+        })
+        .collect()
+}
 /// Where barriers go, as (block, the instruction they precede; its count of
 /// instructions: the block's end). None if barriers cannot keep the order.
 pub(super) fn barriers(blocks: &[Block]) -> Option<Vec<(usize, usize)>> {
     let order = ir::reverse_postorder(blocks);
-    let ends = |b: usize| blocks[b].exit.successors().is_empty();
-    // Blocks every lane runs exactly once: on every path to an end, and on
-    // no loop.
     let in_loop: Vec<bool> = (0..blocks.len()).map(|b| reach(blocks, b, None)[b]).collect();
-    let common = |b: usize| {
-        let on_every_path = b == 0 || {
-            let around = reach(blocks, 0, Some(b));
-            !ends(0) && !(0..blocks.len()).any(|e| around[e] && ends(e))
-        };
-        on_every_path && !in_loop[b]
-    };
-    let common: Vec<bool> = (0..blocks.len()).map(common).collect();
+    let common = common(blocks);
     let mut at = Vec::new();
     // Accesses since the last barrier, all of which commute.
     let mut since: Vec<Access> = Vec::new();
