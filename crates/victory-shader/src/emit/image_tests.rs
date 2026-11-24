@@ -24,7 +24,7 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 /// s0 (a texture of kind `image` at dword 0, a raw UAV at dword 8) and the
 /// table of samplers at s1; or why it does not translate.
 pub(super) fn translate(body: &[u32], image: ResourceType) -> Result<HostShader, ShaderError> {
-    translate_with(body, image, 8, 0)
+    translate_with(body, image, 8, 0, false)
 }
 
 /// [`translate`] with another view at dword 0: the dwords of its descriptor
@@ -34,6 +34,7 @@ pub(super) fn translate_with(
     image: ResourceType,
     dwords: u8,
     stride: u32,
+    wave64: bool,
 ) -> Result<HostShader, ShaderError> {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
@@ -55,7 +56,7 @@ pub(super) fn translate_with(
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![table(0), table(1)],
         used: vec![
@@ -267,5 +268,45 @@ fn a_64_bit_image_atomic_returns_the_old_value() {
         assert_eq!(out[0], vec![0; 64], "{label}");
         let want: Vec<u32> = (0..32).map(|n| 0x100 + n).collect();
         assert_eq!(out[1], want, "{label}");
+    }
+}
+
+#[test]
+fn a_64_bit_compare_and_swap_or_subtraction_carries_across_the_dwords() {
+    // Each lane on its own texel: even lanes swap {0x100 + n : n} into the
+    // zeros, odd lanes compare with {1 : 0} and do not; then all subtract
+    // n + 1.
+    let body = [
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3604_0083, // v_and_b32 v2, 3, v0
+        0x2C06_0082, // v_lshrrev_b32 v3, 2, v0
+        0x7E08_0300, // v_mov_b32 v4, v0
+        0x4A0A_00FF,
+        0x0000_0100, // v_add_nc_u32 v5, 0x100, v0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x4A14_0081, // v_add_nc_u32 v10, 1, v0
+        0x7E16_0280, // v_mov_b32 v11, 0
+        0xF040_1F08,
+        0x0003_0402, // image_atomic_cmpswap v[4:7], v[2:3], s[12:19] dmask:0xf unorm
+        0xF048_1308,
+        0x0003_0A02, // image_atomic_sub v[10:11], v[2:3], s[12:19] dmask:0x3 unorm
+    ];
+    let shader = build(&body, ResourceType::Uav, true);
+    for (label, out) in run(&shader, &[View::Uint2TextureUav(4, 8), View::RawUav(32)]) {
+        let want: Vec<u32> = (0..32u32)
+            .flat_map(|n| {
+                let old = if n & 1 == 0 {
+                    (u64::from(0x100 + n) << 32) | u64::from(n)
+                } else {
+                    0
+                };
+                let x = old.wrapping_sub(u64::from(n) + 1);
+                [x as u32, (x >> 32) as u32]
+            })
+            .collect();
+        assert_eq!(out[0], want, "{label}");
     }
 }

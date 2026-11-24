@@ -12,7 +12,7 @@
 //! compares of them and the lane booleans they decide fold branches, and
 //! everything computed from the dword is tainted. A tainted operand of
 //! anything other lanes or memory see (a store, an export, a cross-lane
-//! operation, an implicit derivative), a tainted branch, or a tainted guard
+//! operation, an implicit derivative, a mask that is counted), a tainted branch, or a tainted guard
 //! of such an instruction ends the proof. The rest of the state is taken to
 //! be arbitrary, so proofs for several edges hold together.
 
@@ -71,6 +71,9 @@ struct Walk<'a, 'b> {
     high: &'b dyn Fn(Value) -> Option<Value>,
     /// Blocks with whole-wave sections.
     sections: &'b dyn Fn(usize) -> bool,
+    /// Masks read as numbers (low dwords) by the block writing them, where
+    /// every lane that passes votes its bit, whether or not it reads them.
+    votes: &'b HashMap<usize, Vec<Value>>,
     defs: HashMap<Value, (usize, usize)>,
 }
 
@@ -83,6 +86,7 @@ pub(super) fn unread(
     missing: &dyn Fn(Value) -> bool,
     high: &dyn Fn(Value) -> Option<Value>,
     sections: &dyn Fn(usize) -> bool,
+    votes: &HashMap<usize, Vec<Value>>,
 ) -> bool {
     let mut defs = HashMap::new();
     for (b, block) in x.p.blocks.iter().enumerate() {
@@ -96,6 +100,7 @@ pub(super) fn unread(
         x,
         high,
         sections,
+        votes,
         defs,
     }
     .run(to, n, missing)
@@ -126,6 +131,10 @@ impl Walk<'_, '_> {
             }
             for i in 0..blocks[b].insts.len() {
                 self.step(&mut s, b, i)?;
+            }
+            let tainted = |m: &Value| self.bit_of(&s, *m) == Some(Bit::Tainted);
+            if self.votes.get(&b).is_some_and(|v| v.iter().any(tainted)) {
+                return None;
             }
             let next = match self.x.st.exits[b] {
                 LaneExit::Jump(t) => vec![t],

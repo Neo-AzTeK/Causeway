@@ -190,7 +190,8 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
-    /// Compute code that reads other lanes: thread ids follow the host
+    /// Compute code that scale a raw access to such a view by its stride. (Root views
+            // are raw.) lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
@@ -1636,7 +1637,7 @@ impl<'a> Lower<'a> {
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
+                let hi = match self.pair_high(v)? {
                     Some(h) => Some(self.get(h)?),
                     None => None,
                 };
@@ -1690,34 +1691,14 @@ impl<'a> Lower<'a> {
 
     /// The value of the high dword of the wave64 register pair whose low
     /// dword holds `lo` (none in wave32).
-    fn pair_high(&self, lo: Value) -> Option<Value> {
+    fn pair_high(&self, lo: Value) -> Result<Option<Value>, Why> {
         if !self.x.native.wave64 {
-            return None;
+            return Ok(None);
         }
-        let p = self.x.p;
-        let pick = |reg: Reg| match reg {
-            Reg::S(c) => Some(Reg::S(c + 1)),
-            _ => None,
-        };
-        if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
-            let h = pick(reg)?;
-            return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
+        match self.x.st.opaque.get(&lo) {
+            Some(&Some(hi)) => Ok(Some(hi)),
+            _ => Err("an opaque lane mask"),
         }
-        if let Some(&(b, i)) = self.phi_at.get(&lo) {
-            let h = pick(p.blocks[b].phis[i].reg)?;
-            return p.blocks[b]
-                .phis
-                .iter()
-                .find(|q| q.reg == h)
-                .map(|q| q.value);
-        }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -2868,7 +2849,9 @@ impl<'a> Lower<'a> {
         if let Some(u) = kind.filter(|u| u.kind == ResourceType::Srv) {
             // A structured buffer is addressed by element and byte: hosts
             // scale a raw access to such a view by its stride.
-            let structured = u.stride >= 4 && u.stride.is_multiple_of(4);
+            let structured = u.stride >= 4
+                && u.stride.is_multiple_of(4)
+                && !src.leaves().iter().any(|l| matches!(l, Source::Built { .. }));
             let props = if structured { (12, u.stride) } else { (11, 0) };
             let h = self.handle(site, src, false, props)?;
             for k in 0..count {
@@ -3121,6 +3104,19 @@ impl<'a> Lower<'a> {
             // Read by scalar loads only: raw and structured buffers, whose
             // stride tells them apart.
             Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
+                let other = self.x.res.descriptors.iter().any(|d| {
+                    let ui = &self.x.p.blocks[d.site.0].insts[d.site.1];
+                    !(matches!(ui.fields, Fields::Smem { .. })
+                        || matches!(ui.fields, Fields::Buffer { format: None, .. })
+                            && !ui.name().contains("_format_"))
+                        && d.source.leaves().into_iter().any(|l| {
+                            matches!(*l, Source::Loaded { load, .. }
+                                if load == site || self.same_entry(load, site))
+                        })
+                });
+                if other {
+                    return Err("a scalar memory read as data");
+                }
                 let stride = match used {
                     Some(u) if u.kind == ResourceType::Srv => u.stride,
                     _ => return Err("a scalar memory read as data"),
@@ -7044,21 +7040,45 @@ impl<'a> Lower<'a> {
 
     /// Whether no effect of a lane entering block `b` over predecessor `n`
     /// needs what has no DXIL form there (see [`super::unread`]).
-    fn unread(&self, b: usize, n: usize, done: &mut HashMap<(usize, usize), bool>) -> bool {
+    fn unread(
+        &self,
+        b: usize,
+        n: usize,
+        votes: &HashMap<usize, Vec<Value>>,
+        done: &mut HashMap<(usize, usize), bool>,
+    ) -> bool {
         *done.entry((b, n)).or_insert_with(|| {
             super::unread::unread(
                 self.x,
                 b,
                 n,
                 &|v| !matches!(self.vals.get(&v), Some(Val::I32(_) | Val::Bit(_))),
-                &|v| self.pair_high(v),
+                &|v| self.pair_high(v).ok().flatten(),
                 &|b| self.sections.contains_key(&b),
+                votes,
             )
         })
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        // Mask joins first: their bits may read data joins and vote.
+        while let Some((v, b, i)) = self.pending_masks.pop() {
+            let phi = &p.blocks[b].phis[i];
+            let offset = p.blocks[b].offset;
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let m =
+                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
+                        unsupported(offset, "a lane-mask join of an untracked mask")
+                    })?;
+                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                incoming.push((x, qb));
+            }
+            self.s.m.set_phi(v, incoming);
+        }
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly.
@@ -7074,6 +7094,12 @@ impl<'a> Lower<'a> {
             }
         }
         let mut unread = HashMap::new();
+        let mut votes: HashMap<usize, Vec<Value>> = HashMap::new();
+        for lo in self.ballots.keys() {
+            if let Some(&b) = self.def_block.get(lo) {
+                votes.entry(b).or_default().push(*lo);
+            }
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -7086,11 +7112,17 @@ impl<'a> Lower<'a> {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     _ if self.read_phis.contains(&phi.value) => {
                         let why = match self.vals.get(&arg) {
-                            Some(Val::Missing(why)) => why,
-                            Some(Val::Bit(_)) if !bit => "an SCC joined with SGPR values",
-                            _ => "a join of mismatched values",
+                            Some(&Val::Missing(why)) => {
+                                if self.unread(b, n, &votes, &mut unread) {
+                                    None
+                                } else {
+                                    Some(why)
+                                }
+                            }
+                            Some(Val::Bit(_)) if !bit => Some("an SCC joined with SGPR values"),
+                            _ => Some("a join of mismatched values"),
                         };
-                        if !self.unread(b, n, &mut unread) {
+                        if let Some(why) = why {
                             return Err(Stop::Retry(phi.value, why));
                         }
                         // No lane from this edge uses it.
@@ -7109,22 +7141,6 @@ impl<'a> Lower<'a> {
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
-        }
-        while let Some((v, b, i)) = self.pending_masks.pop() {
-            let phi = &p.blocks[b].phis[i];
-            let offset = p.blocks[b].offset;
-            let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
-            }
-            self.s.m.set_phi(v, incoming);
         }
         Ok(())
     }
@@ -7232,6 +7248,31 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    #[test]
+    fn a_root_buffer_with_a_stride_is_loaded_as_raw() {
+        let words = [
+            0xBE82_03C1, // s_mov_b32 s2, -1
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF420_0100,
+            0xFA00_0020, // s_buffer_load_dword s4, s[0:3], 0x20
+            0xBF07_8004, // s_cmp_lg_u32 s4, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let used = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 16,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![used]).unwrap();
     }
 
     #[test]

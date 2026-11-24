@@ -152,7 +152,7 @@ fn the_record_count_of_a_scalar_loaded_buffer_is_the_hosts() {
     let data: Vec<u32> = (0..24).map(|n| 1000 * n).collect();
     let run_with = |body: &[u32], stride, view| {
         let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
-        let shader = translate_with(&words, ResourceType::Srv, 4, stride).unwrap();
+        let shader = translate_with(&words, ResourceType::Srv, 4, stride, false).unwrap();
         check(&shader);
         let view = View::Buffer {
             data: &data,
@@ -266,5 +266,159 @@ fn a_descriptor_loaded_again_for_its_size_has_the_first_loads_kind() {
         .collect();
     for (label, out) in run(&shader, &views) {
         assert_eq!(out[0], want, "{label}");
+    }
+}
+
+/// A mask is counted where it is written: a lane whose bit depends on the
+/// reused register votes even if it branches past the count.
+#[test]
+fn a_mask_counted_past_a_branch_on_a_reused_register_is_refused() {
+    let readers: [&[u32]; 5] = [
+        // s_bcnt1_i32_b32 s10, s24; v_mov_b32 v8, s10
+        &[0xBE8A_0F18, 0x7E10_020A],
+        // s_ff1_i32_b32 s10, s24; v_mov_b32 v8, s10
+        &[0xBE8A_1318, 0x7E10_020A],
+        // s_cmp_eq_u32 s24, 0; s_cselect_b32 s10, 1, 0; v_mov_b32 v8, s10
+        &[0xBF06_8018, 0x850A_8081, 0x7E10_020A],
+        // s_cmp_lg_u32 s24, 0; s_cselect_b32 s10, 1, 0; v_mov_b32 v8, s10
+        &[0xBF07_8018, 0x850A_8081, 0x7E10_020A],
+        // v_mbcnt_lo_u32_b32 v8, s24, 0
+        &[0xD765_0008, 0x0001_0018],
+    ];
+    for read in readers {
+        let skip = read.len() as u32;
+        let body = [
+            &REUSED[..],
+            &[
+                0xD4C4_0018,
+                0x0002_0009, // v_cmp_gt_u32 s24, s9, v0
+                0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+                0xBF88_0000 | skip, // s_cbranch_execz -> the restore
+            ],
+            read,
+            &[0xBEFE_0317], // s_mov_b32 exec_lo, s23
+        ]
+        .concat();
+        let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+        assert!(translate(&words, ResourceType::Srv).is_err(), "{read:x?}");
+    }
+}
+
+#[test]
+fn a_register_reused_on_another_path_is_told_by_its_flag_in_wave64() {
+    let reused = [
+        &REUSED[..5],
+        &[
+            0xBE96_246A, // s_and_saveexec_b64 s[22:23], vcc
+            0xBF88_0003, // s_cbranch_execz -> the restore
+        ],
+        &REUSED[7..10],
+        &[
+            0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+            REUSED[11],
+        ],
+    ]
+    .concat();
+    let after = |read: &[u32]| {
+        let words = [&STORE_SETUP[..], &reused, read, &STORE[..]].concat();
+        translate_with(&words, ResourceType::Srv, 8, 0, true)
+    };
+    let guarded = after(&[
+        0xBE96_246A, // s_and_saveexec_b64 s[22:23], vcc
+        0xBF88_0001, // s_cbranch_execz -> the restore
+        USE,
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+    ]);
+    check(&guarded.unwrap());
+    assert!(after(&[USE]).is_err());
+}
+
+/// v8 = 0, then three passes of a loop that adds s9 to it where v5 is -1;
+/// `first` sets the two before the loop, `next` after each pass.
+fn looped(first: &[u32], next: &[u32]) -> Vec<u32> {
+    let pass = [
+        &[
+            0x7D84_0AC1, // v_cmp_eq_u32 vcc_lo, -1, v5
+            0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> the restore
+            0x4A10_1009, // v_add_nc_u32 v8, s9, v8
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        ][..],
+        next,
+        &[
+            0x8114_8114, // s_add_i32 s20, s20, 1
+            0xBF0A_8314, // s_cmp_lt_u32 s20, 3
+        ],
+    ]
+    .concat();
+    // s_cbranch_scc1 -> the pass
+    let back = 0xBF85_0000 | ((u32::MAX - pass.len() as u32) & 0xFFFF);
+    [
+        &[
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0xBE94_0380, // s_mov_b32 s20, 0
+        ][..],
+        first,
+        &pass,
+        &[back],
+    ]
+    .concat()
+}
+
+#[test]
+fn a_register_reused_across_a_back_edge_is_read_where_a_flag_allows() {
+    const LOAD: [u32; 2] = [0xF408_0203, 0xFA00_0000]; // s_load_dwordx4 s[8:11], s[6:7], 0x0
+    const OFF: u32 = 0x7E0A_0280; // v_mov_b32 v5, 0
+    const ON: u32 = 0x7E0A_02C1; // v_mov_b32 v5, -1
+    const TEN: u32 = 0xBE89_038A; // s_mov_b32 s9, 10
+    // The dword comes in, the number over the back edge.
+    let body = looped(&[LOAD[0], LOAD[1], OFF], &[TEN, ON]);
+    for (label, got) in stored(&body) {
+        assert_eq!(got, [20; 32], "{label}");
+    }
+    // The other way round.
+    let body = looped(&[TEN, ON], &[LOAD[0], LOAD[1], OFF]);
+    for (label, got) in stored(&body) {
+        assert_eq!(got, [10; 32], "{label}");
+    }
+    // The flag stays.
+    let body = looped(&[TEN, ON], &LOAD);
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    assert!(translate(&words, ResourceType::Srv).is_err());
+}
+
+#[test]
+fn a_typed_buffer_is_not_sized_as_a_raw_one() {
+    const TYPED: [u32; 2] = [
+        0xE000_2000,
+        0x8002_0900, // buffer_load_format_x v9, v0, s[8:11], 0 idxen
+    ];
+    const SCALAR: [u32; 2] = [
+        0xF420_0344,
+        0xFA00_0000, // s_buffer_load_dword s13, s[8:11], 0
+    ];
+    let after = |uses: [[u32; 2]; 2]| {
+        let words = [
+            &STORE_SETUP[..],
+            &[
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            ],
+            &uses.concat(),
+            &[0x7E10_020A], // v_mov_b32 v8, s10
+            &STORE[..],
+        ]
+        .concat();
+        translate_with(&words, ResourceType::Srv, 4, 0, false)
+    };
+    assert!(after([SCALAR, TYPED]).is_err());
+    let shader = after([TYPED, SCALAR]).unwrap();
+    let data = [0u32; 24];
+    let view = View::Buffer {
+        data: &data,
+        stride: Stride::Typed,
+    };
+    for (label, out) in run(&shader, &[view, View::RawUav(32)]) {
+        assert_eq!(out[0], vec![6; 32], "{label}");
     }
 }

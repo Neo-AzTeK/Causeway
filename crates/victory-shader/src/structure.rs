@@ -353,6 +353,9 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Opaque masks: the high dword (the low one in wave32) by the low
+    /// dword's value, or `None` if it is paired with several.
+    pub opaque: HashMap<Value, Option<Value>>,
 }
 
 impl Structured {
@@ -413,6 +416,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::opaque`].
+    opaque: HashMap<Value, Option<Value>>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -476,6 +481,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            opaque: HashMap::new(),
         })
     }
 
@@ -488,6 +494,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.opaque.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -634,6 +641,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            opaque: self.opaque,
             bools: self.b,
             exits,
             guards,
@@ -696,6 +704,10 @@ impl<'a> Lanes<'a> {
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
+                    let high = self.opaque.entry(k.0).or_insert(Some(k.1));
+                    if *high != Some(k.1) {
+                        *high = None;
+                    }
                     self.b.atom(Atom::Opaque(k.0), born)
                 });
                 (m, derived)

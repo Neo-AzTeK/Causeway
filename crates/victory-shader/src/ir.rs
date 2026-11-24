@@ -666,6 +666,10 @@ fn forward_spills(blocks: &mut [Block], wave64: bool, values: &mut u32) {
             else {
                 continue;
             };
+            // EXEC's writes are followed by register.
+            if code == EXEC || code == EXEC + 1 {
+                continue;
+            }
             let (Some(k), Some(v), Some(out)) = (
                 lane(*at),
                 inst.read(Reg::V(*reg)),
@@ -1238,6 +1242,46 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn a_spilled_opaque_wave64_mask_keeps_its_high_dword() {
+        let words = [
+            0xD761_0005,
+            0x0001_0600, // v_writelane_b32 v5, s0, 3
+            0xD761_0005,
+            0x0001_0805, // v_writelane_b32 v5, s5, 4
+            0xD760_0006,
+            0x0001_0705, // v_readlane_b32 s6, v5, 3
+            0xD760_0007,
+            0x0001_0905, // v_readlane_b32 s7, v5, 4
+            0xBE8A_2406, // s_and_saveexec_b64 s[10:11], s[6:7]
+            0x7E10_0281, // v_mov_b32 v8, 1
+            0xE070_0000,
+            0x8000_0800, // buffer_store_dword v8, off, s[0:3], 0
+            S_ENDPGM,
+        ];
+        let p = build_words(&words, true);
+        let st = crate::structure::structure(&p).unwrap();
+        let (lo, hi) = (input(&p, Reg::S(0)), input(&p, Reg::S(5)));
+        assert_eq!(st.opaque.get(&lo), Some(&Some(hi)));
+    }
+
+    #[test]
+    fn a_spill_read_back_to_exec_stays() {
+        let words = [
+            0xD761_0005,
+            0x0001_0600, // v_writelane_b32 v5, s0, 3
+            0xD760_007E,
+            0x0001_0705, // v_readlane_b32 exec_lo, v5, 3
+            0x7E10_0281, // v_mov_b32 v8, 1
+            0xE070_0000,
+            0x8000_0800, // buffer_store_dword v8, off, s[0:3], 0
+            S_ENDPGM,
+        ];
+        let p = build_words(&words, false);
+        let insts = &p.blocks[0].insts;
+        assert!(insts.iter().any(|i| i.name() == "v_readlane_b32"));
     }
 
     #[test]
