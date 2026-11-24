@@ -316,11 +316,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -1421,7 +1421,7 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::slot;
 
@@ -1437,7 +1437,7 @@ mod tests {
         visible_nodes: 0,
     };
 
-    fn buffer(width: u64) -> ResourceDesc {
+    pub(crate) fn buffer(width: u64) -> ResourceDesc {
         ResourceDesc {
             dimension: BUFFER,
             alignment: 0,
@@ -1453,7 +1453,7 @@ mod tests {
         }
     }
 
-    fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
+    pub(crate) fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
         ResourceDesc {
             dimension: 3,
             width,
@@ -1463,6 +1463,17 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// A committed resource.
+    #[cfg(windows)]
+    pub(crate) fn committed(desc: &ResourceDesc, state: u32) -> This {
+        let null = std::ptr::null();
+        let mut made = null;
+        let iid = &RESOURCE_IIDS[0];
+        let hr = create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, &mut made);
+        assert_eq!(hr, S_OK);
+        made
     }
 
     fn heap(size: u64) -> This {

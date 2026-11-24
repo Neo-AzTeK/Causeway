@@ -409,6 +409,9 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Copies of what the list read back into title memory, done once it has
+    /// run, before `writes`.
+    read_back: Vec<Box<dyn Fn() + Send>>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -596,6 +599,11 @@ impl Host {
             let (address, len) = (*address, *len);
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        }
+        for list in runs {
+            for work in &list.deferred().read_back {
+                work();
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -1063,6 +1071,12 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// Runs `work`, a copy of what the list read back into title memory, once
+    /// the list has run and before its bottom-of-pipe writes.
+    pub(crate) fn defer_read_back(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().read_back.push(Box::new(work));
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is

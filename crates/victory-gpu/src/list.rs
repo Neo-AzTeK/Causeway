@@ -481,9 +481,18 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+#[cfg(windows)]
+impl CopyLocation {
+    /// The subresource a location of kind 0 names (where a footprint would
+    /// start).
+    fn subresource(&self) -> u32 {
+        self.footprint.offset as u32
+    }
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer through one read back
+/// after it ([`texture_to_buffer`]).
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -507,8 +516,16 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            let source_box = (!source_box.is_null()).then(|| {
+                // SAFETY: the title passes a whole box.
+                unsafe { source_box.read_unaligned() }
+            });
+            if let Err(why) = texture_to_buffer(list, &dst, [x, y, z], &src, source_box) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(why, footprint = ?dst.footprint, "texture not copied to a buffer");
+                });
+            }
             return;
         };
         let mut from = src;
@@ -590,6 +607,152 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Reads a texture back into a title buffer: the host GPU copies it into
+/// host memory, and its rows go to title memory once the list has run (only
+/// the rows' own bytes, not the pitch between them).
+///
+/// shortcut: the buffer holds the texture after the submission: commands of
+/// the same submission that read the buffer see what it held before.
+#[cfg(windows)]
+fn texture_to_buffer(
+    list: &crate::host::HostList,
+    dst: &CopyLocation,
+    at: [u32; 3],
+    src: &CopyLocation,
+    source_box: Option<[u32; 6]>,
+) -> Result<(), &'static str> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    const PITCH: u32 = 256;
+    if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+        return Err("not from a texture to a buffer");
+    }
+    let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    let host = crate::host::host().ok_or("no host")?;
+    let (element, block) =
+        crate::resource::element(dst.footprint.format).ok_or("a format of no known size")?;
+    // The subresource as the host lays it out.
+    let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = u64::MAX;
+    let depth;
+    // SAFETY: a live texture; outputs for one subresource.
+    let samples = unsafe {
+        let desc = texture.GetDesc();
+        host.device.GetCopyableFootprints(
+            &desc,
+            src.subresource(),
+            1,
+            0,
+            Some(&mut layout),
+            None,
+            None,
+            Some(&mut total),
+        );
+        depth = desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0;
+        desc.SampleDesc.Count
+    };
+    if total == u64::MAX || samples > 1 {
+        return Err("no such subresource, or a multisampled one");
+    }
+    let whole = layout.Footprint;
+    if crate::resource::element(whole.Format.0 as u32) != Some((element, block)) {
+        return Err("elements of another size");
+    }
+    let [left, top, front, right, bottom, back] =
+        source_box.unwrap_or([0, 0, 0, whole.Width, whole.Height, whole.Depth]);
+    if left >= right || top >= bottom || front >= back {
+        return Ok(()); // an empty box copies nothing
+    }
+    let part = [left, top, front, right, bottom, back]
+        != [0, 0, 0, whole.Width, whole.Height, whole.Depth];
+    if part && depth {
+        return Err("part of a depth texture, which the host copies whole");
+    }
+    if right > whole.Width || bottom > whole.Height || back > whole.Depth {
+        return Err("a box outside the subresource");
+    }
+    let f = &dst.footprint;
+    let size = [right - left, bottom - top, back - front];
+    let fits = |n: usize, bound: u32| at[n].checked_add(size[n]).is_some_and(|end| end <= bound);
+    if !fits(0, f.width) || !fits(1, f.height) || !fits(2, f.depth) {
+        return Err("a box outside the footprint");
+    }
+    let block = block as u32;
+    if at.iter().take(2).any(|n| n % block != 0) || [left, top].iter().any(|n| n % block != 0) {
+        return Err("a box not on a block");
+    }
+    // The box alone, packed into host memory of the list's own.
+    let (row, rows) = (
+        u64::from(size[0].div_ceil(block)) * element,
+        u64::from(size[1].div_ceil(block)),
+    );
+    let pitch = row.next_multiple_of(u64::from(PITCH));
+    let (buffer, data) = host
+        .shared_buffer(pitch * rows * u64::from(size[2]))
+        .ok_or("no host memory")?;
+    list.keep(&buffer);
+    // Where its rows go: offset of the first, then by row and by slice.
+    let title_pitch = u64::from(f.row_pitch);
+    let title_slice = title_pitch * u64::from(f.height.div_ceil(block));
+    let first = u64::from(at[0] / block) * element
+        + u64::from(at[1] / block) * title_pitch
+        + u64::from(at[2]) * title_slice;
+    let span = first
+        + u64::from(size[2] - 1) * title_slice
+        + (rows - 1) * title_pitch
+        + row;
+    let to = buffer_range(dst.resource, f.offset, span).ok_or("not inside a buffer")?;
+
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    let from = CopyLocation {
+        resource: texture.as_raw().cast_const().cast(),
+        ..*src
+    };
+    let packed = CopyLocation {
+        resource: buffer.as_raw().cast_const().cast(),
+        kind: FOOTPRINT,
+        footprint: crate::resource::PlacedFootprint {
+            offset: 0,
+            format: whole.Format.0 as u32,
+            width: size[0].next_multiple_of(block),
+            height: size[1].next_multiple_of(block),
+            depth: size[2],
+            row_pitch: pitch as u32,
+        },
+    };
+    let host_box = D3D12_BOX { left, top, front, right, bottom, back };
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("read back {:?} to {:?} {f:?}", src.resource, dst.resource));
+    // SAFETY: an open list; both locations in the host's layout, naming live
+    // resources.
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const packed).cast(),
+            0,
+            0,
+            0,
+            (&raw const from).cast(),
+            part.then_some(&raw const host_box),
+        )
+    };
+    let (to, data) = (to as usize + first as usize, data as usize);
+    list.defer_read_back(move || {
+        crate::watch::writing(to, (span - first) as usize);
+        for z in 0..u64::from(size[2]) {
+            for y in 0..rows {
+                let out = to as u64 + z * title_slice + y * title_pitch;
+                let from = data as u64 + (z * rows + y) * pitch;
+                crate::host::write_mapped(out as *mut u8, from as *const u8, row as usize);
+            }
+        }
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -1420,6 +1583,79 @@ pub(crate) mod tests {
         assert_eq!(hr, S_OK);
         (list, allocator)
     }
+
+    /// A box of a texture, filled from a buffer, read back into another: its
+    /// rows arrive where the footprint says, nothing between them changes,
+    /// and all of it is there once the list has run. Then a whole subresource.
+    #[cfg(windows)]
+    #[test]
+    fn textures_are_read_back_into_buffers() {
+        use crate::resource::{PlacedFootprint, buffer_bytes, tests as made};
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let image = made::committed(&made::texture(16, 8, 28, 1), COPY_DEST);
+        let source = made::committed(&made::buffer(4096), 0);
+        let target = made::committed(&made::buffer(8192), 0);
+        // SAFETY: the buffers hold this many bytes.
+        let bytes = |b: This, n: usize| unsafe {
+            std::slice::from_raw_parts_mut(buffer_bytes(b).unwrap().0, n)
+        };
+        for (i, b) in bytes(source, 4096).iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        bytes(target, 8192).fill(0xee);
+        let footprint = |offset| PlacedFootprint {
+            offset,
+            format: 28,
+            width: 16,
+            height: 8,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let buffer_at = |resource, offset| CopyLocation {
+            resource,
+            kind: 1,
+            footprint: footprint(offset),
+        };
+        let texture = CopyLocation { resource: image, kind: 0, footprint: footprint(0) };
+        let (list, allocator) = open_list();
+        let null = std::ptr::null();
+        let (from, part, all) =
+            (buffer_at(source, 0), buffer_at(target, 512), buffer_at(target, 4096));
+        copy_texture_region(list, &texture, 0, 0, 0, &from, null);
+        // Columns 4 to 12 of rows 2 to 5, to column 1 of row 3.
+        copy_texture_region(list, &part, 1, 3, 0, &texture, &[4, 2, 0, 12, 5, 1]);
+        copy_texture_region(list, &all, 0, 0, 0, &texture, null);
+        let close = slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+        assert_eq!(close(list), S_OK);
+        let mut queue = null.cast();
+        let desc = [0u32; 4];
+        crate::queue::create(null.cast(), desc.as_ptr().cast(), &QUEUE_IID, &mut queue);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        let mut expected = vec![0xee; 8192];
+        for y in 0..3 {
+            let (to, from) = (512 + (3 + y) * 256 + 4, (2 + y) * 256 + 16);
+            expected[to..to + 32].copy_from_slice(&bytes(source, 4096)[from..from + 32]);
+        }
+        for y in 0..8 {
+            let (to, from) = (4096 + y * 256, y * 256);
+            expected[to..to + 64].copy_from_slice(&bytes(source, 4096)[from..from + 64]);
+        }
+        assert!(bytes(target, 8192) == expected);
+        for o in [list, allocator, queue, image, source, target] {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        }
+    }
+
+    #[cfg(windows)]
+    const QUEUE_IID: Iid = crate::object::guid(
+        0x0ec870a6,
+        0x5d7e,
+        0x4c22,
+        [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+    );
 
     /// Clears `image` as a render target, in a list that is not submitted.
     #[cfg(windows)]
