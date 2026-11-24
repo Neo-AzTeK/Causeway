@@ -25,6 +25,9 @@ const FEW: usize = 3;
 const STARTUP_FRAMES: u64 = 60;
 /// Black frames in an otherwise drawn run that cuts and fades explain.
 const BLACK_WARN: usize = 5;
+/// A run whose last frame-rate line is older than this, in seconds, at its
+/// end has hung (the lines are 5 s apart, and a frame longer at worst).
+const HANG: f64 = 15.0;
 /// A channel range this small over a whole frame is one flat color.
 const FLAT_RANGE: u8 = 8;
 
@@ -101,6 +104,31 @@ impl Rate {
     }
 }
 
+/// A log line's time (`2026-01-31T12:00:00.5Z`), in Unix time.
+fn unix_time(text: &str) -> Option<f64> {
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let mut date = date.splitn(3, '-').map(|n| n.parse::<u32>().ok());
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let mut time = time.splitn(3, ':').map(|n| n.parse::<f64>().ok());
+    let (hour, minute, second) = (time.next()??, time.next()??, time.next()??);
+    if !(1970..10000).contains(&year) || !(1..=12).contains(&month) || day > 31 {
+        return None;
+    }
+    // Years start in March: the leap day is their last.
+    let (y, m) = if month > 2 { (year, month - 3) } else { (year - 1, month + 9) };
+    let days = y * 365 + y / 4 - y / 100 + y / 400 + (m * 153 + 2) / 5 + day;
+    let days = f64::from(days) - 719_469.0;
+    Some(((days * 24.0 + hour) * 60.0 + minute) * 60.0 + second)
+}
+
+/// Whether a saved image is a presented frame: `frame-<n>.png`, and not a
+/// render target dumped with it.
+fn presented(path: &str) -> bool {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let number = name.strip_prefix("frame-").and_then(|n| n.strip_suffix(".png"));
+    number.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The number that ends where `marker` starts.
 fn before(line: &str, marker: &str) -> Option<f64> {
     let head = &line[..line.find(marker)?];
@@ -143,9 +171,16 @@ pub struct Log {
     /// A host device, and a diagnostics build, were seen.
     device: bool,
     diagnostics: bool,
-    /// Run on the software adapter; the log does not say.
-    pub warp: bool,
+    /// The host device is the software adapter's.
+    warp: bool,
+    /// When the run ended, if we ran it (Unix time).
+    pub ended: Option<f64>,
+    /// The last time a line has.
+    last: Option<f64>,
+    /// Modules seen to log at info: their warnings are in the log too.
+    informed: BTreeSet<String>,
     removed: Vec<String>,
+    host_failures: Vec<String>,
     crashes: Vec<String>,
     /// Shaders: the error.
     refused: BTreeMap<String, String>,
@@ -161,6 +196,8 @@ pub struct Log {
     stand_in: bool,
     pad: bool,
 }
+
+const UNHEARD: &str = "none, but nothing shows that the log would have them";
 
 /// Messages of `victory_gpu` about a resource or view that was not made.
 const NOT_MADE: &[&str] = &[
@@ -200,8 +237,19 @@ impl Log {
         {
             self.crashes.push(line.to_owned());
         }
-        if line.contains(" ERROR victory_gpu::host:") || line.contains("device removed:") {
+        if line.contains("device removed:") || line.contains("host GPU device removed") {
             self.removed.push(line.to_owned());
+        } else if line.contains(" ERROR victory_gpu::host:") {
+            self.host_failures.push(line.to_owned());
+        }
+        if let Some(at) = line.split_whitespace().next().and_then(unix_time) {
+            self.last = Some(at);
+        }
+        if let Some((_, rest)) = line.split_once(" INFO ")
+            && let Some((module, _)) = rest.trim_start().split_once(": ")
+            && module.starts_with("victory_")
+        {
+            self.informed.insert(module.to_owned());
         }
         let warn = line.contains(" WARN ");
         if !warn && !line.contains(" INFO ") {
@@ -225,7 +273,9 @@ impl Log {
         }
         if line.contains("victory_gpu::capture: frame saved") {
             // The line's last field: a path may hold spaces.
-            if let Some((_, path)) = line.split_once(" path=") {
+            if let Some((_, path)) = line.split_once(" path=")
+                && presented(path.trim())
+            {
                 let world = self.world().next().is_some();
                 self.captures.push((path.trim().into(), world));
             }
@@ -241,12 +291,18 @@ impl Log {
             self.frames = self.frames.max(frame);
         }
         self.device |= line.contains("host D3D12 device ready");
+        self.warp |= line.contains("on the software adapter (WARP)");
         self.diagnostics |= line.contains("copies per frame: ");
+        // Some refusals are logged once per reason; the drops name each.
+        if let Some((_, shaders)) = line.split_once("without a host pipeline: refused ") {
+            let reason = || "reason not logged".to_owned();
+            self.refused.entry(shaders.trim().to_owned()).or_insert_with(reason);
+        }
         if !warn {
             return;
         }
         if line.contains("no host D3D12 device") || line.contains("no host GPU runs them") {
-            self.removed.push(line.to_owned());
+            self.host_failures.push(line.to_owned());
         } else if line.contains("pipeline refused") || line.contains("root signature refused") {
             let shaders = field(line, "shaders").unwrap_or("?").to_owned();
             self.refused.insert(shaders, error(line));
@@ -265,6 +321,20 @@ impl Log {
         }
     }
 
+    /// Whether a warning of these modules would be in the log. We run the
+    /// title with everything at info; what filtered another log is unknown.
+    fn heard(&self, modules: &[&str]) -> bool {
+        self.ended.is_some()
+            || (!modules.is_empty() && modules.iter().all(|&m| self.informed.contains(m)))
+    }
+
+    /// Seconds without a frame-rate line at the end of the run, or of the
+    /// log if the run's end is not known.
+    fn silence(&self) -> Option<f64> {
+        let rate = unix_time(&self.rates.last()?.time)?;
+        Some(self.ended.or(self.last)? - rate)
+    }
+
     fn world(&self) -> impl Iterator<Item = &Rate> {
         self.rates.iter().filter(|r| r.asked() >= WORLD_DRAWS)
     }
@@ -275,6 +345,8 @@ impl Log {
         let world: Vec<&Rate> = self.world().collect();
         // A clean log of less of the world than this shows nothing yet.
         let settled = world.len() >= WORLD_LINES;
+        let silence = self.silence();
+        let hung = silence.is_some_and(|s| s > HANG);
         let mut areas = Vec::new();
         let mut add = |name, (status, detail)| areas.push(Area { name, status, detail });
 
@@ -294,8 +366,23 @@ impl Log {
             None => (Status::Fail, format!("at most {most:.0} draws/frame asked for")),
         });
 
+        add("hang", match silence {
+            None => (Status::Unknown, "no frame-rate lines".into()),
+            Some(s) if hung => (Status::Fail, format!("no frame-rate line for the last {s:.0} s")),
+            Some(_) if self.ended.is_none() => {
+                (Status::Unknown, "the log does not say when the run ended".into())
+            }
+            Some(s) => (Status::Pass, format!("last frame-rate line {s:.0} s before the end")),
+        });
+
         add("crash", match (self.crashes.first(), end) {
             (Some(first), _) => (Status::Fail, clip(first)),
+            (None, Some(End::TimedOut)) if silence.is_none() => {
+                (Status::Unknown, "no crash line, but no frame-rate line either".into())
+            }
+            (None, Some(End::TimedOut)) if hung => {
+                (Status::Unknown, "no crash line, but it hung".into())
+            }
             (None, Some(End::TimedOut)) => {
                 (Status::Pass, "running until its time was up".into())
             }
@@ -311,8 +398,20 @@ impl Log {
         add("device removed", match self.removed.first() {
             Some(first) => (Status::Fail, clip(first)),
             None if !self.device => (Status::Unknown, "no host device line".into()),
+            None if hung => (Status::Unknown, "not said, but it hung".into()),
+            None if !self.heard(&["victory_gpu::host"]) => (Status::Unknown, UNHEARD.into()),
             None if !settled => (Status::Unknown, "no, but too little of the world ran".into()),
             None => (Status::Pass, "no".into()),
+        });
+
+        add("host GPU failure", match self.host_failures.first() {
+            Some(first) => (Status::Fail, clip(first)),
+            None if hung => (Status::Unknown, "not said, but it hung".into()),
+            None if !self.heard(&["victory_gpu::host", "victory_gpu::queue"]) => {
+                (Status::Unknown, UNHEARD.into())
+            }
+            None if !settled => (Status::Unknown, "none, but too little of the world ran".into()),
+            None => (Status::Pass, "none".into()),
         });
 
         add("world frame rate", match median(&world, |r| r.fps) {
@@ -320,7 +419,7 @@ impl Log {
             Some(r) => {
                 let few = !settled;
                 let status = match r.fps {
-                    _ if few => Status::Unknown,
+                    _ if few || hung => Status::Unknown,
                     fps if fps >= FPS_PASS => Status::Pass,
                     fps if fps >= FPS_WARN => Status::Warn,
                     _ => Status::Fail,
@@ -334,7 +433,11 @@ impl Log {
                     r.gpu,
                     r.copy_back,
                     world.len(),
-                    if few { ", too few to judge" } else { "" }
+                    match (hung, few) {
+                        (true, _) => ", before it hung",
+                        (_, true) => ", too few to judge",
+                        _ => "",
+                    }
                 );
                 (status, detail)
             }
@@ -342,17 +445,22 @@ impl Log {
 
         add("drawn vs dropped", self.drops(&world));
 
-        
-        let count = |n: usize, detail: String| match n {
+        // What is clean passes only if the log has those modules' warnings.
+        let count = |n: usize, detail: String, modules: &[&str]| match n {
+            0 if !self.heard(modules) => (Status::Unknown, UNHEARD.into()),
             0 if settled => (Status::Pass, "none".into()),
             0 => (Status::Unknown, "none, but too little of the world ran".into()),
             n if n <= FEW => (Status::Warn, format!("{n}: {detail}")),
             n => (Status::Fail, format!("{n}: {detail}")),
         };
-        let set = |s: &BTreeSet<String>| count(s.len(), tally(s.iter().map(String::as_str)));
+        // Most of these are logged once per reason, however often they happen.
+        let set = |s: &BTreeSet<String>, modules: &[&str]| {
+            let reasons = format!("distinct reasons: {}", tally(s.iter().map(String::as_str)));
+            count(s.len(), reasons, modules)
+        };
 
         let reasons = tally(self.refused.values().map(String::as_str));
-        add("pipelines refused", count(self.refused.len(), reasons));
+        add("pipelines refused", count(self.refused.len(), reasons, &["victory_gpu::pipeline::host"]));
 
         const STAGES: [(&str, &str); 4] = [
             ("vertex", "untranslated vertex"),
@@ -363,7 +471,7 @@ impl Log {
         let untranslated = |keep: &dyn Fn(&str) -> bool| {
             let errors = self.untranslated.values().filter(|(s, _)| keep(s));
             let errors: Vec<&str> = errors.map(|(_, e)| e.as_str()).collect();
-            count(errors.len(), tally(errors.iter().copied()))
+            count(errors.len(), tally(errors.iter().copied()), &["victory_gpu::pipeline"])
         };
         for (stage, name) in STAGES {
             add(name, untranslated(&|s| s == stage));
@@ -374,6 +482,7 @@ impl Log {
             self.black.iter().copied().filter(|&f| f >= STARTUP_FRAMES).collect();
         add("black frames", match black.len() {
             0 if !self.diagnostics => (Status::Unknown, "not a diagnostics build's log".into()),
+            0 if !self.heard(&["victory_gpu::queue"]) => (Status::Unknown, UNHEARD.into()),
             0 if !settled => (Status::Unknown, "none, but too little of the world ran".into()),
             0 => (Status::Pass, "none".into()),
             n => (
@@ -393,13 +502,14 @@ impl Log {
         };
         add("flat frames", (status, format!("{n} of {} frames saved in the world", judged.len())));
 
-        add("unimplemented graphics", set(&self.methods));
-        // Not graphics, so never a failure, but a missing call explains much.
-        add("unimplemented other", match set(&self.other_methods) {
+        add("unimplemented graphics", set(&self.methods, &["victory_gpu::object", "victory_gpu::list"]));
+        // Not graphics (and from any module, so heard in no other log), so never a failure, but a missing call explains much.
+        add("unimplemented other", match set(&self.other_methods, &[]) {
             (Status::Fail, detail) => (Status::Warn, detail),
             other => other,
         });
-        add("textures/views not made", set(&self.resources));
+        let modules = ["victory_gpu::resource", "victory_gpu::descriptor::host"];
+        add("textures/views not made", set(&self.resources, &modules));
         areas
     }
 
@@ -447,7 +557,9 @@ impl Log {
 
     fn adapter(&self) -> &'static str {
         if self.warp {
-            "software (VICTORY_D3D12_WARP)"
+            "software (WARP)"
+        } else if self.device {
+            "not the software one; the log does not name it"
         } else {
             "unknown: the log does not name it"
         }
@@ -636,8 +748,18 @@ mod tests {
         format!("2026-01-01T00:00:00Z {level} victory_gpu::{text}\n")
     }
 
+    /// When every synthetic line was logged.
+    const THEN: f64 = 1_767_225_600.0;
+
+    /// As we run it, up to `end`; or the log of another run.
     fn judge(text: &str, end: Option<End>) -> Vec<Area> {
-        Log::parse(text).judge(end, |_| None)
+        judge_at(text, end, end.map(|_| THEN + 5.0))
+    }
+
+    fn judge_at(text: &str, end: Option<End>, ended: Option<f64>) -> Vec<Area> {
+        let mut log = Log::parse(text);
+        log.ended = ended;
+        log.judge(end, |_| None)
     }
 
     fn status(areas: &[Area], name: &str) -> Status {
@@ -742,14 +864,15 @@ mod tests {
             + &gpu("WARN", "object: method not implemented object=\"device\" slot=0x218")
             + &gpu("WARN", "resource: no host texture error=x desc=ResourceDesc { width: 1 }")
             + &gpu("WARN", "descriptor::host: view the host does not allow format=3");
-        let log = Log::parse(&text);
-        let areas = log.judge(None, |_| None);
+        let mut log = Log::parse(&text);
+        log.ended = Some(THEN);
+        let areas = log.judge(Some(End::TimedOut), |_| None);
         for (name, wanted, detail) in [
             ("pipelines refused", Status::Warn, "1: The parameter is incorrect. (0x80070057)"),
             ("untranslated pixel", Status::Fail, "4: 4x op is not supported"),
             ("untranslated compute", Status::Pass, "none"),
-            ("textures/views not made", Status::Warn, "2: "),
-            ("unimplemented graphics", Status::Warn, "1: method not implemented"),
+            ("textures/views not made", Status::Warn, "2: distinct reasons: "),
+            ("unimplemented graphics", Status::Warn, "1: distinct reasons: method not implemented"),
         ] {
             let a = areas.iter().find(|a| a.name == name).unwrap();
             assert_eq!(a.status, wanted, "{name}");
@@ -767,29 +890,117 @@ mod tests {
                 format!("queue: a black frame after a frame that was not frame={frame} draws=1");
             gpu("WARN", &text)
         };
-        let with = |lines: &str| status(&judge(&(healthy() + lines), None), "black frames");
+        let with = |lines: &str| status(&judge(&(healthy() + lines), Some(End::TimedOut)), "black frames");
         assert_eq!(with(&black(1)), Status::Pass);
         assert_eq!(with(&black(900)), Status::Warn);
         assert_eq!(with(&(900..910).map(black).collect::<String>()), Status::Fail);
         // A release build does not look for them.
-        let release = judge(&rate(30.0, 2000, 0, 0), None);
+        let release = judge(&rate(30.0, 2000, 0, 0).repeat(3), Some(End::TimedOut));
         assert_eq!(status(&release, "black frames"), Status::Unknown);
     }
 
     #[test]
     fn only_frames_saved_in_the_world_are_looked_at() {
         let saved = |name: &str| {
-            gpu("INFO", &format!("capture: frame saved path=/a b/{name}.png"))
+            gpu("INFO", &format!("capture: frame saved path=/a b/frame-{name}.png"))
         };
-        let log = Log::parse(&(saved("menu") + &healthy() + &saved("one") + &saved("two")));
+        let log = Log::parse(&(saved("1") + &healthy() + &saved("2") + &saved("3")));
         let flat = |flat: &[&str]| {
             let areas = log.judge(None, |p| Some(flat.iter().any(|f| p.ends_with(f))));
             status(&areas, "flat frames")
         };
-        assert_eq!(flat(&["menu.png"]), Status::Pass);
-        assert_eq!(flat(&["one.png"]), Status::Warn);
-        assert_eq!(flat(&["one.png", "two.png"]), Status::Fail);
+        assert_eq!(flat(&["frame-1.png"]), Status::Pass);
+        assert_eq!(flat(&["frame-2.png"]), Status::Warn);
+        assert_eq!(flat(&["frame-2.png", "frame-3.png"]), Status::Fail);
         assert_eq!(status(&log.judge(None, |_| None), "flat frames"), Status::Unknown);
+    }
+
+    #[test]
+    fn dumped_targets_are_not_frames() {
+        let dump = "capture: frame saved path=C:\\a b\\frame-64-03-0x1f0-512x512-f28.png";
+        let text = healthy() + &gpu("INFO", dump);
+        let flat = |text: &str| {
+            status(&Log::parse(text).judge(None, |_| Some(true)), "flat frames")
+        };
+        assert_eq!(flat(&text), Status::Unknown);
+        let frame = gpu("INFO", "capture: frame saved path=C:\\a b\\frame-64.png");
+        assert_eq!(flat(&(text + &frame)), Status::Fail);
+    }
+
+    #[test]
+    fn a_log_passes_only_what_it_would_have_said() {
+        // The frame-rate lines are the host module's.
+        let shown = [
+            "menu reached",
+            "world reached",
+            "world frame rate",
+            "drawn vs dropped",
+            "device removed",
+        ];
+        for a in judge(&healthy(), None) {
+            let wanted = if shown.contains(&a.name) { Status::Pass } else { Status::Unknown };
+            assert_eq!(a.status, wanted, "{}", a.name);
+        }
+        let areas = judge(&(healthy() + &gpu("INFO", "pipeline: first bind pipeline=0x1")), None);
+        assert_eq!(status(&areas, "untranslated pixel"), Status::Pass);
+        // Another module, though its name starts the same.
+        assert_eq!(status(&areas, "pipelines refused"), Status::Unknown);
+    }
+
+    #[test]
+    fn a_run_that_stops_presenting_passes_nothing_about_its_end() {
+        let end = Some(End::TimedOut);
+        let areas = judge_at(&healthy(), end, Some(THEN + 60.0));
+        assert_eq!(status(&areas, "hang"), Status::Fail);
+        for name in ["crash", "device removed", "host GPU failure", "world frame rate"] {
+            assert_eq!(status(&areas, name), Status::Unknown, "{name}");
+        }
+        assert_eq!(status(&judge_at(&healthy(), end, Some(THEN + 14.0)), "hang"), Status::Pass);
+        // A log whose other lines go on shows it too.
+        let later = healthy() + "2026-01-01T00:01:00.5Z  INFO victory_hle::modules::net: x\n";
+        assert_eq!(status(&judge(&later, None), "hang"), Status::Fail);
+        assert_eq!(status(&judge(&healthy(), None), "hang"), Status::Unknown);
+    }
+
+    #[test]
+    fn times_are_read() {
+        assert_eq!(unix_time("2026-01-01T00:00:00Z"), Some(THEN));
+        assert_eq!(unix_time("1970-01-01T00:00:01.5Z"), Some(1.5));
+        assert_eq!(unix_time("2024-03-01T00:00:00Z"), Some(1_709_251_200.0));
+        assert_eq!(unix_time("2024-02-29T01:00:00Z"), Some(1_709_168_400.0));
+        for bad in ["", "Z", "bound", "2024-13-01T00:00:00Z", "2024-01T00:00:00Z"] {
+            assert_eq!(unix_time(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn other_host_failures_are_not_a_removed_device() {
+        let end = Some(End::TimedOut);
+        let closed = healthy() + &gpu("ERROR", "host: a host command list did not close (x)");
+        let areas = judge(&closed, end);
+        assert_eq!(status(&areas, "host GPU failure"), Status::Fail);
+        assert_eq!(status(&areas, "device removed"), Status::Pass);
+        let none = gpu("WARN", "host: no host D3D12 device; command lists will not run error=x");
+        let areas = judge(&none, end);
+        assert_eq!(status(&areas, "host GPU failure"), Status::Fail);
+        assert_eq!(status(&areas, "device removed"), Status::Unknown);
+        // Another failure can be the removal's.
+        let both = gpu("ERROR", "host: a host command list did not reset (x); device removed: y");
+        assert_eq!(status(&judge(&both, end), "device removed"), Status::Fail);
+    }
+
+    #[test]
+    fn refusals_logged_once_are_counted_by_their_drops() {
+        let drop = |hash: u32| {
+            let shaders = format!("[vertex {hash}, pixel 9]");
+            gpu("INFO", &format!("host: dropped 2.0/frame without a host pipeline: refused {shaders}"))
+        };
+        let once = "pipeline::host: no host pipeline: x (logged once) shaders=[vertex 1, pixel 9]";
+        let text = healthy() + &gpu("WARN", once) + &[1, 2, 3, 4, 4].map(drop).concat();
+        let areas = judge(&text, None);
+        let a = areas.iter().find(|a| a.name == "pipelines refused").unwrap();
+        assert_eq!(a.status, Status::Fail);
+        assert!(a.detail.starts_with("4: "), "{}", a.detail);
     }
 
     #[test]

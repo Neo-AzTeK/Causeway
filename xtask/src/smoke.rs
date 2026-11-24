@@ -2,10 +2,11 @@
 //! scripted keys, and reports what the log says (see `report`). Everything
 //! it writes is derived from the title, so it stays outside the repository.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use clap::Args;
@@ -42,6 +43,15 @@ pub struct Smoke {
 /// A frame is saved this often, at the rate the title presents at most.
 const CAPTURE_EVERY: u64 = 100;
 const CAPTURE_FPS: u64 = 30;
+/// Frames saved at most: an environment variable holds 32,767 characters,
+/// and these numbers have 7 digits.
+const CAPTURES: u64 = 3000;
+
+/// Our variables the run still takes from the environment: where its
+/// configuration and caches are, and the adapter. Any other may change what
+/// runs or what is logged.
+const INHERITED: &[&str] =
+    &["VICTORY_CONFIG", "VICTORY_GAME_DIR", "VICTORY_CACHE_DIR", "VICTORY_D3D12_WARP"];
 
 pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     victory_core::ensure_outside_repo(&args.out)?;
@@ -54,8 +64,8 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     };
     let bytes = std::fs::read(&log).with_context(|| format!("reading {}", log.display()))?;
     let mut log = Log::parse(&String::from_utf8_lossy(&bytes));
-    log.warp = end.is_some() && std::env::var_os("VICTORY_D3D12_WARP").is_some_and(|v| v == "1");
-    let areas = log.judge(end, |png| flat_png(&std::fs::read(png).ok()?));
+    log.ended = end.map(|(_, at)| at);
+    let areas = log.judge(end.map(|(end, _)| end), |png| flat_png(&std::fs::read(png).ok()?));
     let text = log.text(&areas);
     create(&args.out)?;
     std::fs::write(args.out.join("report.txt"), &text).context("writing report.txt")?;
@@ -71,7 +81,7 @@ fn create(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
 }
 
-fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, End)> {
+fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     let exe = args.exe.as_ref().context("--exe is required")?;
     ensure!(exe.is_file(), "{} is not a file", exe.display());
     let data = args.data_dir.clone().unwrap_or_else(|| args.out.join("data"));
@@ -93,20 +103,19 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, End)> {
     let frames = out.join("frames");
     create(&frames)?;
     create(&data)?;
-    let listed: Vec<_> = (1..=args.seconds * CAPTURE_FPS / CAPTURE_EVERY)
-        .map(|i| (i * CAPTURE_EVERY).to_string())
-        .collect();
 
     let log = out.join("log.txt");
     let file = File::create(&log).context("creating log.txt")?;
     let mut command = Command::new(&victory);
+    clean(&mut command, std::env::vars_os().map(|(name, _)| name));
     command
         .arg("run")
         .arg(std::path::absolute(exe)?)
         .arg("--execute")
+        .env("VICTORY_LOG", "info")
         .env("VICTORY_KEYS", &keys)
         .env("VICTORY_CAPTURE", &frames)
-        .env("VICTORY_CAPTURE_FRAMES", listed.join(","))
+        .env("VICTORY_CAPTURE_FRAMES", capture_frames(args.seconds))
         .env("VICTORY_DATA_DIR", std::path::absolute(&data)?)
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
@@ -116,23 +125,62 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, End)> {
     Ok((log, end))
 }
 
+/// Takes out of what a run inherits what would change it or its log.
+fn clean(command: &mut Command, names: impl Iterator<Item = OsString>) {
+    for name in names {
+        // Windows does not tell case apart.
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        let ours = upper.starts_with("VICTORY_") && !INHERITED.contains(&upper.as_str());
+        if ours || upper == "RUST_LOG" {
+            command.env_remove(name);
+        }
+    }
+}
+
+/// `VICTORY_CAPTURE_FRAMES` for a run this long.
+fn capture_frames(seconds: u64) -> String {
+    let frames = seconds * CAPTURE_FPS;
+    let every = CAPTURE_EVERY.max(frames.div_ceil(CAPTURES));
+    let listed: Vec<_> = (1..=frames / every).map(|i| (i * every).to_string()).collect();
+    listed.join(",")
+}
+
 /// Builds the diagnostics build; its path.
 fn build(root: &Path) -> Result<PathBuf> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = Command::new(cargo)
+    let built = Command::new(cargo)
         .args(["build", "--locked", "--profile", "diag", "-p", "victory"])
         .args(["--features", "diagnostics"])
+        .args(["--message-format", "json-render-diagnostics"])
         .current_dir(root)
-        .status()
+        .stderr(Stdio::inherit())
+        .output()
         .context("running cargo")?;
-    ensure!(status.success(), "the diagnostics build failed");
-    let target = std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into());
-    let name = format!("victory{}", std::env::consts::EXE_SUFFIX);
-    Ok(root.join(target).join("diag").join(name))
+    ensure!(built.status.success(), "the diagnostics build failed");
+    let messages = String::from_utf8(built.stdout).context("cargo's messages")?;
+    executable(&messages).context("cargo named no executable")
+}
+
+/// The executable in cargo's JSON messages (one is built, named last).
+fn executable(messages: &str) -> Option<PathBuf> {
+    let key = "\"executable\":\"";
+    let text = messages.lines().rev().find_map(|l| Some(&l[l.find(key)? + key.len()..]))?;
+    let mut path = String::new();
+    let mut chars = text.chars();
+    loop {
+        match chars.next()? {
+            '"' => return Some(path.into()),
+            // A path on Windows has no other escapes.
+            '\\' => path.push(chars.next()?),
+            c => path.push(c),
+        }
+    }
 }
 
 /// Runs a process for at most `time`, then ends it and what it started.
-fn run_for(mut command: Command, time: Duration) -> Result<End> {
+/// Also when it ended, or was ended (Unix time).
+fn run_for(mut command: Command, time: Duration) -> Result<(End, f64)> {
+    let now = || SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
     let group = Group::new()?;
     let mut child = command.spawn()?;
     if let Err(e) = group.add(&child) {
@@ -146,13 +194,15 @@ fn run_for(mut command: Command, time: Duration) -> Result<End> {
         if let Some(status) = child.try_wait()?
             && !group.running()?
         {
-            return Ok(End::Exited(status.code()));
+            return Ok((End::Exited(status.code()), now()?));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // Before ending it, which takes a while for a process of this size.
+    let ended = now()?;
     group.kill(&mut child)?;
     child.wait()?;
-    Ok(End::TimedOut)
+    Ok((End::TimedOut, ended))
 }
 
 /// A job: the process and what it starts, and nothing else. They end with
@@ -323,6 +373,44 @@ mod tests {
     }
 
     #[test]
+    fn inherited_debug_variables_are_taken_out() {
+        let mut command = Command::new("x");
+        let names = [
+            "VICTORY_LOG",
+            "RUST_LOG",
+            "victory_dump_targets",
+            "VICTORY_SKIP_PIPELINES",
+            "PATH",
+            "VICTORY_D3D12_WARP",
+            "VICTORY_CACHE_DIR",
+        ];
+        clean(&mut command, names.iter().map(OsString::from));
+        let mut removed: Vec<_> =
+            command.get_envs().map(|(n, _)| n.to_string_lossy().to_uppercase()).collect();
+        removed.sort();
+        assert_eq!(
+            removed,
+            ["RUST_LOG", "VICTORY_DUMP_TARGETS", "VICTORY_LOG", "VICTORY_SKIP_PIPELINES"]
+        );
+    }
+
+    #[test]
+    fn captured_frames_fit_a_variable() {
+        assert_eq!(capture_frames(10), "100,200,300");
+        assert_eq!(capture_frames(1), "");
+        assert!((10_000..32_000).contains(&capture_frames(86400).len()));
+    }
+
+    #[test]
+    fn cargo_names_the_executable() {
+        let messages = r#"{"executable":null}
+{"a":1,"executable":"C:\\my t\\victory.exe","fresh":true}
+{"success":true}"#;
+        assert_eq!(executable(messages), Some(r"C:\my t\victory.exe".into()));
+        assert_eq!(executable("{}"), None);
+    }
+
+    #[test]
     fn an_out_inside_the_repository_is_refused() {
         let root = crate::workspace_root();
         let args = Smoke {
@@ -348,14 +436,14 @@ mod tests {
             c
         };
         let exited = run_for(shell("exit 3"), Duration::from_secs(60)).unwrap();
-        assert_eq!(exited, End::Exited(Some(3)));
+        assert_eq!(exited.0, End::Exited(Some(3)));
 
         // The grandchild holds the pipe: reading ends only when it is gone.
         let (mut read, write) = std::io::pipe().unwrap();
         let mut command = shell("ping -n 60 127.0.0.1");
         command.stdout(write);
         let start = Instant::now();
-        assert_eq!(run_for(command, Duration::from_secs(1)).unwrap(), End::TimedOut);
+        assert_eq!(run_for(command, Duration::from_secs(1)).unwrap().0, End::TimedOut);
         std::io::Read::read_to_end(&mut read, &mut Vec::new()).unwrap();
         assert!(start.elapsed() < Duration::from_secs(30));
     }
