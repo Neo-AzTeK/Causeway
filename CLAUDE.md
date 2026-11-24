@@ -41,6 +41,15 @@ Sessions
   owner, answer a hook in one line; do not redo or restate work.
 - Ask for launch approvals as a batch ("up to 3 runs, 5 minutes each").
 
+Delegating (owner's rule, 2026-11-25)
+- The main session coordinates; it does not debug. A hunt that needs more than
+  a few runs or reads (a hang, a refusal origin, a speed problem) goes to a
+  session with one clear question and an end, via `start_session`; the main
+  session keeps merging, pushing and the handoff.
+- End the session early, before context fills: finish what is verified,
+  commit it, update `HANDOFF.md`, say what is unverified, and tell the owner
+  to wipe context. Do not push through a long investigation to its end.
+
 Agents
 - None by default. Only for a large read with a short answer (`scout`) or the
   independent review of a finished diff (`reviewer`); never to run in parallel

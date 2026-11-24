@@ -251,6 +251,8 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Each loop header's iteration limit (see the nesting shortcut).
+    limits: HashMap<usize, u32>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
@@ -263,6 +265,15 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// The iteration limit of a loop nested depth deep (1 = not nested): the
+/// depth-th root of limit, at least 16, so a nest stays near one limit.
+fn loop_share(limit: u32, depth: usize) -> u32 {
+    if depth <= 1 {
+        return limit;
+    }
+    (f64::from(limit).powf(1.0 / depth as f64) as u32).clamp(16.min(limit), limit)
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -587,6 +598,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            limits: HashMap::new(),
             abort: None,
         }
     }
@@ -951,6 +963,35 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        // shortcut: each entry into an inner loop restarts its count, so
+        // nested loops multiplied the limit (2^20 per level). A loop of depth
+        // d gets the d-th root of the limit (at least 16), which keeps a
+        // nest near one limit in all; a real loop of more iterations than
+        // that, nested, is cut short.
+        let bodies: Vec<(usize, HashSet<usize>)> = self
+            .counters
+            .keys()
+            .map(|&h| {
+                let mut body = HashSet::from([h]);
+                let mut work: Vec<usize> = p.blocks[h]
+                    .preds
+                    .iter()
+                    .copied()
+                    .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+                    .collect();
+                while let Some(q) = work.pop() {
+                    if self.block[q].is_some() && body.insert(q) {
+                        work.extend(p.blocks[q].preds.iter().copied());
+                    }
+                }
+                (h, body)
+            })
+            .collect();
+        for (h, _) in &bodies {
+            let depth = 1 + bodies.iter().filter(|(g, body)| g != h && body.contains(h)).count();
+            let limit = super::loop_limit();
+            self.limits.insert(*h, loop_share(limit, depth));
         }
         self.cur = self.s.entry;
         self.find_sections();
@@ -7270,7 +7311,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = self.s.m.i32(self.limits[&to]);
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -7423,7 +7464,20 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, loop_share, lower};
+
+    #[test]
+    fn nested_loops_share_one_limit() {
+        let limit = super::LOOP_LIMIT;
+        assert_eq!(loop_share(limit, 1), limit);
+        // The product over a nest stays near one limit (it was limit^depth).
+        for depth in 2..=5usize {
+            let total = (loop_share(limit, depth) as u64).pow(depth as u32);
+            assert!(total <= 2 * u64::from(limit).max(16u64.pow(depth as u32)), "{depth}: {total}");
+        }
+        assert_eq!(loop_share(64, 3), 16);
+        assert_eq!(loop_share(8, 3), 8);
+    }
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
