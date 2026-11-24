@@ -1,0 +1,24 @@
+[package]
+name = "victory-testbed"
+description = "Headless checks of the translation layer: HLE exports and GFX10 shaders on WARP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "victory_testbed"
+
+[[bin]]
+name = "testbed"
+path = "src/main.rs"
+
+[dependencies]
+victory-hle.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+victory-shader = { workspace = true, features = ["testbed"] }
+
+[lints]
+workspace = true

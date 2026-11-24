@@ -89,6 +89,8 @@ mod lockstep;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(all(windows, feature = "testbed"))]
+pub mod testbed;
 mod unread;
 #[cfg(windows)]
 pub mod validator;

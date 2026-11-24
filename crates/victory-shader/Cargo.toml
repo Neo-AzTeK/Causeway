@@ -19,6 +19,8 @@ blake3.workspace = true
 host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []
+# Headless translation checks (`emit::testbed`, used by `victory-testbed`).
+testbed = ["host"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
