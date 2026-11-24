@@ -1184,43 +1184,101 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// Debugging aid: `VICTORY_KEYS=<when>:<key>,...` presses keys, with or
+    /// without focus. <when>, in seconds after input starts, is `30` (held
+    /// for 0.2 s), `30-60` (held throughout) or `30-60/4` (held for 0.2 s
+    /// every 4 s). A key is a letter, a digit, or `Enter`, `Esc`, `Tab`,
+    /// `Back`, `Up`, `Down`, `Left`, `Right` (the stand-in pad's table
+    /// maps them to buttons and sticks).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<Scripted>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
+            (Instant::now(), parse_script(&list))
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
+        scripted_at(keys, start.elapsed())
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    struct Scripted {
+        held: std::ops::Range<Duration>,
+        /// Pressed briefly every so often, not held throughout.
+        every: Option<Duration>,
+        vk: u8,
+    }
+
+    /// How long a scripted press lasts.
+    #[cfg(any(test, feature = "diagnostics"))]
+    const PRESS: Duration = Duration::from_millis(200);
+
+    /// The entries of a `VICTORY_KEYS` list; malformed ones are skipped.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn parse_script(list: &str) -> Vec<Scripted> {
+        let seconds = |s: &str| Duration::try_from_secs_f64(s.trim().parse().ok()?).ok();
+        let entry = |entry: &str| {
+            let (when, key) = entry.split_once(':')?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            let Some((from, rest)) = when.split_once('-') else {
+                let at = seconds(when)?;
+                return Some(Scripted { held: at..at.checked_add(PRESS)?, every: None, vk });
+            };
+            let (to, every) = match rest.split_once('/') {
+                // A shorter period would never release the key.
+                Some((to, every)) => (to, Some(seconds(every).filter(|&e| e >= PRESS * 2)?)),
+                None => (rest, None),
+            };
+            Some(Scripted { held: seconds(from)?..seconds(to)?, every, vk })
+        };
+        list.split(',').filter_map(entry).collect()
+    }
+
+    /// The keys down `now` after input started, each once.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn scripted_at(keys: &[Scripted], now: Duration) -> Vec<u8> {
+        let mut down: Vec<u8> = keys
+            .iter()
+            .filter(|k| k.held.contains(&now))
+            .filter(|k| {
+                k.every.is_none_or(|every| {
+                    (now - k.held.start).as_nanos() % every.as_nanos() < PRESS.as_nanos()
+                })
+            })
+            .map(|k| k.vk)
+            .collect();
+        down.sort_unstable();
+        down.dedup();
+        down
+    }
+
+    #[test]
+    fn scripted_keys_press_hold_and_repeat() {
+        let keys = parse_script("30:x, 12-20/4:Enter,18-19:W,1-2/4:Space,5-9/0.1:A,9-5/q:B,junk");
+        let at = |s: f64| scripted_at(&keys, Duration::from_secs_f64(s));
+        assert_eq!(keys.len(), 3);
+        assert_eq!(at(11.9), []);
+        // Every 4 s, for 0.2 s, and not at the end of the range.
+        for (s, down) in [(12.1, true), (12.3, false), (15.9, false), (16.1, true), (20.1, false)] {
+            assert_eq!(at(s), if down { vec![0x0D] } else { vec![] }, "{s}");
+        }
+        assert_eq!((at(18.1), at(18.9), at(19.1)), (vec![b'W'], vec![b'W'], vec![]));
+        assert_eq!((at(30.1), at(30.3)), (vec![b'X'], vec![]));
+        // Two entries holding one key report it once.
+        let twice = parse_script("1-3:W,1-3:W");
+        assert_eq!(scripted_at(&twice, Duration::from_secs(2)), [b'W']);
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
