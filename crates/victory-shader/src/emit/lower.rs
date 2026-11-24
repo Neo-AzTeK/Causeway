@@ -45,6 +45,10 @@ pub(crate) struct Lowered {
     pub wave_ops: bool,
 }
 
+/// A heap handle: DXIL block, descriptor load and its first dword, sampler,
+/// properties.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
     pub p: &'a Program,
@@ -173,7 +177,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1521,6 +1525,17 @@ impl<'a> Lower<'a> {
         let size = self.unary(6, part);
         let exact = self.s.m.cmp(c, pred::OEQ, size, at);
         self.s.m.select(c, exact, zero, r)
+    }
+
+    /// The 64-bit integer of two dwords.
+    fn wide(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The high dword of a 32 × 32-bit product.
@@ -3308,7 +3323,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5649,7 +5664,7 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
-            // DXIL's atomic operations on a 32-bit integer texture UAV; the
+            // DXIL's atomic operations on an integer texture UAV; the
             // old value returns with glc. Sub is the add of the negation.
             let code = match op {
                 "add" | "sub" => 0,
@@ -5670,12 +5685,16 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask: the data dwords (cmpswap: twice the value's). 64-bit ones
+            // are the host's 64-bit typed atomics, on an R32G32 view as the
+            // console's.
+            let swap = code == u32::MAX;
+            let wide = match (dmask, swap) {
+                (1, false) | (3, true) => false,
+                (3, false) | (0xF, true) => true,
+                _ => return Err("an image atomic's data channels"),
+            };
+            let words: u8 = if wide { 2 } else { 1 };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5684,42 +5703,63 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
+            let mut vals = self.vgprs(inst, data, if swap { 2 * words } else { words })?;
+            let (ty, suffix, comp) = if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
+                vals = vals.chunks(2).map(|v| self.wide(v[0], v[1])).collect();
+                (self.s.m.int(64), "i64", 7)
+            } else {
+                (self.s.t.i32, "i32", 5)
+            };
             let mut value = vals[0];
             if op == "sub" {
-                let z = self.s.m.i32(0);
+                let z = self.s.m.int_const(ty, 0);
                 value = self.s.m.bin(c, Bin::Sub, z, value);
             }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
-            };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let mut old = Vec::new();
+            for k in 0..words {
+                old.push(match inst.read(Reg::V(reg + k)) {
+                    Some(v) if cache.glc => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                });
+            }
+            let h = self.handle(site, src, false, (kind | 0x1000, 0x100 | comp))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
             let mut args = vec![h];
-            let r = if code == u32::MAX {
+            let (dx, opcode) = if swap {
                 // cmpswap: data is (new, compare).
                 args.extend(cs);
                 args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
-                    "atomicCompareExchange.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    79,
-                    &args,
-                )
+                ("atomicCompareExchange", 79)
             } else {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                ("atomicBinOp", 78)
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            let r = self.s.op(
+                self.cur,
+                &format!("{dx}.{suffix}"),
+                Attr::NoUnwind,
+                ty,
+                opcode,
+                &args,
+            );
+            let r = if wide {
+                let i32t = self.s.t.i32;
+                let k32 = self.s.m.int_const(ty, 32);
+                let lo = self.s.m.cast(self.cur, Cast::Trunc, r, i32t);
+                let hi = self.s.m.bin(self.cur, Bin::LShr, r, k32);
+                vec![lo, self.s.m.cast(self.cur, Cast::Trunc, hi, i32t)]
+            } else {
+                vec![r]
+            };
+            let values: Vec<_> = r.into_iter().zip(old).collect();
+            let r = self.end_guarded(at, &values);
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                for (k, x) in r.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, None);
+                }
             }
             return Ok(());
         }
