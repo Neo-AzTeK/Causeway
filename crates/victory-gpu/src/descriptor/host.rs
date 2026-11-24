@@ -1074,7 +1074,13 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
+    // Every unordered view, not only a cast one: a typed unordered view in a
+    // format the host cannot store to (B5G5R5A1_UNORM on NVIDIA) is an
+    // invalid call, and the host removes the device for it (#1754).
+    // shortcut: the view is null, so the title's writes to that texture are
+    // lost; packed 16-bit formats need their own unordered path.
+    let stored = viewed_format(own, view, typeless, cast);
+    if unordered && !typed_store(stored) {
         once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
@@ -1085,6 +1091,13 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         *format = d.Format;
     }
     true
+}
+
+/// The format a texture view of `own` (`typeless`: a family's first format)
+/// asked in `view` ends up in: the view's when the texture is typeless or
+/// the view is castable to, else the texture's own. Pure, for testing.
+fn viewed_format(own: u32, view: u32, typeless: bool, cast: bool) -> u32 {
+    if view != 0 && (typeless || cast) { view } else { own }
 }
 
 /// Whether a view without a description of `resource` (a title texture)
@@ -1508,6 +1521,21 @@ mod tests {
         assert!(!within(64, 0, 0, 16));
         assert!(!within(64, 3, 2, 16));
         assert!(!within(64, u64::MAX, 1, 16));
+    }
+
+    /// An unordered view is checked in the format it is made in: the view's
+    /// own on a typeless or castable texture, the texture's otherwise (a
+    /// B5G5R5A1 texture viewed as B5G5R5A1 is checked as B5G5R5A1, #1754).
+    #[test]
+    fn unordered_views_are_checked_in_the_format_they_are_made_in() {
+        const B5G5R5A1: u32 = 86;
+        const R16_TYPELESS: u32 = 53;
+        const R16_UINT: u32 = 57;
+        assert_eq!(viewed_format(B5G5R5A1, B5G5R5A1, false, false), B5G5R5A1);
+        assert_eq!(viewed_format(B5G5R5A1, 0, false, false), B5G5R5A1);
+        assert_eq!(viewed_format(R16_TYPELESS, R16_UINT, true, false), R16_UINT);
+        assert_eq!(viewed_format(R16_UINT, B5G5R5A1, false, true), B5G5R5A1);
+        assert_eq!(viewed_format(R16_UINT, 56, false, false), R16_UINT);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
