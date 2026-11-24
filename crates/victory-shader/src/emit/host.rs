@@ -910,6 +910,9 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// A square RGBA32F texture SRV with a full mip chain, one colour per
+    /// level from the largest.
+    Mips(&'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1150,6 +1153,42 @@ impl Host {
                             (faces == 6).then_some(&cube as *const _),
                             at,
                         );
+                        keep.push(tex);
+                    }
+                    View::Mips(levels) => {
+                        let n = 1u32 << (levels.len() - 1);
+                        let mut desc = texture(n, n, D3D12_RESOURCE_FLAG_NONE);
+                        desc.MipLevels = levels.len() as u16;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        for (level, colour) in levels.iter().enumerate() {
+                            let w = n >> level;
+                            let pitch = (w as usize * 16).next_multiple_of(256);
+                            let data: Vec<u32> = (0..pitch * w as usize / 4)
+                                .map(|k| colour[k % 4].to_bits())
+                                .collect();
+                            let from = upload(&data)?;
+                            let mut to = subresource(&tex);
+                            to.Anonymous.SubresourceIndex = level as u32;
+                            list.CopyTextureRegion(
+                                &to,
+                                0,
+                                0,
+                                0,
+                                &footprint(&from, w, w),
+                                None,
+                            );
+                            keep.push(from);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {

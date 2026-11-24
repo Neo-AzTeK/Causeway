@@ -5594,9 +5594,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -5851,6 +5848,8 @@ impl<'a> Lower<'a> {
             let offset_word = name.ends_with("_o");
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            // Each takes a whole VGPR, with a16 too (two 16-bit components).
+            let first = if *a16 { 2 * first } else { first };
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -5950,8 +5949,9 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
+                    // With a16 an f16 in the low half of its VGPR.
                     let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
