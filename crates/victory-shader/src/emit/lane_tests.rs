@@ -2,7 +2,7 @@
 //! synthetic GFX10 programs of 32 lanes, run as in `image_tests`.
 
 use super::host::View;
-use super::image_tests::{build, run};
+use super::image_tests::{build, run, translate};
 use crate::native::ResourceType;
 
 /// Loads the raw UAV's descriptor to s[40:43] and v16 = 4 × lane.
@@ -63,4 +63,69 @@ fn a_lane_mask_spilled_to_a_vgpr_lane_stays_a_mask() {
             .collect();
         assert_eq!(got, want, "{label}");
     }
+}
+
+/// s9 holds a descriptor's dword; lanes below 16 set it to 100 and v5 to -1
+/// (0 in the others).
+const REUSED: [u32; 12] = [
+    0xF408_0203,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+    0x7E0A_0280, // v_mov_b32 v5, 0
+    0x7E10_0280, // v_mov_b32 v8, 0
+    0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+    0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+    0xBF88_0003, // s_cbranch_execz -> the restore
+    0xBE89_03FF,
+    0x0000_0064, // s_mov_b32 s9, 100
+    0x7E0A_02C1, // v_mov_b32 v5, -1
+    0xBEFE_0317, // s_mov_b32 exec_lo, s23
+    0x7D84_0AC1, // v_cmp_eq_u32 vcc_lo, -1, v5
+];
+const USE: u32 = 0x4A10_0009; // v_add_nc_u32 v8, s9, v0
+
+#[test]
+fn a_register_reused_on_another_path_is_read_where_a_flag_allows() {
+    let want: Vec<u32> = (0..32).map(|l| if l < 16 { 100 + l } else { 0 }).collect();
+    // The flag guards a branch, or EXEC alone.
+    let branch = [
+        0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+        0xBF88_0001, // s_cbranch_execz -> the restore
+        USE,
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+    ];
+    let guard = [branch[0], USE, branch[3]];
+    for read in [&branch[..], &guard[..]] {
+        for (label, got) in stored(&[&REUSED[..], read].concat()) {
+            assert_eq!(got, want, "{label}");
+        }
+    }
+}
+
+#[test]
+fn a_register_reused_on_another_path_is_refused_where_lanes_from_it_read() {
+    let after = |read: &[u32]| {
+        let words = [&STORE_SETUP[..], &REUSED[..], read, &STORE[..]].concat();
+        translate(&words, ResourceType::Srv)
+    };
+    // Unguarded; guarded by the other lanes' flag; read across lanes.
+    assert!(after(&[USE]).is_err());
+    assert!(
+        after(&[
+            0x7D8A_0AC1, // v_cmp_ne_u32 vcc_lo, -1, v5
+            0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+            USE,
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        ])
+        .is_err()
+    );
+    assert!(
+        after(&[
+            0x7E0C_0209, // v_mov_b32 v6, s9
+            0x7E14_0506, // v_readfirstlane_b32 s10, v6
+            0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
+            0x4A10_000A, // v_add_nc_u32 v8, s10, v0
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        ])
+        .is_err()
+    );
 }

@@ -263,7 +263,7 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
@@ -6920,6 +6920,21 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// Whether no effect of a lane entering block `b` over predecessor `n`
+    /// needs what has no DXIL form there (see [`super::unread`]).
+    fn unread(&self, b: usize, n: usize, done: &mut HashMap<(usize, usize), bool>) -> bool {
+        *done.entry((b, n)).or_insert_with(|| {
+            super::unread::unread(
+                self.x,
+                b,
+                n,
+                &|v| !matches!(self.vals.get(&v), Some(Val::I32(_) | Val::Bit(_))),
+                &|v| self.pair_high(v),
+                &|b| self.sections.contains_key(&b),
+            )
+        })
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
@@ -6936,6 +6951,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let mut unread = HashMap::new();
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -6946,14 +6962,21 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                    }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, why));
-                    }
                     _ if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                        let why = match self.vals.get(&arg) {
+                            Some(Val::Missing(why)) => why,
+                            Some(Val::Bit(_)) if !bit => "an SCC joined with SGPR values",
+                            _ => "a join of mismatched values",
+                        };
+                        if !self.unread(b, n, &mut unread) {
+                            return Err(Stop::Retry(phi.value, why));
+                        }
+                        // No lane from this edge uses it.
+                        if bit {
+                            self.s.m.bool(false)
+                        } else {
+                            self.s.m.i32(0)
+                        }
                     }
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),

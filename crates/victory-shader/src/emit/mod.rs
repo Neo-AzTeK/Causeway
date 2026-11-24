@@ -88,6 +88,7 @@ mod lane_tests;
 mod lower;
 mod sampler;
 mod shader;
+mod unread;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]

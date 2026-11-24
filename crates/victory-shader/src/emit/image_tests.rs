@@ -9,7 +9,7 @@ use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{ShaderError, io, ir, resource, structure};
 
 /// `s[4:5]` and `s[6:7]`: the tables of views and of samplers.
 const TABLES: [u32; 4] = [
@@ -22,8 +22,8 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// Lowers a wave32 compute program of 32 threads with the table of views at
 /// s0 (a texture of kind `image` at dword 0, a raw UAV at dword 8) and the
-/// table of samplers at s1; `validate`s it if asked.
-pub(super) fn build(body: &[u32], image: ResourceType, validate: bool) -> HostShader {
+/// table of samplers at s1; or why it does not translate.
+pub(super) fn translate(body: &[u32], image: ResourceType) -> Result<HostShader, ShaderError> {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -77,9 +77,8 @@ pub(super) fn build(body: &[u32], image: ResourceType, validate: bool) -> HostSh
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
-    let shader = HostShader {
+    })?;
+    Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -87,7 +86,12 @@ pub(super) fn build(body: &[u32], image: ResourceType, validate: bool) -> HostSh
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
-    };
+    })
+}
+
+/// A program that translates, `validate`d if asked (see [`translate`]).
+pub(super) fn build(body: &[u32], image: ResourceType, validate: bool) -> HostShader {
+    let shader = translate(body, image).expect("translate");
     if !validate {
         return shader;
     }
