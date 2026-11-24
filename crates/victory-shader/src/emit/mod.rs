@@ -81,9 +81,14 @@ mod container;
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_tests;
+#[cfg(all(test, windows))]
+mod lane_tests;
 mod lower;
 mod sampler;
 mod shader;
+mod unread;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]

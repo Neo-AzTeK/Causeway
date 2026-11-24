@@ -16,7 +16,7 @@
 //! program's VGPR count, all read (and all written, for a destination).
 
 use crate::ShaderError;
-use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
+use crate::gfx10::{self, Fields, Flow, Instruction, NULL, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
@@ -261,7 +261,8 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
         }
     }
-    remove_trivial_phis(&mut blocks, values);
+    remove_trivial_phis(&mut blocks, values, &[]);
+    forward_spills(&mut blocks, wave64, &mut values);
     Ok(Program {
         wave64,
         vgprs,
@@ -589,10 +590,210 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
     (live_in, live_out)
 }
 
+/// SGPRs spilled to VGPR lanes: a `v_readlane_b32` of a constant lane that
+/// only `v_writelane_b32` writes of constant lanes reach reads back an SGPR
+/// (both ignore EXEC), so its result becomes that SGPR's value and the
+/// instruction goes away, with the writes nothing else reads. A spilled lane mask then stays a mask instead of
+/// a number gathered from other lanes. Paths that spilled different values
+/// meet in new phis. Anything else in the lane (a constant, a register no
+/// one set) leaves the instruction as it is.
+fn forward_spills(blocks: &mut [Block], wave64: bool, values: &mut u32) {
+    let mut defs = std::collections::HashMap::new();
+    for (b, block) in blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            defs.insert(phi.value, (b, i, true));
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                defs.insert(v, (b, i, false));
+            }
+        }
+    }
+    let lane = |op: Operand| match op {
+        Operand::Const(c) => crate::resource::inline(c),
+        Operand::Literal(x) => Some(x),
+        _ => None,
+    }
+    .map(|x| x & if wave64 { 63 } else { 31 });
+    // What lane `k` of VGPR value `v` holds: the SGPR value or the phi of
+    // such slots, found past the writes of other lanes.
+    enum Slot {
+        Sgpr(Value),
+        Phi(Value),
+    }
+    let slot = |blocks: &[Block], mut v: Value, k: u32| loop {
+        let &(b, i, phi) = defs.get(&v)?;
+        if phi {
+            return Some(Slot::Phi(v));
+        }
+        let inst = &blocks[b].insts[i];
+        let Fields::Valu(w) = &inst.fields else {
+            return None;
+        };
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+            return None;
+        };
+        if inst.name() != "v_writelane_b32" {
+            return None;
+        }
+        if lane(*at)? == k {
+            return match *value {
+                Operand::Scalar { code, .. } if code != NULL => {
+                    inst.read(Reg::S(code)).map(Slot::Sgpr)
+                }
+                _ => None,
+            };
+        }
+        v = inst.read(Reg::V(reg))?;
+    };
+
+    // Per readlane (block, index): its result's value. `made`: the phi of
+    // each slot, by the VGPR's phi.
+    let mut made: std::collections::HashMap<(Value, u32), Value> = Default::default();
+    let mut with = Vec::new();
+    let mut gone = Vec::new();
+    for b in 0..blocks.len() {
+        for i in 0..blocks[b].insts.len() {
+            let inst = &blocks[b].insts[i];
+            let Fields::Valu(r) = &inst.fields else {
+                continue;
+            };
+            if inst.name() != "v_readlane_b32" {
+                continue;
+            }
+            let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, at]) =
+                (r.dst, &r.src[..])
+            else {
+                continue;
+            };
+            // EXEC's writes are followed by register.
+            if code == EXEC || code == EXEC + 1 {
+                continue;
+            }
+            let (Some(k), Some(v), Some(out)) = (
+                lane(*at),
+                inst.read(Reg::V(*reg)),
+                inst.write(Reg::S(code)),
+            ) else {
+                continue;
+            };
+            // Every slot the read may come from, and the SGPR values there.
+            let mut leaves: Vec<Value> = Vec::new();
+            let mut phis: Vec<Value> = Vec::new();
+            let mut work = vec![v];
+            let mut whole = true;
+            while let Some(v) = work.pop() {
+                match slot(blocks, v, k) {
+                    Some(Slot::Sgpr(s)) => {
+                        if !leaves.contains(&s) {
+                            leaves.push(s);
+                        }
+                    }
+                    Some(Slot::Phi(p)) if phis.contains(&p) => {}
+                    Some(Slot::Phi(p)) => {
+                        phis.push(p);
+                        let (b, i, _) = defs[&p];
+                        work.extend(&blocks[b].phis[i].args);
+                    }
+                    None => {
+                        whole = false;
+                        break;
+                    }
+                }
+            }
+            if !whole || leaves.is_empty() {
+                continue;
+            }
+            let to = if let [one] = leaves[..] {
+                one
+            } else {
+                for &p in &phis {
+                    made.entry((p, k)).or_insert_with(|| {
+                        *values += 1;
+                        Value(*values - 1)
+                    });
+                }
+                for &p in &phis {
+                    let (b, i, _) = defs[&p];
+                    let value = made[&(p, k)];
+                    if blocks[b].phis.iter().any(|f| f.value == value) {
+                        continue;
+                    }
+                    let args = blocks[b].phis[i]
+                        .args
+                        .iter()
+                        .map(|&a| match slot(blocks, a, k) {
+                            Some(Slot::Sgpr(s)) => s,
+                            Some(Slot::Phi(q)) => made[&(q, k)],
+                            None => unreachable!("checked above"),
+                        })
+                        .collect();
+                    blocks[b].phis.push(Phi {
+                        reg: Reg::S(code),
+                        value,
+                        args,
+                    });
+                }
+                match slot(blocks, v, k) {
+                    Some(Slot::Sgpr(s)) => s,
+                    Some(Slot::Phi(p)) => made[&(p, k)],
+                    None => unreachable!("checked above"),
+                }
+            };
+            with.push((out, to));
+            gone.push((b, i));
+        }
+    }
+    for &(b, i) in gone.iter().rev() {
+        blocks[b].insts.remove(i);
+    }
+    if gone.is_empty() {
+        return;
+    }
+    remove_trivial_phis(blocks, *values, &with);
+
+    // Writes no read is left for, with the joins between them.
+    let mut live = vec![false; *values as usize];
+    let mut work: Vec<Value> = Vec::new();
+    let spill = |inst: &Inst| inst.name() == "v_writelane_b32";
+    let mut sources = std::collections::HashMap::new();
+    for block in blocks.iter() {
+        for phi in &block.phis {
+            sources.insert(phi.value, phi.args.clone());
+        }
+        for inst in &block.insts {
+            let reads = inst.reads.iter().map(|r| r.1);
+            if spill(inst) {
+                sources.extend(inst.writes.iter().map(|w| (w.1, reads.clone().collect())));
+            } else {
+                work.extend(reads);
+            }
+        }
+    }
+    while let Some(v) = work.pop() {
+        if !std::mem::replace(&mut live[v.0 as usize], true) {
+            work.extend(sources.get(&v).into_iter().flatten());
+        }
+    }
+    for block in blocks {
+        let dead = |v: Value| !live[v.0 as usize];
+        block
+            .phis
+            .retain(|phi| !(matches!(phi.reg, Reg::V(_)) && dead(phi.value)));
+        block
+            .insts
+            .retain(|inst| !(spill(inst) && inst.writes.iter().all(|w| dead(w.1))));
+    }
+}
+
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
-fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
+/// `with`: other values to replace, by what.
+fn remove_trivial_phis(blocks: &mut [Block], values: u32, with: &[(Value, Value)]) {
     let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+    for &(v, to) in with {
+        replaced[v.0 as usize] = to;
+    }
     let find = |replaced: &[Value], mut v: Value| {
         while replaced[v.0 as usize] != v {
             v = replaced[v.0 as usize];
@@ -1041,6 +1242,78 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn a_spilled_opaque_wave64_mask_keeps_its_high_dword() {
+        let words = [
+            0xD761_0005,
+            0x0001_0600, // v_writelane_b32 v5, s0, 3
+            0xD761_0005,
+            0x0001_0805, // v_writelane_b32 v5, s5, 4
+            0xD760_0006,
+            0x0001_0705, // v_readlane_b32 s6, v5, 3
+            0xD760_0007,
+            0x0001_0905, // v_readlane_b32 s7, v5, 4
+            0xBE8A_2406, // s_and_saveexec_b64 s[10:11], s[6:7]
+            0x7E10_0281, // v_mov_b32 v8, 1
+            0xE070_0000,
+            0x8000_0800, // buffer_store_dword v8, off, s[0:3], 0
+            S_ENDPGM,
+        ];
+        let p = build_words(&words, true);
+        let st = crate::structure::structure(&p).unwrap();
+        let (lo, hi) = (input(&p, Reg::S(0)), input(&p, Reg::S(5)));
+        assert_eq!(st.opaque.get(&lo), Some(&Some(hi)));
+    }
+
+    #[test]
+    fn a_spill_read_back_to_exec_stays() {
+        let words = [
+            0xD761_0005,
+            0x0001_0600, // v_writelane_b32 v5, s0, 3
+            0xD760_007E,
+            0x0001_0705, // v_readlane_b32 exec_lo, v5, 3
+            0x7E10_0281, // v_mov_b32 v8, 1
+            0xE070_0000,
+            0x8000_0800, // buffer_store_dword v8, off, s[0:3], 0
+            S_ENDPGM,
+        ];
+        let p = build_words(&words, false);
+        let insts = &p.blocks[0].insts;
+        assert!(insts.iter().any(|i| i.name() == "v_readlane_b32"));
+    }
+
+    #[test]
+    fn a_spilled_wave64_mask_is_read_back_as_itself() {
+        let p = build_words(
+            &[
+                0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+                0xD761_0005,
+                0x0001_506A, // v_writelane_b32 v5, vcc_lo, 40
+                0xD761_0005,
+                0x0001_106B, // v_writelane_b32 v5, vcc_hi, 8
+                0xD760_0006,
+                0x0001_5105, // v_readlane_b32 s6, v5, 40
+                0xD760_0007,
+                0x0001_1105, // v_readlane_b32 s7, v5, 8
+                0xD501_0008,
+                0x0019_0280, // v_cndmask_b32 v8, 0, 1, s[6:7]
+                0xE070_0000,
+                0x8000_0800, // buffer_store_dword v8, off, s[0:3], 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let insts = &p.blocks[0].insts;
+        let names: Vec<_> = insts.iter().map(|i| i.name()).collect();
+        assert_eq!(names[..2], ["v_cmp_gt_u32", "v_cndmask_b32"], "{names:?}");
+        for half in 0..2 {
+            assert_eq!(
+                insts[1].read(Reg::S(6 + half)),
+                insts[0].write(Reg::S(VCC + half))
+            );
+        }
     }
 
     #[test]
