@@ -76,6 +76,23 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: placed buffer view cost attributed (runs pcost-1..2, GTX 1070,
+  branch claude/placed-view-cost, not merged): of ~48 ms/frame making placed
+  buffer views, 30 ms is making the descriptor, 19 ms the heap's bindless
+  record (`bindless::Viewed::set`: a second `shadow::for_view` and range
+  maps), 1.4 ms `keep`. Inside making, ~58 copies of single views per frame
+  (`shadow::exact`, ring positions) at 0.56 ms each (31-36 ms): a committed
+  buffer apiece. Keeping dead copies' buffers (cap 256) did not help
+  (pcost-2): live copies grow to ~3,300 and die in bursts. Fix on the
+  branch: copies up to 64 KiB placed on 64 KiB blocks of 32 MiB
+  buffer-only heaps (resource heap tier 1 and 2), a dead copy's block free
+  after the next submission has run; committed buffer as before past 64 KiB
+  or if the host refuses (kept: not asked again). Views of a placed copy
+  reach its length rounded up to 256, zeroed at placement, as a buffer of
+  its own (review). Bench: placed+mapped 5.2 us vs committed 150 us.
+  Not verified in the title: runs pcost-3/-4 (and mesh-emu-3, another
+  branch) crashed at title start before the host device (0xc0000005 in the
+  title image, write 0x0), with ~8 GB of 43 GB commit free on the machine.
 - 2026-11-25: world CPU preparation attributed (runs prep-1..3, GTX 1070,
   branch claude/world-prep-cost, merged): of preparing, refresh batches
   78-112 ms (last batch alone 48-82), `sync_heaps` 43-50 ms, steps copy 21,

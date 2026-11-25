@@ -792,6 +792,15 @@ impl HostHeap {
             let later = !for_draw && is_placed_texture(&view);
             made.keys[index as usize] = key;
             made.postponed[index as usize] = later;
+            #[cfg(feature = "diagnostics")]
+            let (placed, mut at) = (making.1 == 4, std::time::Instant::now());
+            #[cfg(feature = "diagnostics")]
+            let mut lap = |part: usize| {
+                if placed {
+                    crate::copystat::part(part, at.elapsed().as_nanos() as u64);
+                    at = std::time::Instant::now();
+                }
+            };
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -801,10 +810,16 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(slot));
             }
+            #[cfg(feature = "diagnostics")]
+            lap(crate::copystat::PART_MAKE);
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
+            #[cfg(feature = "diagnostics")]
+            lap(crate::copystat::PART_VIEWED);
             self.keep(slot, kept.flatten());
+            #[cfg(feature = "diagnostics")]
+            lap(crate::copystat::PART_KEEP);
             #[cfg(feature = "diagnostics")]
             crate::copystat::made(making.1, making.0.elapsed().as_micros() as u64);
         }
@@ -1235,7 +1250,7 @@ fn buffer_srv(
         element
     };
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, unit) {
+    if !in_buffer(&shadow, first, count, unit) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
@@ -1253,11 +1268,11 @@ fn buffer_srv(
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
-/// `buffer`. The console takes a view that is empty or runs past its
-/// memory; the host removes the device for one.
-fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> bool {
-    // SAFETY: a live buffer.
-    within(unsafe { buffer.GetDesc() }.Width, first, count, element)
+/// what host views of `copy`'s buffer may reach
+/// ([`crate::shadow::Shadow::host_len`]). The console takes a view that is
+/// empty or runs past its memory; the host removes the device for one.
+fn in_buffer(copy: &crate::shadow::Shadow, first: u64, count: u32, element: u64) -> bool {
+    within(copy.host_len(), first, count, element)
 }
 
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
@@ -1315,7 +1330,7 @@ fn buffer_uav(
     };
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, unit) {
+    if !in_buffer(&shadow, first, count, unit) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
@@ -1898,6 +1913,26 @@ mod tests {
         assert!(!within(64, 0, 0, 16));
         assert!(!within(64, 3, 2, 16));
         assert!(!within(64, u64::MAX, 1, 16));
+    }
+
+    /// A copy of a single view, placed on a 64 KiB heap block, takes views
+    /// as far as its length rounded up to 256 (as a buffer of its own did),
+    /// not into the rest of the block, where an older copy's bytes are.
+    #[test]
+    fn views_past_a_placed_copy_are_refused() {
+        let _placing = crate::shadow::tests::PLACING.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, crate::watch::PAGE as u64);
+        let Some((copy, true)) = crate::shadow::for_view(p as u64 + 4, 3000, 16) else {
+            crate::shadow::unregister(p, p as u64);
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        assert!(in_buffer(&copy, 0, 3072 / 4, 4), "its length rounded up to 256");
+        assert!(!in_buffer(&copy, 0, 3072 / 4 + 1, 4), "past it");
+        assert!(!in_buffer(&copy, 1, 3072 / 4, 4), "past it");
+        drop(copy);
+        crate::shadow::unregister(p, p as u64);
     }
 
     /// An unordered view is checked in the format it is made in: the view's
