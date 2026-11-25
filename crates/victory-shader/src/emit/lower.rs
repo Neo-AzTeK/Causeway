@@ -594,7 +594,9 @@ impl<'a> Lower<'a> {
                 if !enough && try_virt && wave == 64 && threads <= 1024 {
                     // Two waves of 32 stand in for one of 64 (where its LDS
                     // exchanges can be put in step).
-                    let steps = if one_wave && s.lds_dwords > 0 {
+                    let steps = if super::halves::check(p).is_err() {
+                        None
+                    } else if one_wave && s.lds_dwords > 0 {
                         super::lockstep::barriers(&p.blocks)
                     } else {
                         Some(Vec::new())

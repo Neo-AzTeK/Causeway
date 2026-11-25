@@ -5,6 +5,10 @@ Newest state first inside each section. No game data here (rule #1): counts,
 error kinds, branches and commits only.
 
 ## State (update at every merge)
+- 2026-11-25 (end of session): main = origin/main, chain passes. Wave64 gate (`emit/halves.rs`) merged: two halves only
+  where no lane-derived branch can skip or repeat an s_barrier; all 56 enabled programs pass it. `a1f6cdf8874960a9` has
+  no barrier: its two loops count to a constant-buffer word (garbage suspected, > 2^20); `VICTORY_SHADER_LOOP_LIMIT=64`
+  stops the hang (smoke 12). Launches still need that env or `VICTORY_SKIP_PIPELINES=a1f6cdf8874960a9`.
 - 2026-11-25 (GTX 1070, Pascal, wave32, no mesh shaders, 1,000,000-slot view
   heap): main has view slots past a capped host heap taken from the pool
   (2863ff3), host textures resident only once the GPU may reach them
@@ -27,8 +31,6 @@ error kinds, branches and commits only.
   pixels non-flat in the saved frame: no 3D scene yet.
 
 ## Next, ranked by effect on the picture
-00. Texture refresh at ~3 MB/s: menus at 0.4 fps after ~40 s (smoke 12), so
-   runs on the GTX 1070 do not reach the world unattended. Blocks every run.
 0. (frame-wait hunt, see log) Real cost is GPU time before the removal
    (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
 1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
@@ -38,8 +40,10 @@ error kinds, branches and commits only.
    without a view heap or page table" 168.
 3. Program `a1f6cdf8874960a9` (compute, loops; smoke 11 skipped it: no removal,
    slow submissions 4.5 s -> 250-285 ms): find why it runs so long on the host
-   (loop bound, s_barrier lane-uniformity, wave32 lowering) and fix it, then
-   stop skipping it. One error, one session.
+   and fix it, then stop skipping it. Not the barrier (it has none; loops are
+   uniform, see log). Next: one launch with `VICTORY_SHADER_LOOP_LIMIT=64` (loop
+   count), and its end-of-program aggregated atomic per half. One error, one
+   session.
 4. Refused pipelines: 63 need 64 lanes (the skips cannot be left out); lower
    them on wave32 or fall back.
 5. Untranslated: descriptor read only as data (pixel, compute), lane mask read
@@ -51,8 +55,9 @@ error kinds, branches and commits only.
 8. Unimplemented device methods (two slots seen in smoke 9).
 
 ## Open decisions (owner)
-- Whether to emulate mesh shaders as compute for GPUs without them (GTX 1070
-  class); design written, nothing built.
+- Decided 2026-11-25 (owner: yes): emulate mesh shaders as compute for GPUs
+  without them (GTX 1070 class), native path kept where Caps has mesh tier >= 1;
+  being built by the design session.
 - Pass the other AI the review of 2863ff3, 32f83df, 433ecf7.
 - Whether a device removal should recreate the device (device lifetime).
 
@@ -62,6 +67,54 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: smoke 12's slow menus: `watch::plain_pages` (dc31df2) called
+  `VirtualQuery` on every alias page it guards. The aliases sit in the
+  runtime's ~5.5 GiB committed pool view, and `VirtualQuery` walks every page
+  to the end of a committed region (~10 us/MiB): 62 ms CPU per call, ~300
+  calls/frame, all under the guard lock. Fix: `QueryVirtualMemoryInformation`
+  (1-2 us) first; views are skipped whole. GTX 1070, 250 s: textures <= 5.1
+  ms/frame (was 2300-5400), protecting 2.2 ms for 396 calls, menus 30 fps
+  throughout; world not reached (select screen not pressed). Branch
+  claude/frosty-satoshi-7332c1, merged to main. Other `VirtualQuery` callers on that view
+  (`texture::committed`, `copystat`, `watch::writable`) cost the same if hot.
+- 2026-11-25: finding (offline, local decoded dump, no launch, no code change):
+  `a1f6cdf8874960a9` has two do-while loops (`s_add` counter, `s_cmp_eq` against
+  a count, exit on `scc0`), each guarded by a count-is-zero skip. Count 1 is
+  one dword of a constant buffer (`s_buffer_load` at user-SGPR base + 4); the
+  loop body reads one 16-byte vector per step from the same buffer, count 2
+  likewise (6 vectors per group of 5). A constant buffer holds at most 4096
+  such vectors, so a legitimate count cannot run for seconds; a count that
+  hits the 2^20 limit is garbage (stale or unwritten data, or a view larger
+  than the guest's buffer), not a large real loop. Not shown: which buffer, and
+  which word. One run needed: log, at the first slow submission of this program,
+  the constant-buffer descriptor (base, size) and the dword at base + s7 + 4,
+  with `VICTORY_SHADER_LOOP_LIMIT=64` for safety. No adapter verified.
+- 2026-11-25: smoke 12 (69b004e, RTX 2060 SUPER wave32, 300 s, no skip,
+  `VICTORY_SHADER_LOOP_LIMIT=64`, owner-approved single run): no hang, no
+  removal; 7 slow submissions of 251-271 ms, none naming `a1f6cdf8874960a9`
+  (23 log lines mention it, so it ran). 0.6 fps, 1088 drawn/frame, lost
+  per frame: refused 346, compiling 760, other 2494; 0.0% non-flat. So the
+  hang is a loop trip count, as suspected; not shown whether the count is
+  garbage on the host (a wrong constant-buffer read) or legitimately large.
+  Next: run it at the default limit with the count of its loops logged, or
+  find the count's source. The limit also changes every other loop: this run
+  proves the cause, not a fix.
+- 2026-11-25: halves gate (`emit/halves.rs`, branch claude/kind-chebyshev-d936c6,
+  offline, no launch): two-halves only if no `s_barrier` can be skipped or
+  repeated by a branch on a lane-derived scalar (compare masks, EXEC, scalar
+  ALU on them; lane reads are exchanged by the lowering), and no scalar load
+  address or non-bitwise EXEC write comes from one. Synthetic tests: lane exit
+  + barrier refused; uniform exit, no barrier, barrier after the loop accepted.
+  Census (local files): 223 compute programs still need 64 lanes, as before
+  the gate, so all 56 enabled programs survive it; 931 wave64 programs run on
+  waves of 32 (two halves or lanes that fit; the counter cannot tell them
+  apart). Finding: `a1f6cdf8874960a9` has no `s_barrier` and no LDS; its two
+  backward branches test `s_cmp` of scalars loaded from a constant buffer
+  (uniform), so the barrier hypothesis is refuted for it and the gate accepts
+  it. Not shown: why it runs long. Candidates: loop count read as 0 or garbage
+  (2^20 per-lane limit), and a wave-aggregated atomic at its end (`s_bcnt1`,
+  `s_ff1` on EXEC, `v_readfirstlane`, `v_cmpx` on a lane index) that picks a
+  leader per half. Keep skipping it. No adapter verified (no launch).
 - 2026-11-25: smoke 12 (main be98212, GTX 1070, 300 s): menus 30-36 fps for
   ~40 s, then 0.3-0.4 fps to the end: 2.3-2.9 s/frame in texture preparation
   (`Staging::refresh`, 7.6-9.5 MB/frame read, ~3 MB/s; 5-7 draws, GPU 4 ms).
