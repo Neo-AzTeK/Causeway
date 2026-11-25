@@ -333,6 +333,16 @@ impl Host {
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
+        self.root_signature_with(stages, &[])
+    }
+
+    /// As [`Host::root_signature_for`], with these root views last
+    /// (register, space, kind: 0 CBV, 1 SRV, 2 UAV).
+    pub fn root_signature_with(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        extra: &[(u32, u32, u8)],
+    ) -> Result<ID3D12RootSignature, String> {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
             .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
@@ -383,6 +393,7 @@ impl Host {
         if let Some((slot, _)) = strides {
             views.push((u32::from(slot), super::ROOT_CBV_SPACE, 1));
         }
+        views.extend_from_slice(extra);
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
@@ -923,6 +934,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         min_lod_clamp: false,
+        mesh_compute: false,
         view_marks: false,
     })?;
     Ok(HostShader {
@@ -1052,7 +1064,7 @@ pub enum Root {
         index: usize,
     },
     /// A root CBV (or with `srv`, a root SRV) over a buffer of these
-    /// dwords ([`Host::dispatch`] only).
+    /// dwords.
     View {
         srv: bool,
         data: Vec<u32>,
@@ -1297,7 +1309,25 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
+                    Root::View { srv, data } => {
+                        let b = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buf_desc((data.len() * 4).next_multiple_of(256) as u64),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                            None,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        b.Map(0, None, Some(&mut p)).map_err(err)?;
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), data.len());
+                        b.Unmap(0, None);
+                        if *srv {
+                            list.SetGraphicsRootShaderResourceView(*param, b.GetGPUVirtualAddress());
+                        } else {
+                            list.SetGraphicsRootConstantBufferView(*param, b.GetGPUVirtualAddress());
+                        }
+                        keep.push(b);
+                    }
+                    Root::Uav(_) => return Err("root UAVs in a draw".into()),
                 }
             }
             // A shader that clamps heap indices reads the view-stride table.

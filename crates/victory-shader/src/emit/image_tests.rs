@@ -116,6 +116,7 @@ pub(super) fn translate_caps(
         mesh_stride: 0,
         min_lod_clamp,
         view_marks: false,
+        mesh_compute: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

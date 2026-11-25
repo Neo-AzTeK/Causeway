@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_STRIDES, VIEW_TABLE_HEADER, flags};
+use super::shader::{MESH_ELEMENT_BYTES, Shader, VIEW_STRIDES, VIEW_TABLE_HEADER, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -83,6 +83,8 @@ pub(crate) struct Parts<'a> {
     pub min_lod_clamp: bool,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// A mesh program is made as compute (`emit`, "Mesh shaders as compute").
+    pub mesh_compute: bool,
 }
 
 enum Stop {
@@ -624,6 +626,7 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            s.mesh_compute = x.mesh_compute;
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -2963,22 +2966,60 @@ impl<'a> Lower<'a> {
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
         );
-        self.s
-            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        if !self.s.mesh_compute {
+            self.s
+                .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        }
         let flat = self.mesh_thread();
         let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
         let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
+        self.store_indices(flat, [z, z, z]);
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// Mesh: primitive `prim`'s vertex indices, in the current block. Made
+    /// as compute, the triangle goes to the scratch triangles (three dwords
+    /// at the group's slot `prim`) with indices past the group's earlier
+    /// vertices: the dispatch's triangles index its vertices from 0.
+    fn store_indices(&mut self, prim: V, indices: [V; 3]) {
+        let void = self.s.t.void;
+        if !self.s.mesh_compute {
+            let args = [prim, indices[0], indices[1], indices[2]];
+            self.s
+                .op(self.cur, "emitIndices", Attr::NoUnwind, void, 169, &args);
+            return;
+        }
+        let mesh = self.s.mesh.expect("mesh");
+        let (_, triangles) = self.s.mesh_scratch_handles();
+        let slot = self.mesh_slot(mesh.max_primitives, prim);
+        let c = self.cur;
+        let k12 = self.s.m.i32(12);
+        let at = self.s.m.bin(c, Bin::Mul, slot, k12);
+        let zero = self.s.m.i32(0);
+        let first = self.mesh_slot(mesh.max_vertices, zero);
+        let mut args = vec![triangles, at, self.s.m.undef(self.s.t.i32)];
+        for i in indices {
+            args.push(self.s.m.bin(c, Bin::Add, first, i));
+        }
+        args.push(self.s.m.undef(self.s.t.i32));
+        args.push(self.s.m.i8(7));
+        args.push(self.s.m.i32(4));
+        self.s
+            .op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+    }
+
+    /// Mesh made as compute: slot `index` of the group's `per_group` slots,
+    /// counted from the dispatch's first group, in the current block.
+    fn mesh_slot(&mut self, per_group: u32, index: V) -> V {
+        let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let c = self.cur;
+        let n = self.s.m.i32(per_group);
+        let first = self.s.m.bin(c, Bin::Mul, g, n);
+        self.s.m.bin(c, Bin::Add, first, index)
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
@@ -9725,9 +9766,32 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
-            let el = &mut elements(self, primitive)[id];
-            el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            elements(self, primitive)[id].usage |= 1 << col;
+            if mesh && self.s.mesh_compute {
+                if primitive {
+                    return Err("a per-primitive output of a mesh shader made as compute");
+                }
+                // The vertex's element `id`, channel `col` in the scratch
+                // vertices (`emit`, "Mesh shaders as compute").
+                let stride = self.s.outputs.len() as u32 * MESH_ELEMENT_BYTES;
+                let max_vertices = self.s.mesh.expect("mesh").max_vertices;
+                let vert = self.mesh_thread();
+                let slot = self.mesh_slot(max_vertices, vert);
+                let c = self.cur;
+                let k = self.s.m.i32(stride);
+                let at = self.s.m.bin(c, Bin::Mul, slot, k);
+                let off = self.s.m.i32(id as u32 * MESH_ELEMENT_BYTES + u32::from(col) * 4);
+                let at = self.s.m.bin(c, Bin::Add, at, off);
+                let (vertices, _) = self.s.mesh_scratch_handles();
+                let iu = self.s.m.undef(self.s.t.i32);
+                let args = [vertices, at, iu, x, iu, iu, iu, self.s.m.i8(1), self.s.m.i32(4)];
+                let void = self.s.t.void;
+                self.s
+                    .op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+                continue;
+            }
+            let comp = elements(self, primitive)[id].comp;
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -9780,9 +9844,7 @@ impl<'a> Lower<'a> {
             let i = self.s.m.bin(c, Bin::And, i, mask);
             args.push(self.s.m.select(c, culled, z, i));
         }
-        let void = self.s.t.void;
-        self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
+        self.store_indices(args[0], [args[1], args[2], args[3]]);
         self.end_guarded(at, &[]);
         Ok(())
     }
@@ -10425,6 +10487,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
+            mesh_compute: false,
             native: &native,
             p: &p,
             st: &st,
@@ -10477,6 +10540,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
+            mesh_compute: false,
             native: &native,
             p: &p,
             st: &st,
@@ -10693,6 +10757,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
 
         let emitted = lower(&Parts {
+            mesh_compute: false,
             native: &native,
             p: &p,
             st: &st,

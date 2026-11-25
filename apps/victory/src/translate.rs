@@ -581,7 +581,7 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP };
+                    let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP, mesh_as_compute: false };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;

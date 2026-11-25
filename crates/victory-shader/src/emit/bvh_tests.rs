@@ -593,6 +593,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         min_lod_clamp: false,
+        mesh_compute: false,
         view_marks: false,
     })
     .expect("lower");
