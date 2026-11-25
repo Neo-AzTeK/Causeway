@@ -709,8 +709,18 @@ impl<'a> Tracer<'a> {
         let Some(v) = dynamic else {
             return "a constant address";
         };
-        if self.inputs[v.0 as usize].is_some() {
-            return "an address in an SGPR that is no root parameter";
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            // A user SGPR below the layout's last parameter that no parameter
+            // covers: a pointer the title's own code gets from outside the
+            // root signature (its meaning is unknown), not a system value.
+            let user = matches!(self.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs)
+                && matches!(reg, Reg::S(c) if self.layout.iter().any(|p|
+                    u32::from(c) < u32::from(self.stage.user_sgpr(p.user_data))));
+            return if user {
+                "an address in a user SGPR the root layout does not describe"
+            } else {
+                "an address in an SGPR that is no root parameter"
+            };
         }
         if self
             .leaves(v)
@@ -2012,9 +2022,31 @@ pub(crate) mod tests {
             err,
             ShaderError::Unsupported {
                 offset: 0,
-                what: "an address in an SGPR that is no root parameter"
+                what: "an address in a user SGPR the root layout does not describe"
             }
         );
+    }
+
+    #[test]
+    fn a_user_sgpr_below_the_layout_is_named() {
+        // s_load_dwordx4 s[0:3], s[0:1] in a compute shader whose only
+        // parameter starts at user data 16.
+        for wave64 in [false, true] {
+            let code: Vec<u8> = [0xF408_0000, 0xFA00_0000, S_ENDPGM]
+                .iter()
+                .flat_map(|w: &u32| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, wave64, 256).unwrap();
+            let err = track(&p, &[param(Table, 16, 1)], HwStage::Cs, lanes(&p).as_ref())
+                .unwrap_err();
+            assert_eq!(
+                err,
+                ShaderError::Unsupported {
+                    offset: 0,
+                    what: "an address in a user SGPR the root layout does not describe"
+                }
+            );
+        }
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
