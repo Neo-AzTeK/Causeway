@@ -37,8 +37,16 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Copy-back: bytes of pieces the GPU changed, and microseconds in the
+    /// comparison, title reads, merges, title writes and the final watch.
+    BackDiffBytes,
+    BackCompareUs,
+    BackReadUs,
+    BackMergeUs,
+    BackWriteUs,
+    BackWatchUs,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 28;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -126,6 +134,16 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "copy-back per frame: {:.1} MB in pieces the GPU changed; compare {:.1} ms, title reads \
+         {:.1} ms, merges {:.1} ms, title writes {:.1} ms, watch {:.1} ms",
+        mb(c[C::BackDiffBytes as usize]),
+        ms(c[C::BackCompareUs as usize]),
+        ms(c[C::BackReadUs as usize]),
+        ms(c[C::BackMergeUs as usize]),
+        ms(c[C::BackWriteUs as usize]),
+        ms(c[C::BackWatchUs as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
