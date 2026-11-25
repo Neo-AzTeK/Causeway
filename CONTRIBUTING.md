@@ -15,6 +15,9 @@ disassembly, screenshots or snapshots. No new policy exceptions without the
 owner's decision. `cargo xtask policy` (also the pre-commit hook,
 `cargo xtask install-hooks`) enforces it. Details: `docs/asset-policy.md`.
 
+Run `cargo xtask install-hooks` once per clone: it installs that hook and makes
+`gh` target this repository rather than the parent of the fork.
+
 ## Flow (KISS, owner's decision 2026-11-24)
 
 - No stacks, no PRs. A task is a short branch (or worktree) off `main`, one task
@@ -61,8 +64,8 @@ adapter runs).
 
 ## Running the title on a real GPU
 
-It can reset the display driver. Run one at a time, with diagnostics on and the
-full log kept (`cargo xtask smoke`, see `docs/debugging.md`). Scripted menu
-skipping must not tick the game's legal terms without the owner's OK for that
-launch: use a data directory already set up.
+It can reset the display driver. Use `cargo xtask smoke` (see
+`docs/debugging.md`): diagnostics build, full log, one run at a time, and no
+scripted keys on a data folder not set up unless `--accept-terms` is passed,
+which needs the owner's OK for that launch.
 

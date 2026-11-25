@@ -22,12 +22,8 @@ what agents need.
 
 ## Agent rules
 
-- This is a fork: always pass `-R Neo-AzteK/Causeway` to `gh` (its default can
-  be the parent repo).
-- Standing approval for real-GPU runs (owner, 2026-11-25): one at a time, any
-  time limit, diagnostics on, full log kept, `cargo xtask smoke` defaults.
-  Never accept the game's legal terms by script without the owner's OK for that
-  launch.
+- Real-GPU runs through `cargo xtask smoke` are pre-approved by the owner;
+  `--accept-terms` still needs the owner's OK for that launch.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
 - The main session coordinates and does not debug: a hunt goes to its own
   session with a `task-brief` (one error, one session). No agents by default.
