@@ -182,6 +182,12 @@ pub struct Log {
     /// Modules seen to log at info: their warnings are in the log too.
     informed: BTreeSet<String>,
     removed: Vec<String>,
+    /// The host's adapter line: name, vendor id, device id, video memory.
+    hardware: Option<[String; 4]>,
+    /// The host view heap limit and the host's wave sizes, where a line
+    /// names them (only a capped heap or a wave refusal does).
+    view_limit: Option<String>,
+    waves: Option<String>,
     host_failures: Vec<String>,
     crashes: Vec<String>,
     /// Shaders: the error.
@@ -243,6 +249,19 @@ impl Log {
             self.removed.push(line.to_owned());
         } else if line.contains(" ERROR victory_gpu::host:") {
             self.host_failures.push(line.to_owned());
+        }
+        if line.contains(" victory_gpu::host: ") && line.contains("host D3D12 adapter") {
+            let name = line.split_once(" adapter=").and_then(|(_, r)| r.split_once(" vendor="));
+            if let Some((name, _)) = name {
+                let get = |key| field(line, key).unwrap_or("?").to_owned();
+                self.hardware = Some([name.to_owned(), get("vendor"), get("device"), get("vram_mb")]);
+            }
+        }
+        if line.contains("host view heap capped") {
+            self.view_limit = field(line, "limit").map(str::to_owned);
+        }
+        if let Some((_, have)) = line.split_once(", the host has ") {
+            self.waves = Some(have.strip_suffix(" lanes").unwrap_or(have).trim().to_owned());
         }
         if let Some(at) = line.split_whitespace().next().and_then(unix_time) {
             self.last = Some(at);
@@ -577,13 +596,44 @@ impl Log {
         }
     }
 
-    fn adapter(&self) -> &'static str {
-        if self.warp {
-            "software (WARP)"
+    fn adapter(&self) -> String {
+        if let Some([name, vendor, device, vram]) = &self.hardware {
+            let soft = if self.warp { " (software, WARP)" } else { "" };
+            format!("{name}{soft}, vendor {vendor}, device {device}, {vram} MB video memory")
+        } else if self.warp {
+            "software (WARP)".into()
         } else if self.device {
-            "not the software one; the log does not name it"
+            "not the software one; the log does not name it".into()
         } else {
-            "unknown: the log does not name it"
+            "unknown: the log does not name it".into()
+        }
+    }
+
+    /// What the host logs of its capabilities: only a capped view heap or a
+    /// refused wave size names them; the binding tier is not logged.
+    fn capabilities(&self) -> String {
+        let said = |v: Option<&str>| v.unwrap_or("not logged").to_owned();
+        let waves = self.waves.as_ref().map(|w| w.replace(" to ", "-"));
+        format!(
+            "wave sizes {}; view heap limit {}; resource binding tier not logged",
+            said(waves.as_deref()),
+            said(self.view_limit.as_deref())
+        )
+    }
+
+    /// The device removal's own finding (DRED, `VICTORY_D3D12_DRED`), if the
+    /// log has it: the faulting address and allocation, the commands in flight.
+    fn removal(&self) -> String {
+        let Some(first) = self.removed.first() else {
+            return "no device removal".into();
+        };
+        let at = ["; page fault at", "; inside", "; breadcrumbs", "; no breadcrumbs"]
+            .iter()
+            .filter_map(|m| first.find(m))
+            .min();
+        match at {
+            Some(i) => clip(first[i + 2..].trim()),
+            None => "none in the log (DRED was not on, or the runtime gave nothing)".into(),
         }
     }
 
@@ -599,6 +649,8 @@ impl Log {
         );
         let _ = writeln!(out, "XInput pad: {}", self.pad());
         let _ = writeln!(out, "adapter: {}", self.adapter());
+        let _ = writeln!(out, "capabilities: {}", self.capabilities());
+        let _ = writeln!(out, "removal: {}", self.removal());
         for a in areas {
             let _ = writeln!(out, "{:<8} {:<24} {}", a.status.name(), a.name, a.detail);
         }
@@ -624,11 +676,13 @@ impl Log {
             vec![("shaders", shaders.as_str()), ("error", error)]
         });
         format!(
-            "{{\n  \"frames\": {},\n  \"xinput_pad\": {},\n  \"adapter\": {},\n  \"areas\": \
+            "{{\n  \"frames\": {},\n  \"xinput_pad\": {},\n  \"adapter\": {},\n  \"capabilities\": {},\n  \"removal\": {},\n  \"areas\": \
              [{}\n  ],\n  \"untranslated\": [{}\n  ],\n  \"refused\": [{}\n  ]\n}}\n",
             self.frames,
             quote(self.pad()),
-            quote(self.adapter()),
+            quote(&self.adapter()),
+            quote(&self.capabilities()),
+            quote(&self.removal()),
             objects(judged.collect()),
             objects(untranslated.collect()),
             objects(refused.collect())
@@ -849,6 +903,32 @@ mod tests {
         // A world of which nothing is drawn is still the world.
         let undrawn = judge(&rate(2.0, 0, 0, 900), None);
         assert_eq!(status(&undrawn, "drawn vs dropped"), Status::Fail);
+    }
+
+    #[test]
+    fn a_removal_names_the_adapter_and_the_dred_finding() {
+        let log = gpu(
+            "INFO",
+            "host: host D3D12 adapter adapter=Test GPU 9000 vendor=0x10de device=0x1f06 vram_mb=8192",
+        ) + &gpu("INFO", "host: host D3D12 device ready")
+            + &gpu("WARN", "descriptor::host: host view heap capped wanted=9 title_slots=5 dynamic=1 limit=Some(1000000)")
+            + &gpu("WARN", "pipeline::host: host pipeline refused wave=requires waves of 64 to 64 lanes, the host has 32 to 32 lanes")
+            + &gpu(
+                "ERROR",
+                "host: host GPU device removed after a submission; device removed: 0x887A0006; \
+                 page fault at 0x1000; inside [\"heap (type 1)\"]; breadcrumbs (done/count, list) [\"3/5 0\"]",
+            );
+        let parsed = Log::parse(&log);
+        let areas = parsed.judge(None, |_| None);
+        let text = parsed.text(&areas);
+        assert!(text.contains("adapter: Test GPU 9000, vendor 0x10de, device 0x1f06, 8192 MB"), "{text}");
+        assert!(text.contains("wave sizes 32-32; view heap limit Some(1000000)"), "{text}");
+        assert!(text.contains("removal: page fault at 0x1000; inside"), "{text}");
+        assert!(text.contains("breadcrumbs (done/count, list)"), "{text}");
+        let json = parsed.json(&areas);
+        assert!(json.contains("\"removal\": \"page fault at 0x1000"), "{json}");
+        assert!(json.contains("\"capabilities\""), "{json}");
+        assert_eq!(Log::parse(&healthy()).removal(), "no device removal");
     }
 
     #[test]

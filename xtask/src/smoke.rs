@@ -35,8 +35,11 @@ pub struct Smoke {
     /// A diagnostics build to run instead of building one.
     #[arg(long)]
     exe_victory: Option<PathBuf>,
+    /// Also turn the D3D12 debug layer on (`VICTORY_D3D12_DEBUG=1`); it slows the run.
+    #[arg(long)]
+    d3d12_debug: bool,
     /// Judge this log; nothing runs.
-    #[arg(long, conflicts_with_all = ["exe", "keys", "exe_victory", "data_dir"])]
+    #[arg(long, conflicts_with_all = ["exe", "keys", "exe_victory", "data_dir", "d3d12_debug"])]
     log: Option<PathBuf>,
 }
 
@@ -48,10 +51,11 @@ const CAPTURE_FPS: u64 = 30;
 const CAPTURES: u64 = 3000;
 
 /// Our variables the run still takes from the environment: where its
-/// configuration and caches are, and the adapter. Any other may change what
+/// configuration and caches are, the adapter, and device-removed data (on
+/// unless the caller set it). Any other may change what
 /// runs or what is logged.
 const INHERITED: &[&str] =
-    &["VICTORY_CONFIG", "VICTORY_GAME_DIR", "VICTORY_CACHE_DIR", "VICTORY_D3D12_WARP"];
+    &["VICTORY_CONFIG", "VICTORY_GAME_DIR", "VICTORY_CACHE_DIR", "VICTORY_D3D12_WARP", "VICTORY_D3D12_DRED"];
 
 pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     victory_core::ensure_outside_repo(&args.out)?;
@@ -120,6 +124,13 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file);
+    // Device-removed data costs little; the debug layer is slow, so it is asked for.
+    if std::env::var_os("VICTORY_D3D12_DRED").is_none() {
+        command.env("VICTORY_D3D12_DRED", "1");
+    }
+    if args.d3d12_debug {
+        command.env("VICTORY_D3D12_DEBUG", "1");
+    }
     let end = run_for(command, Duration::from_secs(args.seconds))
         .with_context(|| format!("running {}", victory.display()))?;
     Ok((log, end))
@@ -420,6 +431,7 @@ mod tests {
             data_dir: None,
             keys: None,
             exe_victory: None,
+            d3d12_debug: false,
             log: Some(root.join("README.md")),
         };
         let error = run(&root, &args).unwrap_err();

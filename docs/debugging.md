@@ -39,6 +39,14 @@ connected), and judges each graphics area in `report.txt` and `report.json`.
 `--log <file>` judges an existing log instead. It exits with an error when an
 area failed; what a log does not show is "unknown".
 
+A run turns `VICTORY_D3D12_DRED=1` on (unless the environment sets the variable
+already), so a device removal reports the allocation hit and the commands in
+flight; `report.txt` and `report.json` give them as `removal`. `--d3d12-debug`
+adds the debug layer (`VICTORY_D3D12_DEBUG=1`), which slows the run. The
+reports also name the host adapter (name, vendor and device id, video memory)
+and, where the log has them, the wave sizes and view heap limit, so runs on
+different GPUs can be compared. The host logs no resource binding tier.
+
 On a real GPU this can reset the display driver. The default keys press
 through the title's first-start screens and can tick its legal terms: where
 that is not wanted, pass a `--data-dir` already set up, and `--keys` that
