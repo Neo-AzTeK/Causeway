@@ -27,14 +27,12 @@ working there. Before choosing work, read the "State" and "Next" sections of
 - Goal: the title (the owner's local copy, path given by the owner) works
   fully; milestone: the world's 3D scene is visible.
 - Real-GPU runs can reset the display driver. Standing approval (owner,
-  2026-11-25): runs are approved, one at a time, never two at once; any time
-  limit; the owner may exit early. Log everything (diagnostics on, keep the
-  log), skip configuration (`cargo xtask smoke` defaults), decide the workloads
-  afterwards. A script accepts the game's legal terms only with the owner's OK
-  for that launch.
+  2026-11-25): one run at a time, any time limit, diagnostics on, full log kept,
+  `cargo xtask smoke` defaults. A script accepts the game's legal terms only
+  with the owner's OK for that launch.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
 - **Hardware range** (owner, 2026-11-25): a fix must hold on other GPUs,
-  vendors and drivers, not only the owner's RTX 2060 SUPER (wave32 only). Query
+  vendors and drivers, not only the primary dev GPU (wave32 only, `docs/adapters.md`). Query
   capabilities through `Caps`; keep a clean refusal where a feature is missing;
   test both paths; say which adapters were and were not verified. Every brief
   states it. Every review of a GPU-facing diff answers: which capability does

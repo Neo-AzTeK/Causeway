@@ -15,7 +15,7 @@ that name. No game files are included.
 |------|-------|
 | Boot, setup screens, menus, intro video | work at 30 fps |
 | Saves, pad and keyboard input, menu sound | work |
-| World | loads, then about 0.5 fps on an RTX 2060 SUPER; credits draw, the 3D scene does not |
+| World | loads, then about 0.5-1 fps (adapters: `docs/adapters.md`); credits draw, the 3D scene does not |
 | Network | offline by design |
 | Ray tracing, HDR, scaling, audio reverb | missing |
 
