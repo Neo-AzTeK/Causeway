@@ -25,7 +25,7 @@ Where an instruction lives in `emit/lower.rs` (Grep `fn <name>`): scalar
 - What cannot be expressed is `Missing` with a reason, never a wrong value.
 - A new instruction needs a `valu_tests.rs` case; per-lane descriptors go in
   `waterfall_tests.rs`. GPU tests there take the `ONE_AT_A_TIME` lock.
-- `$env:VICTORY_WARP=1` runs shader tests on the software adapter. It is not
+- `VICTORY_WARP=1` runs shader tests on the software adapter. It is not
   `VICTORY_D3D12_WARP`, which is for the running title (diagnostics builds).
 - `lower.rs` and its tests: one writer at a time.
 - Check wave32 and wave64, and a lane with its EXEC bit clear.

@@ -45,10 +45,12 @@ game (the runner removes all others) and the digest warns when the log does not 
 It exits with an error when an
 area failed; what a log does not show is "unknown".
 
-On a real GPU this can reset the display driver. The default keys press
-through the title's first-start screens and can tick its legal terms: where
-that is not wanted, pass a `--data-dir` already set up, and `--keys` that
-leave time to look at each screen.
+On a real GPU this can reset the display driver, so only one smoke run at a
+time starts on a machine. Scripted keys can tick the title's legal terms on its
+first-start screens, so the runner refuses them unless the data folder is
+already set up (`--data-from <folder>` copies one for the run, `--data-dir
+<folder>` uses it in place). `--keys ""` plays by hand; `--accept-terms` allows
+a fresh folder and needs the owner's OK for that launch.
 
 ## Testbed (no game, no title run)
 

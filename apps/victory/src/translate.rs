@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The census translates as for a device with TiledResources tier 2 or
-/// better (the host queries it, `Host::min_lod_clamp`).
+/// better (the host plans it from `Caps`, `caps::min_lod_clamp`).
 // shortcut: the census has no device; a tier 1 adapter refuses more.
 const MIN_LOD_CLAMP: bool = true;
 

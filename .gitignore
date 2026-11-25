@@ -76,3 +76,7 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+
+# This machine's GPUs, written by `cargo xtask setup`.
+/victory.hardware.toml

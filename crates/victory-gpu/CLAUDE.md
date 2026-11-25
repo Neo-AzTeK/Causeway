@@ -27,21 +27,16 @@
 
 ## Writing tests here
 
-- Memory a test hands to `shadow`/`watch` (a buffer view, `for_view`, `find`,
-  `register`) is never a `Vec` or a stack array. `shadow::loose` copies the
-  whole 4 MiB window around an address and write-protects it; over the host
-  heap that faults the allocator into the guard handler on the thread holding
-  `GUARDS`, which waits for itself (a hang about every second run, in a later
-  test). Use `watch::tests::pool` (write-watched) or
-  `watch::tests::owned_window` (alone in its window).
-- A test that hangs must not wait for the 15-minute chain limit: run the
-  test binary directly with `timeout 60 <exe> --test-threads=1 <filters>`;
-  single-threaded libtest prints `test name ...` before each test, so the
-  last line names the stuck one. Narrow with two filters (culprit + victim).
-- No wall-clock bounds near a tick or a few milliseconds, and no "consecutive"
-  assertions on scheduled events: a loaded host (other sessions build and use
-  the GPU) wakes threads 15-30 ms late. Assert order and "not the time-out".
-  Check a timing test under load before merging: 24 busy loops, 80 runs.
-- A test that needs the host GPU returns when `host()` is `None`; say so
-  (`eprintln!("skipped: no host GPU")`) in new tests so a silent pass is
-  visible with `--nocapture`.
+- Memory handed to `shadow`/`watch` (buffer view, `for_view`, `find`,
+  `register`) is never a `Vec` or stack array: `shadow::loose` write-protects
+  the 4 MiB window around it, and over the host heap that hangs (about every
+  second run). Use `watch::tests::pool` or `watch::tests::owned_window`.
+- A hanging test: run the binary directly, `timeout 60 <exe> --test-threads=1
+  <filters>`; the last `test name ...` line names the stuck one.
+- No wall-clock bounds near a few milliseconds and no "consecutive" assertions
+  on scheduled events (loaded hosts wake threads 15-30 ms late). Assert order
+  and "not the time-out"; check a timing test under load (24 busy loops, 80
+  runs) before merging.
+- A test that needs the host GPU returns when `host()` is `None` and prints
+  `skipped: no host GPU`. Capability paths use fake caps (`caps::reference`),
+  never the real adapter.

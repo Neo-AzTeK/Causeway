@@ -1268,37 +1268,37 @@ fn supported_flags(
     format: u32,
     flags: u32,
 ) -> u32 {
-    use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     let typeless = family(format) == format && family(format + 1) == format;
     if flags & (TARGET | UNORDERED) == 0 || typeless {
         return flags;
     }
-    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-        Format: DXGI_FORMAT(format as i32),
-        ..Default::default()
-    };
-    // SAFETY: the query writes its own structure of the given size.
-    let asked = unsafe {
-        device.CheckFeatureSupport(
-            D3D12_FEATURE_FORMAT_SUPPORT,
-            (&raw mut support).cast(),
-            size_of_val(&support) as u32,
-        )
-    };
-    if asked.is_err() {
-        return flags;
+    let support = crate::caps::per_resource::format_support(device, DXGI_FORMAT(format as i32));
+    let left = flags_the_format_takes(support, flags);
+    if left != flags {
+        tracing::warn!(format, flags, left, "texture without uses the host lacks in its format");
     }
-    let lacks = |use_: D3D12_FORMAT_SUPPORT1| support.Support1.0 & use_.0 == 0;
+    left
+}
+
+/// `flags` without the uses `support` lacks. With no answer (`None`) they
+/// all stay: creating the texture is then the test.
+#[cfg(windows)]
+fn flags_the_format_takes(
+    support: Option<windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1>,
+    flags: u32,
+) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let Some(support) = support else {
+        return flags;
+    };
+    let lacks = |use_: D3D12_FORMAT_SUPPORT1| support.0 & use_.0 == 0;
     let mut left = flags;
     if lacks(D3D12_FORMAT_SUPPORT1_RENDER_TARGET) {
         left &= !TARGET;
     }
     if lacks(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) {
         left &= !UNORDERED;
-    }
-    if left != flags {
-        tracing::warn!(format, flags, left, "texture without uses the host lacks in its format");
     }
     left
 }
@@ -2561,6 +2561,21 @@ pub(crate) mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         drop(copy);
         assert_eq!(resource_release(image), 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_format_keeps_only_the_uses_it_has_or_all_without_an_answer() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FORMAT_SUPPORT1, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        };
+        let both = TARGET | UNORDERED;
+        let left = |support| flags_the_format_takes(support, both);
+        assert_eq!(left(None), both);
+        assert_eq!(left(Some(D3D12_FORMAT_SUPPORT1(0))), 0);
+        assert_eq!(left(Some(D3D12_FORMAT_SUPPORT1_RENDER_TARGET)), TARGET);
+        assert_eq!(left(Some(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)), UNORDERED);
     }
 
     #[test]

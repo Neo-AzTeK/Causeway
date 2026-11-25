@@ -112,7 +112,7 @@ fn wave_plan_serves_each_reference_class() {
 #[test]
 fn unknown_means_unsupported() {
     let c = Caps::unknown();
-    assert!(!min_lod_clamp(&c) && !mesh_shaders(&c) && !atomics64_heap(&c));
+    assert!(!min_lod_clamp(&c) && !mesh_shaders(&c) && !atomics64_heap(&c) && !aniso_point_mip(&c));
     assert!(matches!(wave_plan(&c, WaveNeed::Lanes { min: 32, max: 32, pinnable: true }), WavePlan::Refuse(_)));
     assert_eq!(binding_plan(&c).class, BindingClass::Slots);
     assert_eq!(memory_plan(&c).source, BudgetSource::Fallback);
@@ -184,7 +184,38 @@ fn plans_do_not_depend_on_vendor_or_driver() {
         assert_eq!(min_lod_clamp(&base), min_lod_clamp(&other));
         assert_eq!(mesh_shaders(&base), mesh_shaders(&other));
         assert_eq!(atomics64_heap(&base), atomics64_heap(&other));
+        assert_eq!(aniso_point_mip(&base), aniso_point_mip(&other));
     }
+}
+
+#[test]
+fn heap_atomics_need_both_caps() {
+    const FLAGS: [Option<bool>; 3] = [None, Some(false), Some(true)];
+    for typed_atomics64 in FLAGS {
+        for heap_atomics64 in FLAGS {
+            let c = Caps { typed_atomics64, heap_atomics64, ..Caps::unknown() };
+            let both = typed_atomics64 == Some(true) && heap_atomics64 == Some(true);
+            assert_eq!(atomics64_heap(&c), both, "{typed_atomics64:?} {heap_atomics64:?}");
+        }
+    }
+    assert!(!atomics64_heap(&reference::intel_arc()) && atomics64_heap(&reference::amd_rdna()));
+}
+
+#[test]
+fn point_mip_aniso_is_used_only_where_the_device_says_so() {
+    for (said, want) in [(None, false), (Some(false), false), (Some(true), true)] {
+        let c = Caps { aniso_point_mip: said, ..Caps::unknown() };
+        assert_eq!(aniso_point_mip(&c), want, "{said:?}");
+    }
+}
+
+#[test]
+fn the_digest_says_what_the_caps_hold() {
+    assert_eq!(
+        reference::amd_rdna().digest(),
+        "wave 32-64, binding tier 3, mesh tier 1, shader model 0x67"
+    );
+    assert_eq!(Caps::unknown().digest(), "wave n/a, binding tier n/a, mesh tier n/a, shader model n/a");
 }
 
 #[test]
