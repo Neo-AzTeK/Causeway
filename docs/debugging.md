@@ -51,7 +51,14 @@ It exits with an error when an
 area failed; what a log does not show is "unknown".
 
 On a real GPU this can reset the display driver, so only one smoke run at a
-time starts on a machine. Scripted keys can tick the title's legal terms on its
+time starts on a machine, and none while another `victory.exe`, the testbed or
+any cargo test binary runs (it may be on the GPU). `cargo xtask alone --
+<command>` holds the same lock around GPU tests. `--quiet` also refuses to start
+beside a compiler or linker: use it when timings matter. Each launched run
+is sampled every 5 s; `run.txt` and the digest header say `machine: quiet`,
+`NOT QUIET: ...` or `unknown` (by process name: other load is not seen).
+`--problem <id>` writes the run into that problem's log
+(`docs/problem-sessions.md`). Scripted keys can tick the title's legal terms on its
 first-start screens, so the runner refuses them unless the data folder is
 already set up (`--data-from <folder>` copies one for the run, `--data-dir
 <folder>` uses it in place). `--keys ""` plays by hand; `--accept-terms` allows

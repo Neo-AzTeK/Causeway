@@ -80,7 +80,7 @@ focus:
 
 ```powershell
 cargo xtask setup                        # once per clone: hooks, local files
-cargo test --workspace                   # needs no game data
+cargo xtask alone -- cargo test --workspace  # no game data; uses the GPU
 ```
 
 - [docs/architecture.md](docs/architecture.md): how it works

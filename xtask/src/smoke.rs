@@ -2,6 +2,7 @@
 //! scripted keys, and reports what the log says (see `report`). Everything
 //! it writes is derived from the title, so it stays outside the repository.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 
+use crate::machine::{self, Others};
+use crate::problem;
 use crate::report::sheet;
 use crate::report::{Baseline, Context as Inputs, End, Log, Status, flat_png, read_baseline};
 
@@ -52,6 +55,13 @@ pub struct Smoke {
     /// run is said to have had, which the digest checks against the log.
     #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env)]
     envs: Vec<(String, String)>,
+    /// A run whose timings count: refused while builds or tests run.
+    #[arg(long, conflicts_with = "log")]
+    quiet: bool,
+    /// The problem this run is for (docs/problem-sessions.md): this session
+    /// must hold it, and the run is written into its log.
+    #[arg(long, conflicts_with = "log")]
+    problem: Option<String>,
     /// An earlier run's report.json: the digest shows each metric against it.
     #[arg(long)]
     baseline: Option<PathBuf>,
@@ -114,6 +124,11 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
         .context("writing report.json")?;
     std::fs::write(args.out.join("digest.md"), digest).context("writing digest.md")?;
     print!("{text}");
+    if let Some(id) = &args.problem {
+        let machine = run_value(&log_path, "machine ").unwrap_or_else(|| "unknown".into());
+        let note = format!("smoke run {} (machine {machine})", args.out.display());
+        problem::record_run(root, id, &note)?;
+    }
     let failed = areas.iter().filter(|a| a.status == Status::Fail).count();
     ensure!(failed == 0, "{failed} areas failed");
     Ok(())
@@ -138,7 +153,7 @@ fn run_info(root: &Path, log: &Path) -> (String, Vec<(String, String)>) {
         .filter_map(|l| l.strip_prefix("env ")?.split_once('='))
         .map(|(n, v)| (n.to_owned(), v.to_owned()))
         .collect();
-    let build = match (get("commit "), get("branch ")) {
+    let mut build = match (get("commit "), get("branch ")) {
         (Some(commit), branch) => format!(
             "build commit: {commit} branch: {}{}",
             branch.as_deref().unwrap_or("?"),
@@ -151,7 +166,16 @@ fn run_info(root: &Path, log: &Path) -> (String, Vec<(String, String)>) {
             )
         }
     };
+    if let Some(machine) = get("machine ") {
+        build += &format!("
+machine: {machine}");
+    }
     (build, requested)
+}
+
+fn run_value(log: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(log.with_file_name("run.txt")).ok()?;
+    text.lines().find_map(|l| l.strip_prefix(key)).map(str::to_owned)
 }
 
 /// The checkout's commit, branch, and whether it has uncommitted changes.
@@ -201,7 +225,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     let set_up = args.data_from.as_ref().or(args.data_dir.as_ref());
     check_terms(&keys, set_up.map(PathBuf::as_path), args.accept_terms)?;
     // Held until the title ends: two runs can reset the display driver.
-    let _only = one_run(&std::env::temp_dir().join("causeway-smoke.lock"))?;
+    let _only = one_run(&lock_path())?;
+    // Before the build, which is long; again after it.
+    may_start(&others(&[])?, args.quiet)?;
     create(&args.out)?;
     // An old run's frames and saves would pass for this one's.
     ensure!(
@@ -209,10 +235,18 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         "{} is not empty",
         args.out.display()
     );
+    if let Some(id) = &args.problem {
+        // Refused unless held; says that a run was tried, not that it ran.
+        let asked = format!("smoke run asked for: {}", args.out.display());
+        problem::record_run(root, id, &asked)?;
+    }
     let victory = match &args.exe_victory {
         Some(path) => path.clone(),
         None => build(root)?,
     };
+    // Here, so that a refusal leaves --out empty, to be used again.
+    let at_start = others(&[])?;
+    may_start(&at_start, args.quiet)?;
     let out = std::path::absolute(&args.out)?;
     let frames = out.join("frames");
     create(&frames)?;
@@ -255,12 +289,119 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file);
-    let end = run_for(command, Duration::from_secs(args.seconds))
-        .with_context(|| format!("running {}", victory.display()))?;
+    let mut load = Load::default();
+    load.sample(at_start);
+    // The first at once: copying the data folder may have taken a while.
+    let mut next = Instant::now();
+    let end = run_for(command, Duration::from_secs(args.seconds), |title| {
+        if Instant::now() >= next {
+            next = Instant::now() + SAMPLE_EVERY;
+            match title.ids().and_then(|ids| others(&ids)) {
+                Ok(found) => load.sample(found),
+                Err(_) => load.failed += 1,
+            }
+        }
+    })
+    .with_context(|| format!("running {}", victory.display()))?;
+    let verdict = load.verdict();
+    println!("machine: {verdict}");
+    let mut info = File::options().append(true).open(out.join("run.txt"))?;
+    std::io::Write::write_all(&mut info, format!("machine {verdict}\n").as_bytes())
+        .context("writing run.txt")?;
     Ok((log, end))
 }
 
-/// The lock one smoke run at a time holds on this machine: free once dropped
+/// What runs beside this run, whose title's processes are `title`.
+fn others(title: &[u32]) -> Result<Others> {
+    Ok(machine::others(std::process::id(), title, &machine::processes()?))
+}
+
+/// A build shorter than this can pass unseen.
+// shortcut: sampled, not watched.
+const SAMPLE_EVERY: Duration = Duration::from_secs(5);
+
+/// What ran beside the title.
+#[derive(Default)]
+struct Load {
+    samples: u32,
+    failed: u32,
+    loaded: u32,
+    names: BTreeSet<String>,
+}
+
+impl Load {
+    fn sample(&mut self, others: Others) {
+        self.samples += 1;
+        self.loaded += u32::from(!others.busy.is_empty());
+        self.names.extend(others.busy);
+    }
+
+    fn verdict(&self) -> String {
+        if self.loaded > 0 {
+            format!(
+                "NOT QUIET: timings do not count ({} of {} samples beside {})",
+                self.loaded,
+                self.samples,
+                listed(&self.names)
+            )
+        } else if self.failed > 0 {
+            format!("unknown: {} samples failed", self.failed)
+        } else {
+            format!("quiet ({} samples saw no other build, test or title)", self.samples)
+        }
+    }
+}
+
+fn listed(names: &BTreeSet<String>) -> String {
+    names.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+}
+
+/// invariant(a_gpu_in_use_or_a_busy_quiet_run_does_not_start): one thing on
+/// the real GPU at a time, and no timing beside a build.
+fn may_start(others: &Others, quiet: bool) -> Result<()> {
+    ensure!(others.gpu.is_empty(), "the GPU may be in use: {} is running", listed(&others.gpu));
+    ensure!(
+        !quiet || others.busy.is_empty(),
+        "--quiet: the machine is busy: {}",
+        listed(&others.busy)
+    );
+    Ok(())
+}
+
+// shortcut: one per user's temp folder; older branches' smoke takes it too.
+fn lock_path() -> PathBuf {
+    std::env::temp_dir().join("causeway-smoke.lock")
+}
+
+/// `cargo xtask alone`: runs a command that uses the GPU (tests) while no
+/// smoke run is on, and none can start.
+pub fn alone(command: &[OsString]) -> Result<()> {
+    run_alone(&lock_path(), &others(&[])?, command)
+}
+
+fn run_alone(lock: &Path, others: &Others, command: &[OsString]) -> Result<()> {
+    // invariant(a_command_run_alone_and_a_smoke_run_exclude_each_other): the
+    // lock a smoke run takes, held until the command ends.
+    let _only = one_run(lock)?;
+    may_start(others, false)?;
+    let (program, args) = command.split_first().context("no command")?;
+    // Ended with this process, so that nothing runs on without the lock.
+    let group = Group::new()?;
+    let mut child = Command::new(program)
+        .args(args)
+        .spawn()
+        .with_context(|| format!("running {}", program.to_string_lossy()))?;
+    if let Err(e) = group.add(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    let status = child.wait()?;
+    ensure!(status.success(), "the command failed: {status}");
+    Ok(())
+}
+
+/// The lock one smoke run (or `alone`) at a time holds on this machine: free once dropped
 /// or once the process is gone.
 // shortcut: a title started by hand (`victory run`) does not take it.
 fn one_run(path: &Path) -> Result<File> {
@@ -272,7 +413,9 @@ fn one_run(path: &Path) -> Result<File> {
     std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0);
     options
         .open(path)
-        .with_context(|| format!("is another smoke run on? {} is not free", path.display()))
+        .with_context(|| {
+            format!("is a smoke run or `xtask alone` on? {} is not free", path.display())
+        })
 }
 
 /// Refuses scripted keys where they could tick the title's legal terms: on a
@@ -360,8 +503,13 @@ fn executable(messages: &str) -> Option<PathBuf> {
 }
 
 /// Runs a process for at most `time`, then ends it and what it started.
-/// Also when it ended, or was ended (Unix time).
-fn run_for(mut command: Command, time: Duration) -> Result<(End, f64)> {
+/// Also when it ended, or was ended (Unix time). `watch` is called with its
+/// job while it runs.
+fn run_for(
+    mut command: Command,
+    time: Duration,
+    mut watch: impl FnMut(&Group),
+) -> Result<(End, f64)> {
     let now = || SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
     let group = Group::new()?;
     let mut child = command.spawn()?;
@@ -372,6 +520,7 @@ fn run_for(mut command: Command, time: Duration) -> Result<(End, f64)> {
     }
     let start = Instant::now();
     while start.elapsed() < time {
+        watch(&group);
         // A title that relaunches itself goes on in a child.
         if let Some(status) = child.try_wait()?
             && !group.running()?
@@ -443,6 +592,32 @@ impl Group {
         Ok(info.ActiveProcesses > 0)
     }
 
+    /// The ids of the processes in the job.
+    // shortcut: of more than 256 processes the call fails, and the sample with it.
+    fn ids(&self) -> Result<Vec<u32>> {
+        use windows_sys::Win32::System::JobObjects::*;
+        /// `JOBOBJECT_BASIC_PROCESS_ID_LIST` with room for more than one id.
+        #[repr(C)]
+        struct Ids {
+            assigned: u32,
+            listed: u32,
+            ids: [usize; 256],
+        }
+        let mut list = Ids { assigned: 0, listed: 0, ids: [0; 256] };
+        // SAFETY: the structure of this class, with its size.
+        let read = unsafe {
+            QueryInformationJobObject(
+                self.0,
+                JobObjectBasicProcessIdList,
+                (&raw mut list).cast(),
+                size_of_val(&list) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        ensure!(read != 0, std::io::Error::last_os_error());
+        Ok(list.ids.iter().take(list.listed as usize).map(|&id| id as u32).collect())
+    }
+
     fn kill(&self, _: &mut Child) -> Result<()> {
         // SAFETY: a live job.
         let ended =
@@ -477,6 +652,10 @@ impl Group {
 
     fn running(&self) -> Result<bool> {
         Ok(false)
+    }
+
+    fn ids(&self) -> Result<Vec<u32>> {
+        Ok(Vec::new())
     }
 
     fn kill(&self, child: &mut Child) -> Result<()> {
@@ -604,6 +783,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn a_command_run_alone_and_a_smoke_run_exclude_each_other() {
+        let path = std::env::temp_dir().join(format!("causeway-alone-test-{}", std::process::id()));
+        let shell = |script: &str| ["cmd", "/d", "/c", script].map(OsString::from);
+        let idle = Others::default();
+        let smoke = one_run(&path).unwrap();
+        assert!(run_alone(&path, &idle, &shell("exit 0")).is_err());
+        drop(smoke);
+        run_alone(&path, &idle, &shell("exit 0")).unwrap();
+        assert!(run_alone(&path, &idle, &shell("exit 3")).is_err());
+
+        // While the command runs, the lock a smoke run takes is not free. The
+        // command says it runs, so that trying the lock cannot take it first.
+        let started = path.with_extension("started");
+        let _ = std::fs::remove_file(&started);
+        let busy = path.clone();
+        let script = format!("echo x>{}& ping -n 4 127.0.0.1 >nul", started.display());
+        let command = ["cmd", "/d", "/c", &script].map(OsString::from);
+        let running = std::thread::spawn(move || run_alone(&busy, &Others::default(), &command));
+        let start = Instant::now();
+        while !started.exists() {
+            assert!(start.elapsed() < Duration::from_secs(30), "the command never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(one_run(&path).is_err());
+        running.join().unwrap().unwrap();
+        std::fs::remove_file(started).unwrap();
+        drop(one_run(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_gpu_in_use_or_a_busy_quiet_run_does_not_start() {
+        let set = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect();
+        let idle = Others::default();
+        may_start(&idle, true).unwrap();
+        let building = Others { gpu: set(&[]), busy: set(&["rustc.exe"]) };
+        may_start(&building, false).unwrap();
+        assert!(may_start(&building, true).is_err());
+        let title = Others { gpu: set(&["victory.exe"]), busy: set(&["victory.exe"]) };
+        assert!(may_start(&title, false).is_err());
+
+        let mut load = Load::default();
+        load.sample(idle);
+        assert!(load.verdict().starts_with("quiet (1 samples"));
+        load.sample(building);
+        assert!(load.verdict().starts_with("NOT QUIET"));
+        assert!(load.verdict().contains("1 of 2 samples beside rustc.exe"));
+    }
+
+    #[test]
     fn scripted_keys_need_a_set_up_data_folder_or_the_terms_accepted() {
         let dir = std::env::temp_dir().join(format!("causeway-terms-test-{}", std::process::id()));
         let keys = menu_keys(60);
@@ -627,6 +857,8 @@ mod tests {
             data_dir: None,
             data_from: None,
             accept_terms: false,
+            quiet: false,
+            problem: None,
             keys: None,
             exe_victory: None,
             log: Some(root.join("README.md")),
@@ -646,7 +878,7 @@ mod tests {
             c.args(["/d", "/c", script]).stdout(Stdio::null());
             c
         };
-        let exited = run_for(shell("exit 3"), Duration::from_secs(60)).unwrap();
+        let exited = run_for(shell("exit 3"), Duration::from_secs(60), |_| {}).unwrap();
         assert_eq!(exited.0, End::Exited(Some(3)));
 
         // The grandchild holds the pipe: reading ends only when it is gone.
@@ -654,7 +886,11 @@ mod tests {
         let mut command = shell("ping -n 60 127.0.0.1");
         command.stdout(write);
         let start = Instant::now();
-        assert_eq!(run_for(command, Duration::from_secs(1)).unwrap().0, End::TimedOut);
+        // The job lists the shell and what it started.
+        let mut seen = 0;
+        let watch = |job: &Group| seen = seen.max(job.ids().unwrap().len());
+        assert_eq!(run_for(command, Duration::from_secs(1), watch).unwrap().0, End::TimedOut);
+        assert!(seen >= 2, "{seen}");
         std::io::Read::read_to_end(&mut read, &mut Vec::new()).unwrap();
         assert!(start.elapsed() < Duration::from_secs(30));
     }

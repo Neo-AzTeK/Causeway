@@ -20,6 +20,7 @@ and ask the owner for the title's folder if none is set.
 | cost, delegation, reading, output | `docs/agent-workflow.md` |
 | cross-crate flow, import resolution | `docs/architecture.md` |
 | debug variables, smoke runs | `docs/debugging.md` |
+| problem sessions, problem list | `docs/problem-sessions.md`, `docs/problems.md`; skill `problem-session` |
 | capabilities, planners, fakes | `docs/hardware-range.md`, `docs/gpu-review-checklist.md` |
 | adapters verified / not verified | `docs/adapters.md` |
 | asset policy | `docs/asset-policy.md` |
@@ -30,9 +31,16 @@ and ask the owner for the title's folder if none is set.
 
 - Real-GPU runs through `cargo xtask smoke` are pre-approved by the owner;
   `--accept-terms` still needs the owner's OK for that launch.
+- Before a build or test, check no title is running (`Get-Process victory`):
+  it spoils that run's timings, and several crates' tests use the GPU.
+- Descriptor and view-heap work belongs to another AI.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
-- The main session coordinates and does not debug: a hunt goes to its own
-  session with a `task-brief` (one error, one session). No agents by default.
+- The main session coordinates and does not debug: a problem goes to its own
+  problem session, which owns it until fixed (`/problem-session <id>`). No
+  agents by default.
+- A problem session, after compaction or a pause: `cargo xtask problem resume
+  <id>` and read its notes before acting.
+- Merge only on the owner's explicit yes; push only with their OK.
 - Grep, then read at most 150 lines; never a source file over 800 lines whole
   (`lower.rs`); at most 60 lines of output per command; do not re-read a file
   after editing it. Details: `docs/agent-workflow.md`.

@@ -23,12 +23,15 @@ driver change).
 
 ## Flow (KISS, owner's decision 2026-11-24)
 
-- No stacks, no PRs. A task is a short branch (or worktree) off `main`, one task
-  per branch, small diff, no drive-by refactors or formatting (`cargo fmt
+- No stacks, no PRs. A task is a short branch (or worktree) off `main` (a
+  problem session's lives as long as its problem), one task per branch, small
+  diff, no drive-by refactors or formatting (`cargo fmt
   --check` already fails on `main`).
-- When its checks pass, merge it into `main` and push `main`, after each merge
-  or milestone. Never force-push or rewrite `main`. Push other branches or open
+- When its checks pass, ask the owner. Merge into `main` only on their explicit
+  yes, and push only with their OK. Never force-push or rewrite `main`. Open
   PRs only when the owner asks.
+- A game problem is owned by one problem session until fixed, with a stricter
+  bar for "done": `docs/problem-sessions.md`.
 - Mark a deliberate simplification `// shortcut:` with its limit.
 - A new dependency needs a measured gain or a correctness reason, and a
   GPL-3.0-compatible licence.
@@ -64,8 +67,12 @@ Before merging, the full chain. There is no CI: nobody else runs it.
 
     cargo clippy -q --workspace --all-targets --locked -- -D warnings
     cargo clippy -q --workspace --all-targets --all-features --locked -- -D warnings
-    cargo test -q --workspace --locked
+    cargo xtask alone -- cargo test -q --workspace --locked
     cargo xtask policy
+
+Several crates' tests use the real GPU: `cargo xtask alone -- <command>` runs
+one while no smoke run is on or can start. Use it for any `cargo test` of
+`victory-gpu`, `victory-shader` or `victory-hle` too.
 
 A bug fix has a test that fails without it. A performance claim has before and
 after numbers. Tests never need game files. Report what was not verified and

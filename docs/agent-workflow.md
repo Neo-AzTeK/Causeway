@@ -5,22 +5,28 @@ early and stays long costs most. Agents were the largest cost measured (64% of
 one evening, one agent 32%).
 
 ## Sessions
-- One milestone per session. Let the context compact instead of handing off: no
+- One goal per session. Let the context compact instead of handing off: no
   handoff files; durable facts go to the tracked docs (adapters, design, debug
   switches), the rest stays in the conversation and the commit messages.
-- Goals need an end, and a stop where the owner must decide. Waiting on the
-  owner, answer a hook in one line; do not redo or restate work.
-- Before a long step, commit what is verified and say what is unverified. Do
-  not push a long investigation to its end.
+- A game problem gets a problem session, which stays until it is fixed or the
+  owner must decide, however long that takes, and keeps running notes outside
+  the repository (`docs/problem-sessions.md`; the notes are a lab book, not a
+  handoff). The reading and output limits below keep it affordable.
+- Any other goal needs an end, and a stop where the owner must decide. Waiting
+  on the owner, answer a hook in one line; do not redo or restate work.
+- Before a long step, commit what is verified and say what is unverified.
 
 ## Delegating (owner, 2026-11-25)
 - The main session coordinates; it does not debug. A hunt that needs more than
   a few runs or reads (a hang, a refusal origin, a speed problem) goes to a
-  session with one clear question and an end, via `start_session`.
-- One error, one session: do a run, group the errors by type (count, do not
-  print), start a fresh session per distinct error with a `task-brief` (error
-  text, evidence, a "done when" test). The main session runs, triages, merges
-  and pushes. Never two real-GPU launches at once.
+  problem session, via `start_session` with the prompt `/problem-session <id>`.
+- One overall problem, one session: do a run, group the errors by cause (count,
+  do not print), match them to `docs/problems.md`, and give an unlisted one a
+  row (the owner ranks it). Sub-causes stay with their problem; do not split
+  them into short sessions. The main session runs, triages, and merges and
+  pushes when the owner says so. Never two real-GPU launches at once.
+- A question that is not a problem to fix (a lookup, a measurement) goes with a
+  `task-brief`.
 - Agents: none by default. Only for a large read with a short answer
   (`scout`) or the independent review of a finished diff (`reviewer`); never
   to run in parallel what one session can do in order. One small job each with

@@ -2,6 +2,9 @@
 name: task-brief
 description: Template for briefing a subagent or new session in this repo so it has complete context in few tokens. Use before delegating or handing off work.
 ---
+A game problem to be fixed is not briefed with this: start it with
+`/problem-session <id>`, whose notes carry the context.
+
 A fresh agent starts without this conversation. Fill every line, in under 250
 words; write "none" rather than drop a line. Point to code as `path` and
 symbol instead of pasting it. Do not repeat `CLAUDE.md`; name it to read.
