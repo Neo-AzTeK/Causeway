@@ -29,7 +29,11 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+title's data folder. After the title's own crash filter returns, its latest debug
+output is added (where it saved its report, if it did). A title that stops
+itself on a breakpoint (`int3`) is often at a failed check: diagnostics builds
+also log the first eight quadwords each register points at (title memory: do
+not copy it into the repository).
 
 ## Smoke runs
 

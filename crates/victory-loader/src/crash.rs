@@ -8,9 +8,10 @@
 //! exception too), is reported from the unhandled-exception filter
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
-//! often states the reason. Diagnostics builds can also append first-chance
-//! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
-//! crash log too.
+//! often states the reason, and again once the title's own filter returns.
+//! Diagnostics builds add, for an unhandled breakpoint, the memory the
+//! registers point at, and can also append first-chance breakpoints with
+//! `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the crash log too.
 
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
