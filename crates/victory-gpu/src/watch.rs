@@ -397,11 +397,39 @@ impl Tracked {
     }
 }
 
+/// The end of the allocation holding `at`, and whether it is private
+/// memory (not a view), without `VirtualQuery`, which walks every page to
+/// the end of a region: 10 us per MiB of a committed view, 60 ms for a
+/// page of the runtime's 5.5 GiB pool view. `None` if not answered.
+fn allocation(at: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: an out value of the right size for its class.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            at as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    // SAFETY: plain flags.
+    let private = unsafe { info.Anonymous.Flags } & 1 != 0;
+    let end = (info.AllocationBase as usize).saturating_add(info.RegionSize);
+    (ok && end > at).then_some((end, private))
+}
+
 /// Of pages `[first, last)`, the runs `[a, b)` holding plain committed
 /// memory now (private and not write-watched: the C heap), which no guard
 /// may cover. A page partly plain counts whole. Asked when guarding, not
 /// when tracking: the heap commits pages of its reservations later, also
-/// inside a loose copy's window. Title pools answer in one call.
+/// inside a loose copy's window. Title pools answer in one call, views in
+/// one per view.
 fn plain_pages(first: usize, last: usize) -> Vec<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
@@ -418,6 +446,13 @@ fn plain_pages(first: usize, last: usize) -> Vec<(usize, usize)> {
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut at = start;
     while at < end {
+        // Views are never plain.
+        if let Some((allocation_end, false)) = allocation(at) {
+            at = allocation_end.min(end);
+            continue;
+        }
+        #[cfg(test)]
+        tests::REGION_WALKS.with(|n| n.set(n.get() + 1));
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
@@ -708,6 +743,50 @@ pub(crate) mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    thread_local! {
+        /// `plain_pages`' region queries on this thread.
+        pub(super) static REGION_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A page of a big committed view (the runtime's pool view of its
+    /// physical pages) is not plain, found without a region query, which
+    /// walks the view to its end (60 ms a page in the title's menus).
+    #[test]
+    fn plain_pages_skip_views_without_walking_them() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            SEC_RESERVE, UnmapViewOfFile,
+        };
+        const SIZE: usize = 256 << 20;
+        // SAFETY: a pagefile-backed section, one view of it, its pages
+        // committed (charged, never touched); all released below.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            assert_ne!(view, 0);
+            assert!(!VirtualAlloc(view as *const _, SIZE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            (section, view)
+        };
+        let page = view.div_ceil(PAGE) + 1;
+        REGION_WALKS.with(|n| n.set(0));
+        assert_eq!(plain_pages(page, page + 2), [], "a view is never plain");
+        assert_eq!(REGION_WALKS.with(|n| n.get()), 0, "nor walked");
+        // SAFETY: the view and section made above.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            CloseHandle(section);
+        }
+    }
 
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).

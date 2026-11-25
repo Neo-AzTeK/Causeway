@@ -27,8 +27,8 @@ error kinds, branches and commits only.
   pixels non-flat in the saved frame: no 3D scene yet.
 
 ## Next, ranked by effect on the picture
-00. Texture refresh at ~3 MB/s: menus at 0.4 fps after ~40 s (smoke 12), so
-   runs on the GTX 1070 do not reach the world unattended. Blocks every run.
+00. Texture refresh at ~3 MB/s: fixed on branch claude/frosty-satoshi-7332c1
+   (not merged yet, see log): menus hold 30 fps.
 0. (frame-wait hunt, see log) Real cost is GPU time before the removal
    (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
 1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
@@ -62,6 +62,16 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: smoke 12's slow menus: `watch::plain_pages` (dc31df2) called
+  `VirtualQuery` on every alias page it guards. The aliases sit in the
+  runtime's ~5.5 GiB committed pool view, and `VirtualQuery` walks every page
+  to the end of a committed region (~10 us/MiB): 62 ms CPU per call, ~300
+  calls/frame, all under the guard lock. Fix: `QueryVirtualMemoryInformation`
+  (1-2 us) first; views are skipped whole. GTX 1070, 250 s: textures <= 5.1
+  ms/frame (was 2300-5400), protecting 2.2 ms for 396 calls, menus 30 fps
+  throughout; world not reached (select screen not pressed). Branch
+  claude/frosty-satoshi-7332c1. Other `VirtualQuery` callers on that view
+  (`texture::committed`, `copystat`, `watch::writable`) cost the same if hot.
 - 2026-11-25: smoke 12 (main be98212, GTX 1070, 300 s): menus 30-36 fps for
   ~40 s, then 0.3-0.4 fps to the end: 2.3-2.9 s/frame in texture preparation
   (`Staging::refresh`, 7.6-9.5 MB/frame read, ~3 MB/s; 5-7 draws, GPU 4 ms).
