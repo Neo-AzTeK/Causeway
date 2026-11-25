@@ -2568,6 +2568,12 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            let (refused, flat_pipelines, flat_draws) = crate::pipeline::fallback_counts();
+            if refused > 0 {
+                tracing::info!(
+                    "refused pixel programs {refused}: {flat_pipelines} pipelines made and {flat_draws} draws run \n                     with a flat substitute (VICTORY_REFUSED_FALLBACK), still counted as refusals"
+                );
+            }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (resident, resident_ms) = crate::resource::resident_counts();
             tracing::info!(

@@ -210,6 +210,8 @@ mod image_tests;
 mod lane_tests;
 mod lockstep;
 mod lower;
+mod flat;
+pub use flat::{FLAT_COLOUR, flat_pixel_shader};
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]

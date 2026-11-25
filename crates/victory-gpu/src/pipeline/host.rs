@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
-use super::{Shader, Translated};
+use super::{Shader, Translated, fallback};
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -296,6 +296,9 @@ pub(crate) struct HostPipeline {
     /// written-pages bitmap, if a stage marks its writes through views
     /// (`victory_shader::emit`, "Write marks").
     pub(crate) marks: Option<(u32, u32)>,
+    /// A refused pixel program replaced by the flat substitute (see
+    /// [`fallback`]).
+    pub(crate) fallback: bool,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -313,6 +316,21 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        let made = Self::build(shaders, g, false);
+        if made.is_some() || !fallback::enabled() {
+            return made;
+        }
+        let g = g?;
+        let ps = shaders.iter().find(|s| s.stage == "pixel")?;
+        let mut flat = Self::build(shaders, Some(g), true)?;
+        flat.fallback = true;
+        fallback::made(ps);
+        Some(flat)
+    }
+
+    /// `new`, with the pixel stage replaced by the flat substitute if
+    /// `flat`.
+    fn build(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, flat: bool) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -338,7 +356,9 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            if !flat {
+                stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            }
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -517,7 +537,15 @@ impl HostPipeline {
                 return None;
             }
         };
+        // The substitute pixel shader, when the title's is left out.
+        let flat_ps = if flat { g.map(fallback::pixel_shader).unwrap_or_default() } else { Vec::new() };
         let code = |i: usize| {
+            if i == 1 && !flat_ps.is_empty() {
+                return D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: flat_ps.as_ptr().cast(),
+                    BytecodeLength: flat_ps.len(),
+                };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -569,6 +597,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                fallback: false,
             });
         }
         let Some(g) = g else {
@@ -603,6 +632,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                fallback: false,
             });
         }
 
@@ -686,6 +716,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             rectangles: !gs.is_empty(),
             slots: g.slots(),
+            fallback: false,
             inputs: g.elements(),
             marks,
         })
@@ -960,5 +991,54 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// A pixel program the host cannot run (it does not translate): without
+    /// the switch the pipeline is refused; with it, the vertex stage keeps
+    /// its pipeline, a flat substitute takes the pixel stage, and the
+    /// refusal is still counted. Software adapter, so it needs the
+    /// `diagnostics` feature: `cargo test -p victory-gpu --features
+    /// diagnostics refused_pixel`.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn a_refused_pixel_program_is_drawn_with_a_substitute() {
+        // SAFETY: set before any thread of this test binary reads it; the
+        // host device is made on first use below.
+        unsafe { std::env::set_var("VICTORY_D3D12_WARP", "1") };
+        if host().is_none() {
+            return;
+        }
+        let vs = Arc::new(Shader::new("vertex", b"a vertex shader"));
+        let host_vs = victory_shader::emit::host::stub_vs(&victory_shader::emit::host::stub_ps()).unwrap();
+        vs.translated
+            .set(Some(Translated {
+                host: host_vs,
+                used: Vec::new(),
+            }))
+            .ok()
+            .unwrap();
+        let ps = Arc::new(Shader::new("pixel", b"not a console shader"));
+        assert!(ps.translated().is_none());
+        let mut g = GraphicsState::default();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        let shaders = [vs, ps];
+
+        fallback::force(false);
+        assert!(HostPipeline::new(&shaders, Some(&g)).is_none(), "refused without the switch");
+        assert_eq!(fallback::counts(), (0, 0, 0));
+
+        fallback::force(true);
+        let p = HostPipeline::new(&shaders, Some(&g)).expect("a substitute pipeline");
+        fallback::force(false);
+        assert!(p.fallback && !p.compute && p.stages.len() == 1);
+        assert_eq!(fallback::counts(), (1, 1, 0), "still counted as a refusal");
+        fallback::drew();
+        assert_eq!(fallback::counts().2, 1);
+        // The title's own state is kept.
+        assert_eq!(p.stages[0].shader.stage, "vertex");
     }
 }
