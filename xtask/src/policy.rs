@@ -10,6 +10,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+use crate::{capability, comments};
+
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
@@ -74,18 +76,50 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
             violations.push(format!("{path}: {problem}"));
         }
     }
-    if violations.is_empty() {
-        println!("asset policy: {} files ok", files.len());
-        return Ok(());
+    if !violations.is_empty() {
+        for v in &violations {
+            eprintln!("POLICY: {v}");
+        }
+        bail!(
+            "{} asset-policy violation(s). Nothing from the game may be committed; \
+             see docs/asset-policy.md",
+            violations.len()
+        )
     }
-    for v in &violations {
-        eprintln!("POLICY: {v}");
+    println!("asset policy: {} files ok", files.len());
+    // The whole tree even when `staged`: a marker and its test may be in
+    // different files.
+    let sources = rust_sources(root)?;
+    let problems = comments::check(&sources, comments::DECISION_REFS);
+    if !problems.is_empty() {
+        for p in &problems {
+            eprintln!("POLICY: {p}");
+        }
+        bail!("{} comment-rule violation(s); see CONTRIBUTING.md, \"Comments\"", problems.len())
     }
-    bail!(
-        "{} asset-policy violation(s). Nothing from the game may be committed; \
-         see docs/asset-policy.md",
-        violations.len()
-    )
+    println!("comment rules ok");
+    let problems = capability::check(&sources, capability::OTHER_OWNER);
+    if !problems.is_empty() {
+        for p in &problems {
+            eprintln!("POLICY: {p}");
+        }
+        bail!("{} hardware-range violation(s); see docs/hardware-range.md", problems.len())
+    }
+    println!("capability queries ok");
+    Ok(())
+}
+
+/// The working tree's Rust files as (path, text).
+fn rust_sources(root: &Path) -> Result<Vec<(String, String)>> {
+    Ok(list_files(root, false)?
+        .into_iter()
+        .filter(|path| path.ends_with(".rs"))
+        // A file deleted but still in the index has nothing to check.
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(root.join(&path)).ok()?;
+            Some((path, text))
+        })
+        .collect())
 }
 
 fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {

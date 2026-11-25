@@ -152,6 +152,7 @@ fn check_sm66(device: &ID3D12Device) -> Result<(), String> {
     let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
         HighestShaderModel: D3D_SHADER_MODEL_6_6,
     };
+    // test-host-query: this crate has no `Caps`; only `Host::new` asks.
     // SAFETY: valid D3D12 device and output struct matching `D3D12_FEATURE_SHADER_MODEL`.
     unsafe {
         device
@@ -176,6 +177,7 @@ impl Host {
     #[cfg(any(test, feature = "testbed"))]
     pub fn has_waves_of(&self, lanes: u32) -> bool {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // test-host-query: only tests and the testbed ask.
         // SAFETY: the structure the feature names, and its size.
         let asked = unsafe {
             self.device.CheckFeatureSupport(
@@ -412,6 +414,7 @@ impl Host {
             });
         }
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // test-host-query: the title's root signatures read `Caps` instead.
         // SAFETY: the feature query writes the structure of the given size.
         // Older runtimes may not recognize OPTIONS19; that means no support.
         let aniso_point_mip_supported = unsafe {

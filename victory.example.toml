@@ -1,4 +1,6 @@
-# Copy to `victory.toml` (git-ignored) and point it at YOUR files.
+# This machine's paths. `cargo xtask setup --game-dir <folder>` writes
+# `victory.toml` (git-ignored) if there is none; or copy this file to it.
+# Point it at YOUR files.
 # Every path must be OUTSIDE the repository; the tools refuse otherwise.
 # Environment variables (shown below) take precedence over this file.
 # VICTORY_CONFIG selects a different config file.

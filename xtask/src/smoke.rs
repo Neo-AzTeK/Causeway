@@ -27,9 +27,17 @@ pub struct Smoke {
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86400))]
     seconds: u64,
     /// The title's saves and settings; a folder in --out by default, so
-    /// every run goes through the first-start menus.
+    /// every run goes through the first-start menus (see --accept-terms).
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// A data folder already set up, copied into --out/data for this run; the
+    /// source is not changed.
+    #[arg(long, conflicts_with_all = ["data_dir", "log"])]
+    data_from: Option<PathBuf>,
+    /// Lets scripted keys run on a data folder not set up yet, where they can
+    /// tick the title's legal terms. Needs the owner's OK for that launch.
+    #[arg(long, conflicts_with = "log")]
+    accept_terms: bool,
     /// `VICTORY_KEYS` instead of the menu-skipping keys.
     #[arg(long)]
     keys: Option<String>,
@@ -184,6 +192,16 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     victory_core::ensure_outside_repo(&data)?;
     let keys = args.keys.clone().unwrap_or_else(|| menu_keys(args.seconds));
     check_keys(&keys)?;
+    if let Some(from) = &args.data_from {
+        victory_core::ensure_outside_repo(from)?;
+        ensure!(from.is_dir(), "{} is not a folder", from.display());
+    }
+    // invariant(scripted_keys_need_a_set_up_data_folder_or_the_terms_accepted): a
+    // script never accepts the title's terms unasked.
+    let set_up = args.data_from.as_ref().or(args.data_dir.as_ref());
+    check_terms(&keys, set_up.map(PathBuf::as_path), args.accept_terms)?;
+    // Held until the title ends: two runs can reset the display driver.
+    let _only = one_run(&std::env::temp_dir().join("causeway-smoke.lock"))?;
     create(&args.out)?;
     // An old run's frames and saves would pass for this one's.
     ensure!(
@@ -199,6 +217,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     let frames = out.join("frames");
     create(&frames)?;
     create(&data)?;
+    if let Some(from) = &args.data_from {
+        copy_dir(from, &data)?;
+    }
 
     let log = out.join("log.txt");
     let file = File::create(&log).context("creating log.txt")?;
@@ -237,6 +258,53 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     let end = run_for(command, Duration::from_secs(args.seconds))
         .with_context(|| format!("running {}", victory.display()))?;
     Ok((log, end))
+}
+
+/// The lock one smoke run at a time holds on this machine: free once dropped
+/// or once the process is gone.
+// shortcut: a title started by hand (`victory run`) does not take it.
+fn one_run(path: &Path) -> Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    // invariant(one_smoke_run_at_a_time): no sharing, so a second open fails
+    // while the first handle lives.
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0);
+    options
+        .open(path)
+        .with_context(|| format!("is another smoke run on? {} is not free", path.display()))
+}
+
+/// Refuses scripted keys where they could tick the title's legal terms: on a
+/// data folder that is missing or empty.
+// shortcut: a folder with any file counts as set up, so one left at the terms
+// screen passes.
+fn check_terms(keys: &str, data: Option<&Path>, accepted: bool) -> Result<()> {
+    let set_up = data
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .is_some_and(|mut entries| entries.next().is_some());
+    ensure!(
+        accepted || set_up || keys.trim().is_empty(),
+        "scripted keys on a data folder not set up can tick the title's legal terms: \
+         pass --data-from or --data-dir with one set up, --keys \"\" to play by hand, \
+         or --accept-terms with the owner's OK for this launch"
+    );
+    Ok(())
+}
+
+/// Copies the files and folders under `from` into `to`.
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    for entry in walkdir::WalkDir::new(from) {
+        let entry = entry.context("reading --data-from")?;
+        let target = to.join(entry.path().strip_prefix(from)?);
+        if entry.file_type().is_dir() {
+            create(&target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Takes out of what a run inherits what would change it or its log.
@@ -525,6 +593,31 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn one_smoke_run_at_a_time() {
+        let path = std::env::temp_dir().join(format!("causeway-lock-test-{}", std::process::id()));
+        let first = one_run(&path).unwrap();
+        assert!(one_run(&path).is_err());
+        drop(first);
+        drop(one_run(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scripted_keys_need_a_set_up_data_folder_or_the_terms_accepted() {
+        let dir = std::env::temp_dir().join(format!("causeway-terms-test-{}", std::process::id()));
+        let keys = menu_keys(60);
+        assert!(check_terms(&keys, None, false).is_err());
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(check_terms(&keys, Some(&dir), false).is_err());
+        check_terms("", Some(&dir), false).unwrap();
+        check_terms(&keys, Some(&dir), true).unwrap();
+        std::fs::write(dir.join("settings"), "x").unwrap();
+        check_terms(&keys, Some(&dir), false).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn an_out_inside_the_repository_is_refused() {
         let root = crate::workspace_root();
         let args = Smoke {
@@ -532,6 +625,8 @@ mod tests {
             out: root.join("smoke-out"),
             seconds: 1,
             data_dir: None,
+            data_from: None,
+            accept_terms: false,
             keys: None,
             exe_victory: None,
             log: Some(root.join("README.md")),

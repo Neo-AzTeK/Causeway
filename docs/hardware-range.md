@@ -1,7 +1,7 @@
 # Hardware range: how a fix holds on other GPUs
 
 Rule (CLAUDE.md): a fix must hold on other GPUs, vendors and drivers, not only
-the owner's RTX 2060 SUPER (NVIDIA, wave32 only). This page is how. The code
+the primary dev GPU (NVIDIA, wave32 only; `docs/adapters.md`). This page is how. The code
 is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
 
 ## The mechanism in four lines
@@ -10,7 +10,8 @@ is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
    Every query may fail; a failed field is `None` and means "not supported".
 2. A planner is a pure function `&Caps -> decision` (`wave_plan`,
    `binding_plan`, `memory_plan`, `min_lod_clamp`, `mesh_shaders`,
-   `atomics64_heap`, `format_choice`). It never sees vendor or driver.
+   `atomics64_heap`, `aniso_point_mip`, `format_choice`). It never sees vendor
+   or driver.
 3. A planner that cannot serve the device returns a `Refusal`, which prints as
    `the host GPU lacks <feature>: needs <x>, has <y>`.
 4. Tests run every planner over the fake caps in `caps::reference` and over
@@ -26,7 +27,7 @@ is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
 | least-level clamp | `tiled_tier` | OPTIONS `TiledResourcesTier` | `min_lod_clamp` |
 | mesh shaders | `mesh_tier` | OPTIONS7 | `mesh_shaders` |
 | 64-bit image atomics | `typed_atomics64`, `heap_atomics64` | OPTIONS9, OPTIONS11 | `atomics64_heap` |
-| aniso with point mips | `aniso_point_mip` | OPTIONS19 | read the field |
+| aniso with point mips | `aniso_point_mip` | OPTIONS19 | `aniso_point_mip` |
 | memory | `memory`, `uma` | `GetDesc1`, `QueryVideoMemoryInfo`, ARCHITECTURE1 | `memory_plan` |
 | format use | `formats` (probed list) | `FORMAT_SUPPORT` | `format_choice` |
 
@@ -111,20 +112,26 @@ Answer each in the commit message or the review:
 - Does anything branch on vendor or driver outside `WORKAROUNDS`?
 - Is a result cached across device creation?
 
-## Wave 2: call sites to move onto `Caps` (after the open branches merge)
+## Who may ask the device
 
-| Call site | Field | Planner |
-|-----------|-------|---------|
-| `host.rs` device creation (`create_hardware_device`, WARP) | keep `Arc<Caps>` in `Host`, replaced on loss | `Caps::probe` |
-| `host.rs` `Host::mesh_shaders` (static) | `mesh_tier`, `shader_model` | `mesh_shaders` |
-| `host.rs` `Host::heap_atomics64` (static) | `typed_atomics64`, `heap_atomics64` | `atomics64_heap` |
-| `pipeline/host.rs` `wave_lanes`, `wave_mismatch` | `wave`, `shader_model` | `wave_plan` (adds pinning; unknown now refuses) |
-| `pipeline/host.rs` OPTIONS19 query | `aniso_point_mip` | field |
-| `victory-shader` `emit/host.rs` SM 6.6 check, wave-size check, OPTIONS19 | same | pass plan values in `emit::Options` |
-| tiled-resources query (`claude/shader-lowering-715e2e`, 97aa4c2) | `tiled_tier` | `min_lod_clamp` |
-| `vram.rs` `resolve` (`claude/vram-budget-b32508`, 7b99681) | `memory`, `uma` | `memory_plan` (a UMA part's dedicated figure is no longer used) |
-| `descriptor/host.rs` and `resource.rs` `FORMAT_SUPPORT` | `formats` | `format_supports`, `format_choice` (probe the formats they ask) |
-| descriptor heap sizing (other owner) | `binding_tier` | `binding_plan` |
+Only `caps/`. `cargo xtask policy` (`xtask/src/capability.rs`) rejects a
+`CheckFeatureSupport` or `CheckInterfaceSupport` in any other Rust file (the
+checker's own, under `xtask/`, aside):
+
+| Kind of question | Where it goes |
+|------------------|---------------|
+| what the device can do | a `Caps` field and a planner |
+| about one resource (a format the title picks while it runs) | a function in `caps/per_resource.rs` |
+| the test host (`victory-shader/src/emit/`, below the crate that has `Caps`) | `// test-host-query: why`, one per call |
+
+Part of the test host also runs in the title (`fuses_fmad`, which asks
+OPTIONS19 and uses no sampler).
+
+Still open, all in descriptor and heap code (other owner): one `FORMAT_SUPPORT`
+query in `descriptor/host.rs` (`typed_store`, which also caches its answers
+across devices), counted in `OTHER_OWNER` so that no other is added; heap sizing
+by `binding_plan`. `format_choice` and `Caps::formats` have no caller. The
+`Host` keeps one `Caps` and nothing replaces it after a device loss.
 
 ## Prior art (ideas only; no code taken)
 

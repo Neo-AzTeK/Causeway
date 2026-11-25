@@ -1,3 +1,3 @@
 #!/bin/sh
-# Enforces the asset policy on every commit. Install with: cargo xtask install-hooks
+# Enforces the asset policy on every commit. Install with: cargo xtask setup
 exec cargo xtask policy --staged

@@ -6,7 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 //!
 //! Emulated mesh pipelines (added 2026-11-25): where the host has no mesh
-//! shaders (`Host::mesh_shaders`, from the caps), a title mesh pipeline is
+//! shaders (`caps::mesh_shaders`), a title mesh pipeline is
 //! two host pipelines ([`EmulatedMesh`]): the mesh program made as compute,
 //! which writes its vertices and triangles to scratch buffers, and a
 //! graphics pipeline of the vertex shader made for it with the title's
@@ -24,7 +24,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
 use super::{Shader, Translated, fallback};
-use crate::caps::{Caps, Refusal, WaveNeed, WavePlan, wave_plan};
+use crate::caps::{
+    Caps, Refusal, WaveNeed, WavePlan, aniso_point_mip, atomics64_heap, mesh_shaders, wave_plan,
+};
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -427,7 +429,7 @@ impl HostPipeline {
         }
         let mesh = find("mesh");
         // Keep native mesh shaders where the caps say the host has them.
-        if mesh.is_some() && pass == Pass::Title && !host()?.mesh_shaders() {
+        if mesh.is_some() && pass == Pass::Title && !mesh_shaders(&host()?.caps) {
             return Self::emulated(shaders, g, flat);
         }
         let mesh_draw = matches!(pass, Pass::MeshDraw(_));
@@ -469,25 +471,14 @@ impl HostPipeline {
                 })
                 .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
         });
-        if atomics64 && !host.heap_atomics64() {
+        if atomics64 && !atomics64_heap(&host.caps) {
             return refuse(
                 "the host GPU has no 64-bit atomics on typed heap resources",
                 shaders,
             );
         }
 
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: the feature query writes the structure of the given size.
-        // Older runtimes may not recognize OPTIONS19; that means no support.
-        let aniso_point_mip_supported = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.AnisoFilterWithPointMipSupported.as_bool();
+        let aniso_point_mip_supported = aniso_point_mip(&host.caps);
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();

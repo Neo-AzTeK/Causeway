@@ -237,18 +237,19 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        let info = adapter.as_ref().and_then(|a| a.GetDesc1().ok());
-        crate::vram::init(adapter.clone(), &crate::caps::Caps::probe(&device, &[]));
-        if let Some(desc) = info {
+        let caps = crate::caps::Caps::probe(&device, &[]);
+        crate::vram::init(adapter.clone(), &caps);
+        // An adapter that did not describe itself has no name.
+        if !caps.adapter.name.is_empty() {
             tracing::info!(
-                adapter = %adapter_name(&desc),
-                vendor = format_args!("{:#06x}", desc.VendorId),
-                device = format_args!("{:#06x}", desc.DeviceId),
-                vram_mb = desc.DedicatedVideoMemory >> 20,
+                adapter = %caps.adapter.name,
+                vendor = format_args!("{:#06x}", caps.adapter.vendor_id),
+                device = format_args!("{:#06x}", caps.adapter.device_id),
+                vram_mb = caps.memory.dedicated >> 20,
                 "host D3D12 adapter"
             );
         }
-        log_caps(&device);
+        log_caps(&caps);
         tracing::info!("{}", switches_line(std::env::vars()));
         tracing::info!("host D3D12 device ready");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
@@ -265,7 +266,6 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
-        let caps = crate::caps::Caps::probe(&device, &[]);
         Ok(Host {
             device,
             caps,
@@ -310,41 +310,14 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
-/// For the run digest: what this device can do, `n/a` where it cannot say.
-fn log_caps(device: &ID3D12Device) {
-    fn query<T: Default>(device: &ID3D12Device, feature: D3D12_FEATURE) -> Option<T> {
-        let mut data = T::default();
-        // SAFETY: the query writes its own structure of the given size.
-        unsafe {
-            device.CheckFeatureSupport(feature, (&raw mut data).cast(), size_of::<T>() as u32).ok()?
-        };
-        Some(data)
-    }
-    let tier = |t: Option<i32>| t.map_or("n/a".to_owned(), |t| t.to_string());
-    let waves = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>(device, D3D12_FEATURE_D3D12_OPTIONS1)
-        .map_or("n/a".to_owned(), |o| format!("{}-{}", o.WaveLaneCountMin, o.WaveLaneCountMax));
-    let binding = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS>(device, D3D12_FEATURE_D3D12_OPTIONS)
-        .map(|o| o.ResourceBindingTier.0);
-    let mesh = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS7>(device, D3D12_FEATURE_D3D12_OPTIONS7)
-        .map(|o| o.MeshShaderTier.0);
-    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
-    // SAFETY: the query writes its own structure of the given size.
-    let model = unsafe {
-        device
-            .CheckFeatureSupport(
-                D3D12_FEATURE_SHADER_MODEL,
-                (&raw mut model).cast(),
-                size_of_val(&model) as u32,
-            )
-            .ok()
-            .map(|()| format!("{:#x}", model.HighestShaderModel.0))
-    };
-    tracing::info!(
-        "host D3D12 caps: wave {waves}, binding tier {}, mesh tier {}, shader model {}",
-        tier(binding),
-        tier(mesh),
-        model.as_deref().unwrap_or("n/a")
-    );
+/// The device's figures for the run digest, and the paths they decide.
+fn log_caps(caps: &crate::caps::Caps) {
+    use crate::caps::{atomics64_heap, mesh_shaders, min_lod_clamp};
+    tracing::info!("host D3D12 caps: {}", caps.digest());
+    let mesh = mesh_shaders(caps);
+    tracing::info!(mesh, emulated = !mesh, "host mesh shader support");
+    tracing::info!(clamp = min_lod_clamp(caps), "host least-level clamp support");
+    tracing::info!(atomics = atomics64_heap(caps), "host 64-bit atomics on typed heap resources");
 }
 
 /// The longest value of a switch the log keeps.
@@ -961,75 +934,6 @@ struct Deferred {
 }
 
 impl Host {
-    /// Whether the host runs mesh shaders at shader model 6.6 (translated
-    /// mesh shaders need both; [`crate::caps::mesh_shaders`]); logged once.
-    /// Without, mesh programs are made as compute and drawn by a vertex
-    /// shader (`pipeline::host`, "emulated mesh pipelines").
-    pub(crate) fn mesh_shaders(&self) -> bool {
-        static MESH: OnceLock<bool> = OnceLock::new();
-        *MESH.get_or_init(|| {
-            let mesh = crate::caps::mesh_shaders(&self.caps);
-            tracing::info!(mesh, emulated = !mesh, "host mesh shader support");
-            mesh
-        })
-    }
-
-    /// Whether the host samples with a least-level clamp (D3D12
-    /// TiledResources tier 2 or better); logged once. A failed query counts
-    /// as no.
-    pub(crate) fn min_lod_clamp(&self) -> bool {
-        static CLAMP: OnceLock<bool> = OnceLock::new();
-        *CLAMP.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
-            // SAFETY: the query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-            };
-            let clamp = ok && options.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0;
-            tracing::info!(clamp, "host least-level clamp support");
-            clamp
-        })
-    }
-
-    /// Whether the host runs 64-bit atomics on typed resources in the
-    /// descriptor heap (translated 64-bit image atomics); logged once.
-    pub(crate) fn heap_atomics64(&self) -> bool {
-        static ATOMICS: OnceLock<bool> = OnceLock::new();
-        *ATOMICS.get_or_init(|| {
-            let mut typed = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
-            let mut heap = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS9,
-                        (&raw mut typed).cast(),
-                        size_of_val(&typed) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_D3D12_OPTIONS11,
-                            (&raw mut heap).cast(),
-                            size_of_val(&heap) as u32,
-                        )
-                        .is_ok()
-            };
-            let atomics = ok
-                && typed.AtomicInt64OnTypedResourceSupported.as_bool()
-                && heap.AtomicInt64OnDescriptorHeapResourceSupported.as_bool();
-            tracing::info!(atomics, "host 64-bit atomics on typed heap resources");
-            atomics
-        })
-    }
-
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -1105,7 +1009,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
+        #[cfg(feature = "diagnostics")]
+        let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
         crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1161,7 +1069,11 @@ impl Host {
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
+            #[cfg(feature = "diagnostics")]
+            let touching = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::TouchUs);
             list.touch_textures();
+            #[cfg(feature = "diagnostics")]
+            drop(touching);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1170,10 +1082,18 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        #[cfg(feature = "diagnostics")]
+        let flushing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::LastFlushUs);
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        drop(flushing);
         // Last before the lists run: every texture they reach is raised by
         // now (`resource::residency`).
+        #[cfg(feature = "diagnostics")]
+        let residing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::ResidentUs);
         crate::resource::make_resident(&self.device);
+        #[cfg(feature = "diagnostics")]
+        drop(residing);
         let prepared = std::time::Instant::now();
         // One ExecuteCommandLists per run (with its prelude): the scheduler
         // can preempt between calls, which one 8-list call gave it no chance
@@ -1186,6 +1106,8 @@ impl Host {
             .map(|(&a, &b)| &lists[a..b])
             .collect();
         // Last: the written-pages bitmaps the lists marked, read back.
+        #[cfg(feature = "diagnostics")]
+        let marking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarksUs);
         let mut marks: Vec<MarkBits> = Vec::new();
         for list in runs {
             for m in &list.deferred().marks {
@@ -1198,6 +1120,10 @@ impl Host {
         if tail[0].is_some() {
             groups.push(&tail);
         }
+        #[cfg(feature = "diagnostics")]
+        drop(marking);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PrepareUs, started.elapsed().as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         #[cfg(feature = "diagnostics")]
@@ -3221,6 +3147,7 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 pub(crate) fn release_retired() {
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
+    crate::shadow::blocks_cooled();
 }
 
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`

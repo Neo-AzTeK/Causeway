@@ -102,12 +102,56 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
+    /// Preparing submissions, the parts outside the steps: title heaps
+    /// mirrored, host textures touched, the last refresh batch, residency,
+    /// written-pages read-backs; and the whole preparing.
+    SyncHeapsUs,
+    TouchUs,
+    LastFlushUs,
+    ResidentUs,
+    MarksUs,
+    PrepareUs,
+    /// Title heap slots synced (their page written), and of all mirrored
+    /// slots those made again.
+    SyncSlots,
+    SyncMade,
+    /// Refresh batches: time bringing ranges up to date where no shader
+    /// writes, and under ranges shaders write.
+    UpdateFreeUs,
+    UpdateBusyUs,
 }
-const COUNTERS: usize = 63;
+const COUNTERS: usize = 73;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Heap slots made (again) by view kind (`View::kind`): count, microseconds.
+static MADE: [[AtomicU64; 2]; 8] = [const { [const { AtomicU64::new(0) }; 2] }; 8];
+
+/// A heap slot of view kind `kind` was made in `us`.
+pub(crate) fn made(kind: usize, us: u64) {
+    if let Some([n, t]) = MADE.get(kind) {
+        n.fetch_add(1, Relaxed);
+        t.fetch_add(us, Relaxed);
+    }
+}
+
+/// Parts of making placed buffer views (kind 4) and buffer views at
+/// large, nanoseconds: making the descriptor, the heap's bindless record,
+/// the slot's held resource; `shadow::for_view` (all buffer views), and
+/// copies of single views made (count, time).
+pub(crate) const PART_MAKE: usize = 0;
+pub(crate) const PART_VIEWED: usize = 1;
+pub(crate) const PART_KEEP: usize = 2;
+pub(crate) const PART_FOR_VIEW: usize = 3;
+pub(crate) const PART_EXACT_N: usize = 4;
+pub(crate) const PART_EXACT: usize = 5;
+static PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(crate) fn part(i: usize, n: u64) {
+    PARTS[i].fetch_add(n, Relaxed);
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -232,7 +276,8 @@ pub(crate) fn log(frames: f64) {
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms, heaps synced {:.1} ms, textures touched {:.1} ms, last batch {:.1} ms, residency {:.1} ms, mark reads {:.1} ms, in all {:.1} ms; heap slots synced {:.0}, \
+         made {:.0}; refreshes free {:.1} ms, busy {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
          {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -285,6 +330,16 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::StepMemoryUs as usize]),
         ms(c[C::UploadsUs as usize]),
         ms(c[C::PreludeUs as usize]),
+        ms(c[C::SyncHeapsUs as usize]),
+        ms(c[C::TouchUs as usize]),
+        ms(c[C::LastFlushUs as usize]),
+        ms(c[C::ResidentUs as usize]),
+        ms(c[C::MarksUs as usize]),
+        ms(c[C::PrepareUs as usize]),
+        c[C::SyncSlots as usize],
+        c[C::SyncMade as usize],
+        ms(c[C::UpdateFreeUs as usize]),
+        ms(c[C::UpdateBusyUs as usize]),
         mb(c[C::CompareBytes as usize]),
         ms(c[C::CompareUs as usize]),
         c[C::MarkedPages as usize],
@@ -308,6 +363,25 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackMergeUs as usize]),
         ms(c[C::BackWriteUs as usize]),
         ms(c[C::BackWatchUs as usize]),
+    );
+    let kinds = ["constant", "shader", "unordered", "sampler", "placed buffer", "placed texture", "placed texture left for draws", "placed unordered"];
+    let made: Vec<String> = MADE
+        .iter()
+        .zip(kinds)
+        .map(|([n, t], kind)| {
+            let (n, t) = (n.swap(0, Relaxed) as f64 / frames, t.swap(0, Relaxed) as f64 / 1e3 / frames);
+            format!("{kind} {n:.0} in {t:.1} ms")
+        })
+        .collect();
+    tracing::info!("  heap slots made per frame by kind: {}", made.join(", "));
+    let [mk, viewed, keep, for_view, exact_n, exact] = [0, 1, 2, 3, 4, 5].map(|i| PARTS[i].swap(0, Relaxed) as f64 / frames);
+    tracing::info!(
+        "  placed buffer parts per frame: make {:.1} ms, bindless {:.1} ms, keep {:.1} ms; for_view (all) {:.1} ms, view copies made {exact_n:.0} in {:.1} ms",
+        mk / 1e6,
+        viewed / 1e6,
+        keep / 1e6,
+        for_view / 1e6,
+        exact / 1e6
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()
@@ -339,5 +413,14 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+/// Runs its closure when dropped (timing a function with several returns).
+pub(crate) struct OnDrop<F: FnMut()>(pub(crate) F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
     }
 }

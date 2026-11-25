@@ -1,13 +1,15 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod capability;
+mod comments;
 mod policy;
 mod report;
+mod setup;
 mod smoke;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -26,8 +28,14 @@ enum Cmd {
         #[arg(long)]
         staged: bool,
     },
-    /// Point git at .githooks/ so every commit runs the policy check.
-    InstallHooks,
+    /// Set up a clone: git hooks, `gh`'s default repository, and the ignored
+    /// files naming the title's folder and this machine's GPUs.
+    #[command(alias = "install-hooks")]
+    Setup {
+        /// The title's folder, for a `victory.toml` not made yet.
+        #[arg(long)]
+        game_dir: Option<PathBuf>,
+    },
     /// Run a title unattended with the diagnostics build, skip its menus and
     /// judge each graphics area. On a real GPU this can reset the driver.
     Smoke(Box<smoke::Smoke>),
@@ -38,19 +46,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::Smoke(args) => smoke::run(&root, &args),
-        Cmd::InstallHooks => {
-            let status = Command::new("git")
-                .args(["config", "core.hooksPath", ".githooks"])
-                .current_dir(&root)
-                .status()
-                .context("running git")?;
-            anyhow::ensure!(
-                status.success(),
-                "git config failed (is this a git repository?)"
-            );
-            println!("hooks installed: commits now run `cargo xtask policy --staged`");
-            Ok(())
-        }
+        Cmd::Setup { game_dir } => setup::run(&root, game_dir.as_deref()),
     }
 }
 

@@ -2686,16 +2686,16 @@ void main(uint3 id : SV_DispatchThreadID) {
             (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
             View::Placed(false, resource, desc)
         };
-        let width = |address: u64| {
+        let whole = crate::shadow::find(start, 1 << 16).unwrap();
+        let own = |address: u64| {
             let made = crate::descriptor::host::make_view(&view(address), at).expect("a view");
-            // SAFETY: a live buffer.
-            unsafe { made.GetDesc() }.Width
+            windows::core::Interface::as_raw(&made) != windows::core::Interface::as_raw(&whole.buffer)
         };
         // The host's view is raw: it starts on a multiple of 16 bytes (an
         // element of 456 is not one every time) as well as on an element.
-        assert_eq!(width(start + 2 * 456), 1 << 16, "on an element: the buffer's copy");
-        assert_eq!(width(start + 456), (4 * 456u64).next_multiple_of(256), "on an element, not 16");
-        assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
+        assert!(!own(start + 2 * 456), "on an element: the buffer's copy");
+        assert!(own(start + 456), "on an element, not 16");
+        assert!(own(start + 100), "off: its own bytes");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
         drop(copy);
