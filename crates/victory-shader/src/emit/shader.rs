@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -13,22 +13,23 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
-/// parameter) of the view-stride table: dword `i` is the byte stride of
-/// the buffer view at view-heap index `i`.
+/// parameter) of the view-stride table: dword [`VIEW_TABLE_HEADER`] + `i` is
+/// the byte stride of the buffer view at view-heap index `i`.
 pub const VIEW_STRIDES: u8 = 255;
+/// Dwords before the strides in the view-stride table, what the host knows
+/// of its view heap: dword 0 is the last heap index (the heap has that many
+/// slots and one more; hosts cap their heaps differently, so the shader
+/// reads it), dword 1 the index of the null raw buffer SRV (the null raw
+/// UAV is the one below).
+pub const VIEW_TABLE_HEADER: u32 = 2;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
+/// Sampler heap indices are clamped below this: the host's sampler heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+/// indices"). View heap indices are clamped to the host's own limit, read
+/// from the view-stride table ([`VIEW_TABLE_HEADER`]).
 pub const HEAP_SAMPLERS: u32 = 2048;
-/// The heap index of the host's null raw buffer view (the null raw
-/// unordered access view at the index below), read instead of a slot that
-/// holds no buffer view where a shader reads one at an index it computes
-/// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -100,6 +101,10 @@ pub(crate) struct Shader {
     pub memory_dirty: Option<V>,
     /// The view addresses' handle, once a descriptor's address is read.
     pub view_addresses: Option<V>,
+    /// The view heap's last index and null raw buffer SRV index, read from
+    /// the view-stride table in the entry block when first needed.
+    view_limit: Option<V>,
+    view_null: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -164,6 +169,8 @@ impl Shader {
             memory: None,
             memory_dirty: None,
             view_addresses: None,
+            view_limit: None,
+            view_null: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -442,6 +449,47 @@ impl Shader {
         )
     }
 
+    /// Dword `k` of the view-stride table, read in the entry block.
+    fn view_table_dword(&mut self, k: u32) -> V {
+        let table = self.root_srv_handle(VIEW_STRIDES);
+        let block = self.entry;
+        let at = self.m.i32(4 * k);
+        let (undef, mask, four) = (self.m.undef(self.t.i32), self.m.i8(1), self.m.i32(4));
+        let r = self.op(
+            block,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.t.res_ret,
+            139,
+            &[table, at, undef, mask, four],
+        );
+        let x = self.m.extract(block, r, 0);
+        self.m.cast(block, Cast::Bitcast, x, self.t.i32)
+    }
+
+    /// The last index of the host's view heap.
+    pub fn view_limit(&mut self) -> V {
+        if let Some(v) = self.view_limit {
+            return v;
+        }
+        let v = self.view_table_dword(0);
+        self.view_limit = Some(v);
+        v
+    }
+
+    /// The index of the host's null raw buffer SRV (the UAV is the one
+    /// below), read instead of a slot that holds no buffer view where a
+    /// shader reads one at an index it computes (module notes, "Buffer views
+    /// at computed heap indices").
+    pub fn view_null(&mut self) -> V {
+        if let Some(v) = self.view_null {
+            return v;
+        }
+        let v = self.view_table_dword(1);
+        self.view_null = Some(v);
+        v
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
@@ -460,7 +508,11 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = if sampler {
+            self.m.i32(HEAP_SAMPLERS - 1)
+        } else {
+            self.view_limit()
+        };
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));

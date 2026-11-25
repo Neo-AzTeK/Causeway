@@ -279,7 +279,8 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                             1,
                             Root::View {
                                 srv: true,
-                                data: vec![4, 12],
+                                // The header (last slot 1, null SRV 1), then the strides.
+                                data: vec![1, 1, 4, 12],
                             },
                         ),
                     ],
@@ -332,8 +333,9 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             ud[u.index as usize] = u32::from(u.root == RootType::Constants);
         }
         let dispatch = Dispatch {
-            // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
+            // Heap index 1 holds no buffer view: stride 0. The heap has 4 slots, the
+            // null UAV and SRV the last two: the header names 3 twice.
+            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![3, 3, 4, 0, 0, 0] })],
             views: &views,
             samplers: &[],
             groups: [1, 1, 1],
@@ -399,7 +401,7 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                 &Dispatch {
                     // User data, then the stride table: heap index 1 holds a
                     // buffer view.
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![1, 1, 4, 4] })],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
