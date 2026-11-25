@@ -443,6 +443,25 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+impl View {
+    /// Its kind for diagnostics (`crate::copystat::made`): constant,
+    /// shader, unordered, sampler, placed buffer, placed texture, placed
+    /// texture left for draws (`postponed`), placed unordered.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn kind(&self, postponed: bool) -> usize {
+        match self {
+            View::Constant(..) => 0,
+            View::Shader(..) => 1,
+            View::Unordered(..) => 2,
+            View::Sampler(_) | View::ConsoleSampler(_) => 3,
+            View::Placed(true, ..) => 7,
+            View::Placed(false, resource, _) if resource[0] == 1 => 4,
+            View::Placed(..) if postponed => 6,
+            View::Placed(..) => 5,
+        }
+    }
+}
+
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {

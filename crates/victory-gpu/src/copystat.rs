@@ -127,6 +127,17 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
+/// Heap slots made (again) by view kind (`View::kind`): count, microseconds.
+static MADE: [[AtomicU64; 2]; 8] = [const { [const { AtomicU64::new(0) }; 2] }; 8];
+
+/// A heap slot of view kind `kind` was made in `us`.
+pub(crate) fn made(kind: usize, us: u64) {
+    if let Some([n, t]) = MADE.get(kind) {
+        n.fetch_add(1, Relaxed);
+        t.fetch_add(us, Relaxed);
+    }
+}
+
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -337,6 +348,16 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackWriteUs as usize]),
         ms(c[C::BackWatchUs as usize]),
     );
+    let kinds = ["constant", "shader", "unordered", "sampler", "placed buffer", "placed texture", "placed texture left for draws", "placed unordered"];
+    let made: Vec<String> = MADE
+        .iter()
+        .zip(kinds)
+        .map(|([n, t], kind)| {
+            let (n, t) = (n.swap(0, Relaxed) as f64 / frames, t.swap(0, Relaxed) as f64 / 1e3 / frames);
+            format!("{kind} {n:.0} in {t:.1} ms")
+        })
+        .collect();
+    tracing::info!("  heap slots made per frame by kind: {}", made.join(", "));
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))

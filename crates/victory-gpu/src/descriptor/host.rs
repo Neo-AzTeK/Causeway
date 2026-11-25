@@ -776,6 +776,8 @@ impl HostHeap {
             tests::MADE.with(|n| n.set(n.get() + 1));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SyncMade, 1);
+            #[cfg(feature = "diagnostics")]
+            let making = (std::time::Instant::now(), view.kind(!for_draw && is_placed_texture(&view)));
             self.set_stride(slot, Some(&view));
             self.note_address(slot, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -803,6 +805,8 @@ impl HostHeap {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             self.keep(slot, kept.flatten());
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::made(making.1, making.0.elapsed().as_micros() as u64);
         }
         Some(view)
     }
