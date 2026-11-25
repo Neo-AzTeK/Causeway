@@ -421,21 +421,14 @@ pub struct Options {
     /// triangles (module notes, "Mesh shaders as compute"), for hosts
     /// without mesh shaders. Other stages are unchanged.
     pub mesh_as_compute: bool,
-    /// The device has no double-precision shader operations: a program
-    /// that uses them is refused.
-    pub no_doubles: bool,
 }
 
-/// Whether a host as `options` say can run code that computes in double
-/// precision (`doubles`).
-fn host_runs(options: Options, doubles: bool) -> Result<(), ShaderError> {
-    if doubles && options.no_doubles {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "double-precision arithmetic on a host without it",
-        });
-    }
-    Ok(())
+/// Whether the host shader `dxil` computes in double precision (its feature
+/// part says so), which a host without `Caps::doubles` cannot run.
+pub fn uses_doubles(dxil: &[u8]) -> bool {
+    let features = Container::parse(dxil).ok();
+    let features = features.as_ref().and_then(|c| c.part(FourCC(*b"SFI0")));
+    features.is_some_and(|p| p.data.first().is_some_and(|b| b & 1 != 0))
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -615,7 +608,6 @@ fn emit_once(
         }
         l => l?,
     };
-    host_runs(options, l.doubles)?;
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,

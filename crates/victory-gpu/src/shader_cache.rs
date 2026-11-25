@@ -79,11 +79,16 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// [`host_shader_for`] a device with double-precision shader operations.
+pub fn host_shader(container: &[u8], min_lod_clamp: bool, mesh_as_compute: bool) -> (Result<HostShader, String>, bool) {
+    host_shader_for(container, min_lod_clamp, mesh_as_compute, false)
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there. `mesh_as_compute`: mesh
 /// programs are made as compute (hosts without mesh shaders). `no_doubles`:
 /// programs computing in double precision are refused.
-pub fn host_shader(
+pub fn host_shader_for(
     container: &[u8],
     min_lod_clamp: bool,
     mesh_as_compute: bool,
@@ -91,13 +96,23 @@ pub fn host_shader(
 ) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options =
-        victory_shader::emit::Options { view_marks: true, min_lod_clamp, mesh_as_compute, no_doubles };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let options = victory_shader::emit::Options { view_marks: true, min_lod_clamp, mesh_as_compute };
+    let translate = |c: &[u8]| {
+        let shader = victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string())?;
+        runs_here(shader, no_doubles)
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), (min_lod_clamp, mesh_as_compute, no_doubles), container, translate),
         None => (translate(container), false),
     }
+}
+
+/// `shader`, unless the device cannot run it.
+fn runs_here(shader: HostShader, no_doubles: bool) -> Result<HostShader, String> {
+    if no_doubles && victory_shader::emit::uses_doubles(&shader.dxil) {
+        return Err("double-precision arithmetic is not supported by this device".into());
+    }
+    Ok(shader)
 }
 
 /// The cache entry's converter: the build and the container in, the

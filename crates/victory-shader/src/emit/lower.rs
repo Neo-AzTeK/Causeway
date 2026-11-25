@@ -53,8 +53,6 @@ pub(crate) struct Lowered {
     /// Marks the pages it writes through buffer views (`emit`, "Write
     /// marks").
     pub view_marks: bool,
-    /// Computes in double precision, which not every host has.
-    pub doubles: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -1538,7 +1536,6 @@ impl<'a> Lower<'a> {
             heap: self.heap[0],
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
-            doubles: self.s.flags & flags::DOUBLES != 0,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]

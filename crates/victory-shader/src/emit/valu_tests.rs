@@ -1804,13 +1804,9 @@ fn doubles_add_in_double_precision() {
 }
 
 #[test]
-fn doubles_are_refused_where_the_host_has_none() {
-    let without = super::Options {
-        no_doubles: true,
-        ..Default::default()
-    };
-    let e = super::host_runs(without, true).expect_err("no doubles on this host");
-    assert!(e.to_string().contains("double-precision"), "{e}");
-    assert!(super::host_runs(without, false).is_ok());
-    assert!(super::host_runs(Default::default(), true).is_ok());
+fn a_shader_that_needs_doubles_says_so() {
+    let double = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    assert!(super::uses_doubles(&double.dxil));
+    let single = build_valu_cs(&[vop1(0x001, 0, vgpr(1))]);
+    assert!(!super::uses_doubles(&single.dxil));
 }
