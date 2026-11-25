@@ -10,7 +10,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::comments;
+use crate::{capability, comments};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
@@ -89,7 +89,8 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     println!("asset policy: {} files ok", files.len());
     // The whole tree even when `staged`: a marker and its test may be in
     // different files.
-    let problems = comments::check(&rust_sources(root)?, comments::DECISION_REFS);
+    let sources = rust_sources(root)?;
+    let problems = comments::check(&sources, comments::DECISION_REFS);
     if !problems.is_empty() {
         for p in &problems {
             eprintln!("POLICY: {p}");
@@ -97,6 +98,14 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
         bail!("{} comment-rule violation(s); see CONTRIBUTING.md, \"Comments\"", problems.len())
     }
     println!("comment rules ok");
+    let problems = capability::check(&sources, capability::OTHER_OWNER);
+    if !problems.is_empty() {
+        for p in &problems {
+            eprintln!("POLICY: {p}");
+        }
+        bail!("{} hardware-range violation(s); see docs/hardware-range.md", problems.len())
+    }
+    println!("capability queries ok");
     Ok(())
 }
 

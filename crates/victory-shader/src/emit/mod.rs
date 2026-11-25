@@ -1374,6 +1374,7 @@ mod tests {
                 continue;
             };
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // test-host-query: a test asking whether it can run here.
             // SAFETY: the query writes the structure of the given size.
             let queried = unsafe {
                 host.device.CheckFeatureSupport(

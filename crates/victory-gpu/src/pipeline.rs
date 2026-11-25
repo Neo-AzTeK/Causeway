@@ -220,8 +220,8 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let (host, cached) = crate::shader_cache::host_shader(
         container,
-        crate::host::host().is_some_and(|h| h.min_lod_clamp()),
-        crate::host::host().is_some_and(|h| !h.mesh_shaders()),
+        crate::host::host().is_some_and(|h| crate::caps::min_lod_clamp(&h.caps)),
+        crate::host::host().is_some_and(|h| !crate::caps::mesh_shaders(&h.caps)),
     );
     (host.and_then(|host| with_resources(container, host)), cached)
 }

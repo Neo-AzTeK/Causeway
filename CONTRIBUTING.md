@@ -71,7 +71,8 @@ which GPU adapter ran: passing tests do not show the title renders.
 ## Hardware range
 
 A fix must hold on other GPUs, vendors and drivers, not only the primary dev GPU
-(wave32 only). Query capabilities through `Caps` instead of hardcoding, keep a
+(wave32 only). Query capabilities through `Caps` instead of hardcoding (only
+`caps/` asks the device; `cargo xtask policy` rejects it elsewhere), keep a
 clean refusal where a device lacks a feature, test both paths (`caps::reference`
 gives fake caps, no GPU needed), and say which adapters were and were not
 verified. A review of a GPU-facing diff answers: which capability does this

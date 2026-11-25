@@ -96,6 +96,12 @@ pub fn atomics64_heap(caps: &Caps) -> bool {
     caps.typed_atomics64 == Some(true) && caps.heap_atomics64 == Some(true)
 }
 
+/// Whether a sampler may filter anisotropically with point mip selection;
+/// where not, translated samplers take the nearest filter the host has.
+pub fn aniso_point_mip(caps: &Caps) -> bool {
+    caps.aniso_point_mip == Some(true)
+}
+
 /// How much the binding model allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingClass {
