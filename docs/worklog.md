@@ -5,6 +5,11 @@ Newest state first inside each section. No game data here (rule #1): counts,
 error kinds, branches and commits only.
 
 ## State (update at every merge)
+- 2026-11-25 (GTX 1070, main 93d7987, smoke 14, 900 s, loop limit 64, save
+  with terms accepted): menus and loading hold 30 fps; the world is reached
+  ~6 min in at 2.4 fps (411 ms: preparing 220, GPU 145, copy-back 25, other
+  22); 451 drawn, ~2100 dropped/frame (mesh ~1900: kind 10 923 + 156 mesh
+  programs; kind 2 40). First 3D content seen (distant lights), ground black.
 - 2026-11-25 (end of session): main = origin/main, chain passes. Wave64 gate (`emit/halves.rs`) merged: two halves only
   where no lane-derived branch can skip or repeat an s_barrier; all 56 enabled programs pass it. `a1f6cdf8874960a9` has
   no barrier: its two loops count to a constant-buffer word (garbage suspected, > 2^20); `VICTORY_SHADER_LOOP_LIMIT=64`
@@ -31,6 +36,9 @@ error kinds, branches and commits only.
   pixels non-flat in the saved frame: no 3D scene yet.
 
 ## Next, ranked by effect on the picture
+(Owner goal: >= 30 fps in the world. GTX 1070 order: mesh emulation (branch
+claude/mesh-emulation, testing), then world CPU preparation 220 ms/frame
+(copies ~89 ms for ~75 MB, ~130 ms unattributed), then GPU 145 ms.)
 0. (frame-wait hunt, see log) Real cost is GPU time before the removal
    (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
 1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
@@ -67,6 +75,13 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: GTX 1070 smokes 13-14 (main 93d7987, `VICTORY_SHADER_LOOP_LIMIT=64`):
+  13 (420 s, fresh save) menus/loading 30 fps throughout, the scripted keys
+  loop on the terms-of-use checkbox (ticked by hand). 14 (900 s, `--data-dir`
+  of 13's save): world at ~6 min, 2.4 fps median, preparing 53%; no hang,
+  crash or removal; non-flat pixels 2.0% mean (max 6.6%). Refused 241,
+  untranslated 18 (more programs reached than smoke 12, not a regression).
+  Merged claude/frosty-satoshi-7332c1 (plain_pages fix) and origin/main.
 - 2026-11-25: smoke 12's slow menus: `watch::plain_pages` (dc31df2) called
   `VirtualQuery` on every alias page it guards. The aliases sit in the
   runtime's ~5.5 GiB committed pool view, and `VirtualQuery` walks every page
