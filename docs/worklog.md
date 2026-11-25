@@ -37,8 +37,10 @@ error kinds, branches and commits only.
 
 ## Next, ranked by effect on the picture
 (Owner goal: >= 30 fps in the world. GTX 1070 order: mesh emulation (branch
-claude/mesh-emulation, testing), then world CPU preparation 220 ms/frame
-(copies ~89 ms for ~75 MB, ~130 ms unattributed), then GPU 145 ms.)
+claude/mesh-emulation, testing), then world CPU preparation 150-230 ms/frame
+(attributed, branch claude/world-prep-cost: refresh batches 78-112 ms, title
+heap sync 43-50 ms = placed buffer views made again, ~11,000/frame at 5.6 us),
+then GPU 145 ms.)
 0. (frame-wait hunt, see log) Real cost is GPU time before the removal
    (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
 1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
@@ -75,6 +77,17 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: world CPU preparation attributed (runs prep-1..3, GTX 1070,
+  branch claude/world-prep-cost, not merged): of preparing, refresh batches
+  78-112 ms (last batch alone 48-82), `sync_heaps` 43-50 ms, steps copy 21,
+  GPU writes 13-15, heaps 13; the rest < 5. `sync_heaps` checks ~250-320k
+  slots/frame and makes ~10-16k again; placed buffer views are 11,200 of them
+  at 5.6 us (46 ms), constants 0.9 us, shader views 1.6 us. Fix on the
+  branch: unchanged slots checked under one lock (26 -> 1 ns/slot, bench),
+  postponed placed-texture slots no longer made again; no measurable
+  preparing gain in the title (run-to-run spread larger). Next: why a placed
+  buffer view costs 5.6 us (`view_copy`/`shadow::for_view`?), or reuse its
+  made descriptor per view entry.
 - 2026-11-25: GTX 1070 smokes 13-14 (main 93d7987, `VICTORY_SHADER_LOOP_LIMIT=64`):
   13 (420 s, fresh save) menus/loading 30 fps throughout, the scripted keys
   loop on the terms-of-use checkbox (ticked by hand). 14 (900 s, `--data-dir`
