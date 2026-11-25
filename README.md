@@ -1,6 +1,6 @@
 # Causeway
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files you
+Runs an Xbox Series X|S title natively on Windows, from files you
 supply. The title's x86-64 code runs unchanged in our process; Causeway
 supplies the platform under it and recompiles its shaders for Direct3D 12.
 

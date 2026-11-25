@@ -1,6 +1,6 @@
 //! Depth textures the title also writes through unordered access (decision
 //! 0007, "One host texture per texture memory"). The console allows both
-//! uses of one texture (Grand Theft Auto VI's shadow-map copies and its
+//! uses of one texture (the title's shadow-map copies and its
 //! material depth, written by compute and then tested as depth); the host
 //! does not: a depth-stencil resource takes no unordered access, in any
 //! format. Such a texture gets a writable twin, a colour texture per plane
@@ -548,7 +548,7 @@ fn compile() -> windows::core::Result<Converter> {
 mod tests {
     use super::*;
 
-    /// The material-depth frame of Grand Theft Auto VI: written through
+    /// The material-depth frame of the title: written through
     /// unordered views, read as a shader resource in the same list, written
     /// again; read in the next list; tested as depth in a later one; the
     /// next frame writes it through unordered views again.

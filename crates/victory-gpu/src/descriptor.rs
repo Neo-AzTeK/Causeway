@@ -34,7 +34,7 @@ pub(crate) struct HeapDesc {
     nodes: u32,
 }
 
-/// Newer titles (Grand Theft Auto VI) pass the description followed by
+/// Newer titles (the title) pass the description followed by
 /// memory of their own for the descriptors: an address and its size in
 /// bytes, or a null address to have the heap allocate (inferred from the
 /// title's call sites; older titles pass the plain description).
@@ -77,7 +77,7 @@ impl Heap {
     }
 
     /// The host heap, made on first use from what the title wrote so far.
-    /// Made late because a host view heap the size of Grand Theft Auto VI's
+    /// Made late because a host view heap the size of the title's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
@@ -152,7 +152,7 @@ fn mirror(handle: u64) {
 }
 
 /// Mirrors what the title wrote into its shader-visible heaps without a
-/// call: Grand Theft Auto VI copies descriptors (our records) into its heap
+/// call: the title copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
 /// written since the last sync is made again if its record changed (in the
 /// world 1,300-14,400 slots a frame, against a few hundred views made by
@@ -843,7 +843,7 @@ mod tests {
         crate::watch::tests::free(memory);
     }
 
-    /// Grand Theft Auto VI places its shader-visible heap in its own memory
+    /// The title places its shader-visible heap in its own memory
     /// and checks that the heap starts there.
     #[test]
     fn placed_heaps_start_at_the_title_memory() {
