@@ -202,7 +202,7 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
 /// Guards the other mappings of taken pages.
 fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    protect(g, &others);
+    protect(g, &others, false);
 }
 
 /// Tracks `[start, start + len)` if it is the runtime's GPU memory (every
@@ -281,6 +281,8 @@ fn open(g: &mut Guards, page: usize) -> bool {
         return false;
     }
     let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    let _t = Timed(std::time::Instant::now(), crate::copystat::C::KernelUs);
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
     #[cfg(feature = "diagnostics")]
@@ -328,7 +330,7 @@ impl Tracked {
         guard_aliases(&mut g, &others);
         #[cfg(feature = "diagnostics")]
         drop(asked);
-        for page in protect(&mut g, &whole) {
+        for page in protect(&mut g, &whole, true) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -361,7 +363,7 @@ impl Tracked {
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, pages);
         guard_aliases(&mut g, &others);
-        for page in protect(&mut g, pages) {
+        for page in protect(&mut g, pages, true) {
             changed.remove(&page);
             self.changed.taken(page);
         }
@@ -403,6 +405,10 @@ impl Tracked {
 /// when tracking: the heap commits pages of its reservations later, also
 /// inside a loose copy's window. Title pools answer in one call.
 fn plain_pages(first: usize, last: usize) -> Vec<(usize, usize)> {
+    #[cfg(test)]
+    tests::PLAIN_CHECKS.with(|c| c.set(c.get() + 1));
+    #[cfg(feature = "diagnostics")]
+    let _t = Timed(std::time::Instant::now(), crate::copystat::C::ViewQueryUs);
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -443,8 +449,11 @@ fn plain_pages(first: usize, last: usize) -> Vec<(usize, usize)> {
 /// Makes `pages` read-only where not already (in runs), and returns those
 /// now guarded or with nothing mapped (taken either way); a page that is
 /// mapped but cannot be guarded, or holds plain memory ([`plain_pages`]),
-/// is left out (it stays changed).
-fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
+/// is left out (it stays changed). `check_plain` false skips the plain-memory
+/// query for pages known to be views (other mappings of taken pages): a
+/// `VirtualQuery` there walks the whole view and took 8-16 ms per call in the
+/// title's big tiled heap, seconds per texture.
+fn protect(g: &mut Guards, pages: &[usize], check_plain: bool) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
@@ -456,11 +465,15 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
     let set = |from: usize, to: usize| {
+        #[cfg(feature = "diagnostics")]
+        let _t = Timed(std::time::Instant::now(), crate::copystat::C::KernelUs);
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
     };
     let unmapped = |page: usize| {
+        #[cfg(feature = "diagnostics")]
+        let _t = Timed(std::time::Instant::now(), crate::copystat::C::ViewQueryUs);
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
@@ -486,7 +499,11 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         i += 1;
         #[cfg(feature = "diagnostics")]
         counted(1, run.len() as u64);
-        let plain = plain_pages(run[0], run[run.len() - 1] + 1);
+        let plain = if check_plain {
+            plain_pages(run[0], run[run.len() - 1] + 1)
+        } else {
+            Vec::new()
+        };
         if plain.is_empty() && set(run[0], run[run.len() - 1] + 1) {
             g.protected.extend(run);
             taken.extend(run);
@@ -630,7 +647,7 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
         }
     }
     if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
-        protect(&mut g, &[page]);
+        protect(&mut g, &[page], true);
     }
 }
 
@@ -704,6 +721,10 @@ impl Drop for Timed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    thread_local! {
+        /// Calls of `plain_pages` on this thread.
+        pub(super) static PLAIN_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
@@ -981,6 +1002,23 @@ pub(crate) mod tests {
         // takes it for `a`'s pages here).
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+    }
+
+    /// Guarding the other mappings of taken pages asks nothing of the memory
+    /// manager about plain memory: a view is never plain (the query is slow
+    /// in big views).
+    #[test]
+    fn guarding_aliases_does_not_scan_them_for_plain_memory() {
+        let (a, b) = twin_views(4);
+        let t = track(a, 4 * PAGE, true).expect("views are tracked");
+        PLAIN_CHECKS.with(|c| c.set(0));
+        assert_eq!(t.take(a, a + 4 * PAGE), [(a, a + 4 * PAGE)]);
+        // One check for the taken pages, none for their four aliases.
+        assert_eq!(PLAIN_CHECKS.with(|c| c.get()), 1);
+        // The aliases are guarded all the same.
+        // SAFETY: the second view of the pages, guarded by the take.
+        unsafe { ((b + 2 * PAGE) as *mut u32).write_volatile(5) };
+        assert_eq!(t.take(a, a + 4 * PAGE), [(a + 2 * PAGE, a + 3 * PAGE)]);
     }
 
     /// A write or mapping that runs past the end of the address space (a

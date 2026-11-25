@@ -31,8 +31,8 @@ error kinds, branches and commits only.
   pixels non-flat in the saved frame: no 3D scene yet.
 
 ## Next, ranked by effect on the picture
-00. Texture refresh at ~3 MB/s: menus at 0.4 fps after ~40 s (smoke 12), so
-   runs on the GTX 1070 do not reach the world unattended. Blocks every run.
+00. (done, see log) Texture refresh slowdown: fixed on tex-refresh-speed; check
+   it on the GTX 1070 after merge.
 0. (frame-wait hunt, see log) Real cost is GPU time before the removal
    (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
 1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
@@ -69,6 +69,20 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: texture refresh slowdown fixed (branch tex-refresh-speed, RTX 2060
+  SUPER, wave32, tier 3; GTX 1070 not run). Cause: `Tracked::take` guarded the
+  other mappings of every taken page through `protect`, whose `plain_pages` ran
+  `VirtualQuery` on each alias view: 8-16 ms per call in the title's big views
+  (396 calls = 6.5 s per window; the guard handler waited on the lock `take`
+  held, 11.7 s). `VirtualProtect` was 3 ms in all. Detile (4 GB/s), blake3 and
+  `ReadProcessMemory` (2-3 ms per 9 MB) were never the cost. Fix: aliases are
+  views, never plain heap: `protect(.., check_plain=false)` skips the query
+  (test `guarding_aliases_does_not_scan_them_for_plain_memory`, fails without).
+  Before: 2.3 s/frame preparing, 1.4 MB textures per frame (~0.6 MB/s), intro 30
+  fps then 0.4 fps. After (120 s smoke): textures 12.7 MB in 6.2 ms, no refresh
+  over 100 ms, 29-31 fps in menus, reaches 1211 draws/frame. Added: diagnostics
+  line "slow texture refresh" with phase times (take, read, detile, committed,
+  hash). Intro lag the owner saw was not this branch (its menu fps match smoke 12).
 - 2026-11-25: finding (offline, local decoded dump, no launch, no code change):
   `a1f6cdf8874960a9` has two do-while loops (`s_add` counter, `s_cmp_eq` against
   a count, exit on `scc0`), each guarded by a count-is-zero skip. Count 1 is
