@@ -429,6 +429,40 @@ mod tests {
         assert_eq!(super::match_adapter("   ", &names), None);
     }
 
+    /// Written-pages bitmaps are in video memory (from system memory each
+    /// mark crosses PCIe); a submission's marks are read back and the GPU
+    /// zeroes the bitmap, so the next submission reads none.
+    #[test]
+    fn marks_are_in_video_memory_read_back_and_zeroed() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let bits = host.mark_bits(256).unwrap();
+        let mut heap = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: a plain query of a live buffer.
+        unsafe { bits.gpu.GetHeapProperties(Some(&mut heap), None) }.unwrap();
+        assert_eq!(heap.Type, D3D12_HEAP_TYPE_DEFAULT, "in video memory");
+        // The list marks dwords 2 and 3 (by a copy, as a shader would).
+        let (src, at) = host.shared_buffer(256).unwrap();
+        // SAFETY: our mapped buffer.
+        unsafe { at.cast::<u32>().copy_from([0x5u32, 0x80].as_ptr(), 2) };
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list, live buffers.
+        unsafe { list.list.CopyBufferRegion(&bits.gpu, 8, &src, 0, 8) };
+        list.keep(&src);
+        list.read_marks(&bits);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: dwords of the mapped readback buffer, the GPU done with it.
+        let read = |w: usize| unsafe { (bits.data as *const u32).add(w).read_volatile() };
+        assert_eq!((read(2), read(3)), (0x5, 0x80), "marks read back");
+        list.reset();
+        list.read_marks(&bits);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!((0..64).map(read).max(), Some(0), "the bitmap was zeroed");
+    }
+
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
         let Some(host) = host() else { return };
@@ -807,6 +841,9 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Written-pages bitmaps the list's shaders mark: read back and zeroed
+    /// after each submission of the list (`Host::read_marks`).
+    marks: Vec<MarkBits>,
 }
 
 impl Host {
@@ -1010,11 +1047,24 @@ impl Host {
         // to do (shortcut: a hypothesis for the ~2.7 s submission the host
         // reset, not verified on a real GPU). Only the last call waits,
         // unless diagnostics time each list (`VICTORY_GPU_TIMING`).
-        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
+        let mut groups: Vec<&[Option<ID3D12CommandList>]> = firsts
             .iter()
             .zip(firsts.iter().skip(1).chain([&lists.len()]))
             .map(|(&a, &b)| &lists[a..b])
             .collect();
+        // Last: the written-pages bitmaps the lists marked, read back.
+        let mut marks: Vec<MarkBits> = Vec::new();
+        for list in runs {
+            for m in &list.deferred().marks {
+                if !marks.iter().any(|k| k.gpu.as_raw() == m.gpu.as_raw()) {
+                    marks.push(m.clone());
+                }
+            }
+        }
+        let tail = [(!marks.is_empty()).then(|| self.read_marks(&marks)).flatten()];
+        if tail[0].is_some() {
+            groups.push(&tail);
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         #[cfg(feature = "diagnostics")]
@@ -1046,7 +1096,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if each && started.elapsed() > std::time::Duration::from_millis(50) {
+            if each && i < runs.len() && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -1056,7 +1106,7 @@ impl Host {
                 }
             }
             // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            if groups.len() > 1 && i < runs.len() && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
                 removed_in = Some(i);
             }
             let _ = (i, started);
@@ -1810,6 +1860,16 @@ impl HostList {
     /// whether its shaders read title memory with no copy.
     pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
         self.deferred().missed.push(Box::new(check));
+    }
+
+    /// The list's shaders mark `bits`: after each submission of the list
+    /// its marks are in `bits.data` (before `defer_missed` and
+    /// `defer_after` work) and the bitmap is zeroed.
+    pub(crate) fn read_marks(&self, bits: &MarkBits) {
+        let mut deferred = self.deferred();
+        if !deferred.marks.iter().any(|m| m.gpu.as_raw() == bits.gpu.as_raw()) {
+            deferred.marks.push(bits.clone());
+        }
     }
 
     /// Runs `work` once the list has run (each submission), before its
@@ -2838,6 +2898,137 @@ impl Host {
             }
         }
     }
+
+    /// A written-pages bitmap of `bytes` bytes ([`MarkBits`]): zeroed, in
+    /// video memory, with its mapped, zeroed readback buffer.
+    pub(crate) fn mark_bits(&self, bytes: u64) -> Option<MarkBits> {
+        let bytes = bytes.max(4);
+        let buffer = |kind, flags, state| -> windows::core::Result<ID3D12Resource> {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: bytes,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a committed buffer (zeroed: no
+            // CREATE_NOT_ZEROED flag).
+            unsafe { self.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made)? };
+            made.ok_or_else(windows::core::Error::empty)
+        };
+        let made = buffer(
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
+        .and_then(|gpu| {
+            // Readback buffers stay in the copy destination state.
+            let readback = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: our readback buffer of `bytes` bytes, mapped for good.
+            unsafe {
+                readback.Map(0, None, Some(&mut data))?;
+                std::ptr::write_bytes(data.cast::<u8>(), 0, bytes as usize);
+            }
+            Ok(MarkBits {
+                gpu,
+                readback,
+                data: data as usize,
+                bytes,
+            })
+        });
+        made.inspect_err(|e| tracing::warn!(error = %e, bytes, "no written-pages bitmap")).ok()
+    }
+
+    /// The submission's last list, for the bitmaps its lists' shaders
+    /// marked: each goes into its readback buffer and is zeroed for the
+    /// next submission. Its own `ExecuteCommandLists`, so each bitmap is
+    /// back in the common state (buffers decay there after a call).
+    fn read_marks(&self, marks: &[MarkBits]) -> Option<ID3D12CommandList> {
+        /// Bytes of zeros the bitmaps are cleared from, at most per copy.
+        const ZEROS: u64 = 1 << 19;
+        struct Tail(ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Resource);
+        // SAFETY: used only in `execute`, one submission at a time.
+        unsafe impl Send for Tail {}
+        // SAFETY: as above.
+        unsafe impl Sync for Tail {}
+        static TAIL: OnceLock<Option<Tail>> = OnceLock::new();
+        let made = TAIL.get_or_init(|| {
+            let zeros = self.mark_bits(ZEROS)?.gpu;
+            // SAFETY: plain object creation.
+            unsafe {
+                let allocator: ID3D12CommandAllocator =
+                    self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                let list: ID3D12GraphicsCommandList = self
+                    .device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .ok()?;
+                list.Close().ok()?;
+                name(&list, || "written-pages readback".into());
+                Some(Tail(allocator, list, zeros))
+            }
+        });
+        let Some(Tail(allocator, list, zeros)) = made else {
+            fail(format_args!("no list to read written-pages bitmaps back"));
+        };
+        let each = |before, after| -> Vec<D3D12_RESOURCE_BARRIER> {
+            marks.iter().map(|m| transition(&m.gpu, before, after)).collect()
+        };
+        // SAFETY: the list is not executing (every submission is waited
+        // for); the bitmaps, their readback buffers and the zeros are live.
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                list.Reset(allocator, None)?;
+                let mut first = each(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                first.push(transition(zeros, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                list.ResourceBarrier(&first);
+                for m in marks {
+                    list.CopyBufferRegion(&m.readback, 0, &m.gpu, 0, m.bytes);
+                }
+                list.ResourceBarrier(&each(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST));
+                for m in marks {
+                    for at in (0..m.bytes).step_by(ZEROS as usize) {
+                        list.CopyBufferRegion(&m.gpu, at, zeros, 0, (m.bytes - at).min(ZEROS));
+                    }
+                }
+                let mut last = each(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                last.push(transition(zeros, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON));
+                list.ResourceBarrier(&last);
+                list.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("the written-pages readback did not record ({e})"));
+        }
+        list.cast().ok()
+    }
+}
+
+/// A written-pages bitmap that shaders mark with atomics on hot dwords,
+/// kept in video memory: from system memory each mark crossed PCIe (85x a
+/// mark in video memory on a GTX 1070). `gpu` is what shaders mark;
+/// after each submission of a list that names it ([`HostList::read_marks`])
+/// it is copied into `readback`, mapped at `data`, and zeroed.
+#[derive(Clone)]
+pub(crate) struct MarkBits {
+    pub(crate) gpu: ID3D12Resource,
+    readback: ID3D12Resource,
+    /// The readback buffer's mapping: the marks of the last submission
+    /// that copied them; the host clears what it reads.
+    pub(crate) data: usize,
+    bytes: u64,
 }
 
 /// Host resources that view heap slots stopped viewing while a submission

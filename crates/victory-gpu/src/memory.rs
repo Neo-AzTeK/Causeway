@@ -22,7 +22,8 @@
 //! Cost per submission with such a list: one change check of every host
 //! copy (the refresh), copies of the pages the title wrote, a compare of
 //! each 64 KiB page shaders wrote, and the table's rewrite when copies came
-//! or went (two views per new copy); per list a bitmap of 256 KiB.
+//! or went (two views per new copy); per list a bitmap of 256 KiB in video
+//! memory and its readback buffer, copied and zeroed by the GPU.
 //!
 //! Memory no copy holds reads 0 and takes no writes (null views,
 //! bounds-checked); shaders mark such pages (or 256 MiB regions with no
@@ -376,18 +377,18 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     })
     .flatten()?;
     let bits = (CAPACITY + 1) * BLOCK;
-    let (bitmap, data) = crate::host::host()?.shared_buffer((bits / 8).next_multiple_of(256) as u64)?;
-    crate::host::name(&bitmap, || "title memory written pages".into());
+    // In video memory, its marks read back after each submission of the
+    // list (before the work below), which the list keeps.
+    let bitmap = crate::host::host()?.mark_bits((bits / 8).next_multiple_of(256) as u64)?;
+    crate::host::name(&bitmap.gpu, || "title memory written pages".into());
     let words = bits / 32;
-    // SAFETY: our mapped buffer of at least `words` dwords.
-    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
     // SAFETY: a live buffer.
-    let dirty = unsafe { bitmap.GetGPUVirtualAddress() };
-    list.keep(&bitmap);
+    let dirty = unsafe { bitmap.gpu.GetGPUVirtualAddress() };
+    list.read_marks(&bitmap);
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
-    let data = data as usize;
+    let data = bitmap.data;
     list.defer_missed(move || {
         let l = layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
