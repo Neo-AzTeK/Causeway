@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// The census translates as for a device with TiledResources tier 2 or
+/// better (the host queries it, `Host::min_lod_clamp`).
+// shortcut: the census has no device; a tier 1 adapter refuses more.
+const MIN_LOD_CLAMP: bool = true;
+
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
@@ -369,7 +374,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 }
                                 let one = std::time::Instant::now();
                                 let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container);
+                                    victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP);
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {
@@ -568,7 +573,7 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options { view_marks: true, ..Default::default() };
+                    let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
