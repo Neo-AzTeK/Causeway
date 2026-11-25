@@ -10,7 +10,7 @@ use super::container::SigElement;
 use super::shader::{MESH_ELEMENT_BYTES, Shader};
 use crate::ShaderError;
 use crate::dxbc::{Container, FourCC};
-use crate::native::HwStage;
+use crate::native::{HwStage, StageIo};
 
 /// The vertex shader for a mesh program made as compute, and the bytes
 /// per vertex in the scratch vertices it reads.
@@ -19,6 +19,27 @@ pub struct MeshVertexShader {
     /// Reads `t0` in [`super::MESH_SPACE`] (a raw root SRV), nothing else.
     pub shader: HostShader,
     pub stride: u32,
+}
+
+/// The vertex and primitive slots per group of the mesh program of the
+/// console container `container`: its declared maxima.
+pub fn mesh_limits(container: &[u8]) -> Result<(u32, u32), ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let Some(StageIo::Ms(ms)) = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .map(|p| p.io)
+    else {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without a mesh program",
+        });
+    };
+    Ok((ms.max_vertices, ms.max_primitives))
 }
 
 /// The vertex shader for the mesh program of the console container

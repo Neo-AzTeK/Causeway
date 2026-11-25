@@ -208,7 +208,12 @@
 //!   vertex shader [`mesh_vertex_shader`] makes, which reads vertex
 //!   `SV_VertexID` from the raw root SRV `t0` in [`MESH_SPACE`] and outputs
 //!   the mesh program's signature, so its pixel shader links unchanged.
-//!   Per-primitive outputs are refused (the title's programs have none).
+//!   A dispatch may run part of the title's groups (the host splits
+//!   dispatches larger than its scratch): the group number the program
+//!   sees is its group id plus dword 0 of the raw root SRV `t1` in
+//!   [`MESH_SPACE`]; the scratch addresses count from the dispatch's
+//!   first group. Per-primitive outputs are refused (the title's programs
+//!   have none).
 
 mod bitcode;
 #[cfg(all(test, windows))]
@@ -231,7 +236,7 @@ pub use flat::{FLAT_COLOUR, flat_pixel_shader};
 mod rect;
 pub use rect::rectangle_gs;
 mod mesh_vs;
-pub use mesh_vs::{MeshVertexShader, mesh_vertex_shader};
+pub use mesh_vs::{MeshVertexShader, mesh_limits, mesh_vertex_shader};
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
@@ -1048,7 +1053,7 @@ mod tests {
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
     fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
-        triangle_mesh_with(prim, false, Options::default()).map(|m| m.1)
+        triangle_mesh_with(prim, false, false, Options::default()).map(|m| m.1)
     }
 
     /// [`triangle_mesh`] of one wave of 32 or 64 lanes, made as `options`
@@ -1056,10 +1061,21 @@ mod tests {
     fn triangle_mesh_with(
         prim: u32,
         wave64: bool,
+        group_z: bool,
         options: Options,
     ) -> Result<(Vec<u8>, HostShader), ShaderError> {
         let lanes = if wave64 { 64 } else { 32 };
-        let words = [
+        // The position's z is the group number (as the console passes it in
+        // v5, times the group's lanes) instead of 0.5 when `group_z`.
+        let mut words: Vec<u32> = if group_z {
+            vec![
+                0x7E00_0505, // v_readfirstlane_b32 s0, v5
+                0x7E0C_0C00, // v_cvt_f32_u32 v6, s0
+            ]
+        } else {
+            vec![0x7E0C_02F0] // v_mov_b32 v6, 0.5
+        };
+        words.extend([
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
             0x3604_0281, // v_and_b32 v2, 1, v1
@@ -1070,7 +1086,6 @@ mod tests {
             0x0608_08F3, // v_add_f32 v4, -1.0, v4
             0x100A_06F4, // v_mul_f32 v5, 2.0, v3
             0x060A_0AF3, // v_add_f32 v5, -1.0, v5
-            0x7E0C_02F0, // v_mov_b32 v6, 0.5
             0x7E0E_02F2, // v_mov_b32 v7, 1.0
             0x7E12_02FF, // v_mov_b32 v9, prim
             prim,
@@ -1079,7 +1094,7 @@ mod tests {
             0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
             0x0706_0504,
             0xBF81_0000, // s_endpgm
-        ];
+        ]);
         let native = NativeProgram {
             stage: HwStage::Ms,
             wave64,
@@ -1150,13 +1165,16 @@ mod tests {
                 let lanes = if wave64 { 64u32 } else { 32 };
                 for (prim, culled) in [(TRIANGLE, false), (TRIANGLE | EDGE_FLAGS | CULL, true)] {
                     let what = format!("{label}, wave64 {wave64}, {prim:#x}");
-                    let (console, cs) = triangle_mesh_with(prim, wave64, options)
+                    let (console, cs) = triangle_mesh_with(prim, wave64, false, options)
                         .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    // The same with the group number as z, for the readback.
+                    let (_, cs_z) = triangle_mesh_with(prim, wave64, true, options)
+                        .unwrap_or_else(|e| panic!("{what}: group z: {e}"));
                     let vs = mesh_vertex_shader(&console).unwrap();
                     assert_eq!(vs.stride, MESH_ELEMENT_BYTES, "{what}");
                     let path = super::validator::Validator::default_path();
                     if let Ok(mut v) = super::validator::Validator::load(path.as_deref()) {
-                        for d in [&cs.dxil, &vs.shader.dxil] {
+                        for d in [&cs.dxil, &cs_z.dxil, &vs.shader.dxil] {
                             v.validate(&mut d.clone()).unwrap_or_else(|e| panic!("{what}: {e}"));
                         }
                     }
@@ -1166,14 +1184,15 @@ mod tests {
                     assert_eq!(crate::dxbc::u32_at(dxil, 0).unwrap() >> 16, 5, "{what}");
                     let root = host
                         .root_signature_with(
-                            &[(&cs, D3D12_SHADER_VISIBILITY_ALL)],
-                            &[(0, MESH_SPACE, 2), (1, MESH_SPACE, 2)],
+                            &[(&cs_z, D3D12_SHADER_VISIBILITY_ALL)],
+                            &[(0, MESH_SPACE, 2), (1, MESH_SPACE, 2), (1, MESH_SPACE, 1)],
                         )
                         .unwrap();
                     let pso = host
-                        .compute_pipeline_with(&root, &cs.dxil)
+                        .compute_pipeline_with(&root, &cs_z.dxil)
                         .unwrap_or_else(|e| panic!("{what}: compute pipeline: {e}"));
-                    let groups = 3;
+                    // The dispatch runs the title's groups 5 to 7.
+                    let (groups, base) = (3, 5);
                     let out = host
                         .dispatch(
                             &root,
@@ -1183,6 +1202,7 @@ mod tests {
                                     (0, Root::Constants(vec![0])),
                                     (1, Root::Uav(groups * lanes * 4)),
                                     (2, Root::Uav(groups * lanes * 3)),
+                                    (3, Root::View { srv: true, data: vec![base] }),
                                 ],
                                 views: &[],
                                 samplers: &[],
@@ -1199,7 +1219,7 @@ mod tests {
                         let want = [
                             4.0 * (lane & 1) as f32 - 1.0,
                             2.0 * (lane & 2) as f32 - 1.0,
-                            0.5,
+                            ((base + v / lanes) * lanes) as f32,
                             1.0,
                         ];
                         let at = v as usize * 4;
@@ -1215,7 +1235,37 @@ mod tests {
                     if culled {
                         continue;
                     }
-                    // The first triangle's corners, drawn by the vertex shader.
+                    // The first triangle's corners, drawn by the vertex shader
+                    // from what the program without group z writes.
+                    let vertices: Vec<u32> = (0..3u32)
+                        .flat_map(|l| [4.0 * (l & 1) as f32 - 1.0, 2.0 * (l & 2) as f32 - 1.0, 0.5, 1.0])
+                        .map(f32::to_bits)
+                        .collect();
+                    let root = host
+                        .root_signature_with(
+                            &[(&cs, D3D12_SHADER_VISIBILITY_ALL)],
+                            &[(0, MESH_SPACE, 2), (1, MESH_SPACE, 2), (1, MESH_SPACE, 1)],
+                        )
+                        .unwrap();
+                    let pso = host.compute_pipeline_with(&root, &cs.dxil).unwrap();
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(vec![0])),
+                                    (1, Root::Uav(lanes * 4)),
+                                    (2, Root::Uav(lanes * 3)),
+                                    (3, Root::View { srv: true, data: vec![0] }),
+                                ],
+                                views: &[],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{what}: dispatch: {e}"));
+                    assert_eq!(out[0][..12], vertices[..], "{what}: first triangle");
                     let vroot = host
                         .root_signature_with(&[(&vs.shader, D3D12_SHADER_VISIBILITY_VERTEX)], &[(0, MESH_SPACE, 1)])
                         .unwrap();
@@ -1229,7 +1279,7 @@ mod tests {
                             &Draw {
                                 roots: vec![
                                     (0, Root::Constants(vec![0])),
-                                    (1, Root::View { srv: true, data: vertices.clone() }),
+                                    (1, Root::View { srv: true, data: out[0].clone() }),
                                 ],
                                 textures: &[],
                                 samplers: &[],

@@ -1588,8 +1588,23 @@ impl<'a> Lower<'a> {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
                 };
+                let e = self.s.entry;
+                // Made as compute, a dispatch may run part of the title's
+                // groups: the first one's number is dword 0 of `t1` in
+                // MESH_SPACE (`emit`, "Mesh shaders as compute").
+                let g = if self.s.mesh_compute {
+                    let h = self.s.mesh_base_handle();
+                    let (z, u, mask, al) = (self.s.m.i32(0), self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+                    let res_ret = self.s.t.res_ret;
+                    let r = self.s.op(e, "rawBufferLoad.f32", Attr::ReadOnly, res_ret, 139, &[h, z, u, mask, al]);
+                    let f = self.s.m.extract(e, r, 0);
+                    let base = self.s.m.cast(e, Cast::Bitcast, f, self.s.t.i32);
+                    self.s.m.bin(e, Bin::Add, g, base)
+                } else {
+                    g
+                };
                 let n = self.s.m.i32(self.x.mesh_stride);
-                return Val::I32(self.s.m.bin(self.s.entry, Bin::Mul, g, n));
+                return Val::I32(self.s.m.bin(e, Bin::Mul, g, n));
             }
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the

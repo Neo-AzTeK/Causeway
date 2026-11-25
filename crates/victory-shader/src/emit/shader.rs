@@ -45,8 +45,9 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// the last bit.
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// Where a mesh program run as compute (`emit`, "Mesh shaders as compute")
-/// writes its vertices (`u0`, raw root UAV) and triangles (`u1`), and where
-/// the vertex shader made for it reads the vertices (`t0`, raw root SRV).
+/// writes its vertices (`u0`, raw root UAV) and triangles (`u1`) and reads
+/// its first group's number (`t1`, raw root SRV), and where the vertex
+/// shader made for it reads the vertices (`t0`, raw root SRV).
 pub const MESH_SPACE: u32 = 3;
 /// Bytes per output element of a vertex in the mesh scratch buffer.
 pub const MESH_ELEMENT_BYTES: u32 = 16;
@@ -103,6 +104,8 @@ pub(crate) struct Shader {
     pub mesh_scratch: Option<(V, V)>,
     /// The scratch vertices' handle in the vertex shader reading them.
     pub mesh_vertices: Option<V>,
+    /// The handle of the dispatch's first group number (made as compute).
+    pub mesh_base: Option<V>,
     /// A geometry shader taking triangles and emitting triangle strips of
     /// at most this many vertices (`rect`).
     pub gs: Option<u32>,
@@ -196,6 +199,7 @@ impl Shader {
             mesh_compute: false,
             mesh_scratch: None,
             mesh_vertices: None,
+            mesh_base: None,
             gs: None,
             user_data: 0,
             samplers: 0,
@@ -445,6 +449,17 @@ impl Shader {
         }
         let h = self.space_handle(MESH_SPACE, 0, false);
         self.mesh_vertices = Some(h);
+        h
+    }
+
+    /// The handle of the dispatch's first group number (`t1` in
+    /// [`MESH_SPACE`], dword 0), made in the entry block.
+    pub fn mesh_base_handle(&mut self) -> V {
+        if let Some(h) = self.mesh_base {
+            return h;
+        }
+        let h = self.space_handle(MESH_SPACE, 1, false);
+        self.mesh_base = Some(h);
         h
     }
 
@@ -716,6 +731,7 @@ impl Shader {
             || self.view_writes.is_some()
             || self.mesh_scratch.is_some()
             || self.mesh_vertices.is_some()
+            || self.mesh_base.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -775,6 +791,7 @@ impl Shader {
                 || self.view_addresses.is_some()
                 || self.view_marks.is_some()
                 || self.mesh_vertices.is_some()
+                || self.mesh_base.is_some()
             {
                 let ty = self
                     .m
@@ -790,6 +807,7 @@ impl Shader {
                     .chain(self.view_addresses.map(|_| (MEMORY_SPACE, 1)))
                     .chain(self.view_marks.map(|_| (MEMORY_SPACE, VIEW_MARKS)))
                     .chain(self.mesh_vertices.map(|_| (MESH_SPACE, 0)))
+                    .chain(self.mesh_base.map(|_| (MESH_SPACE, 1)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
