@@ -115,7 +115,8 @@ Answer each in the commit message or the review:
 ## Who may ask the device
 
 Only `caps/`. `cargo xtask policy` (`xtask/src/capability.rs`) rejects a
-`CheckFeatureSupport` or `CheckInterfaceSupport` anywhere else under `crates/`:
+`CheckFeatureSupport` or `CheckInterfaceSupport` in any other Rust file (the
+checker's own, under `xtask/`, aside):
 
 | Kind of question | Where it goes |
 |------------------|---------------|

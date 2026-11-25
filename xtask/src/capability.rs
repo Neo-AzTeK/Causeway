@@ -2,11 +2,14 @@
 //! as part of `cargo xtask policy`: only `victory-gpu/src/caps/` asks the
 //! host GPU what it can do. Elsewhere, code reads `Caps` or a planner.
 //!
-//! shortcut: the query calls are found by name in the text of `crates/`, so a
+//! shortcut: the query calls are found by name in the source text, so a
 //! macro that builds the name would pass.
 
 /// The calls that ask a device or adapter what it supports.
 const QUERY_CALLS: [&str; 2] = ["CheckFeatureSupport", "CheckInterfaceSupport"];
+
+/// This tool names the calls and talks to no GPU.
+const CHECKER_DIR: &str = "xtask/";
 
 /// Where those calls belong.
 const CAPS_DIR: &str = "crates/victory-gpu/src/caps/";
@@ -26,20 +29,23 @@ pub const OTHER_OWNER: &[(&str, usize)] = &[("crates/victory-gpu/src/descriptor/
 const FIX: &str = "read a `Caps` field or a planner; for one format use \
                    `caps::per_resource` (docs/hardware-range.md)";
 
+const TEST_HOST_FIX: &str = "in the test host, put `// test-host-query: why` above \
+                             the call (docs/hardware-range.md)";
+
 /// What is wrong in `sources`, the repository's Rust files as (path, text),
 /// with `other_owner` calls left in files this check may not change.
 pub fn check(sources: &[(String, String)], other_owner: &[(&str, usize)]) -> Vec<String> {
     let mut problems = Vec::new();
     for (path, text) in sources {
-        if !path.starts_with("crates/") || path.starts_with(CAPS_DIR) {
+        if path.starts_with(CHECKER_DIR) || path.starts_with(CAPS_DIR) {
             continue;
         }
         let unmarked = unmarked(path, text, &mut problems);
-        match other_owner.iter().find(|(p, _)| p == path) {
-            Some(_) => {}
-            None => problems.extend(unmarked.iter().map(|line| {
-                format!("{path}:{line}: the host GPU is asked outside `caps/`: {FIX}")
-            })),
+        if other_owner.iter().all(|(p, _)| p != path) {
+            let fix = if path.starts_with(TEST_HOST_DIR) { TEST_HOST_FIX } else { FIX };
+            problems.extend(unmarked.iter().map(|line| {
+                format!("{path}:{line}: the host GPU is asked outside `caps/`: {fix}")
+            }));
         }
     }
     for &(path, allowed) in other_owner {
@@ -132,11 +138,21 @@ mod tests {
     }
 
     #[test]
-    fn caps_comments_and_code_outside_the_crates_may_name_queries() {
+    fn the_test_host_is_told_about_its_marker() {
+        let found = run(&host_file(), &call());
+        assert!(found[0].contains(TEST_HOST_MARKER), "{}", found[0]);
+        assert!(!run(GPU, &call())[0].contains(TEST_HOST_MARKER));
+    }
+
+    #[test]
+    fn caps_comments_and_this_tool_may_name_queries() {
         assert!(run(&format!("{CAPS_DIR}probe.rs"), &call()).is_empty());
         assert!(run(GPU, &format!("/// `{}` is asked once.\n", QUERY_CALLS[0])).is_empty());
         assert!(run(GPU, &format!("f(); // not {}\n", QUERY_CALLS[0])).is_empty());
         assert!(run("xtask/src/x.rs", &call()).is_empty());
+        for path in ["apps/victory/src/x.rs", "tests/fixtures/x/src/lib.rs"] {
+            assert_eq!(run(path, &call()).len(), 1, "{path}");
+        }
     }
 
     #[test]
