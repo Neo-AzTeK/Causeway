@@ -498,6 +498,15 @@ impl Shadow {
         written.map_or(0, |_| n)
     }
 
+    /// Whether [`Shadow::update`] of `[address, address + len)` has anything
+    /// to copy: a page there changed since it was taken, or the memory is not
+    /// tracked (copied whole each time).
+    pub(crate) fn stale(&self, address: usize, len: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        from < to && self.tracked.as_ref().is_none_or(|t| t.any_changed(from, to))
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.

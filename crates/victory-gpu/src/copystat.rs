@@ -123,11 +123,11 @@ pub(crate) enum C {
     /// copies due again.
     BatchFlushes,
     BatchInvalidations,
-    /// Of the refreshes done, those of bytes all brought up to date earlier
-    /// since the last title write: count, bytes asked, time.
-    Repeats,
-    RepeatBytes,
-    RepeatUs,
+    /// Refreshes skipped (nothing changed in the range), refreshes run, and
+    /// their time in nanoseconds (most take under a microsecond).
+    CleanSkips,
+    Updates,
+    UpdateNs,
     /// Ranges shaders write that updates looked through, and the time
     /// finding those over the range.
     PendingScanned,
@@ -386,12 +386,12 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  snapshots per frame by copy: {}", snapshots.join(", "));
     tracing::info!(
-        "refresh batches per frame: {:.0} flushes, {:.0} invalidations; {:.0} repeats of refreshed bytes          ({:.0} MB, {:.1} ms); {:.0} shader-write ranges scanned in {:.1} ms",
+        "refresh batches per frame: {:.0} flushes, {:.0} invalidations; {:.0} refreshes of unchanged          ranges skipped, {:.0} run in {:.1} ms; {:.0} shader-write ranges scanned in {:.1} ms",
         c[C::BatchFlushes as usize],
         c[C::BatchInvalidations as usize],
-        c[C::Repeats as usize],
-        mb(c[C::RepeatBytes as usize]),
-        ms(c[C::RepeatUs as usize]),
+        c[C::CleanSkips as usize],
+        c[C::Updates as usize],
+        c[C::UpdateNs as usize] / 1e6,
         c[C::PendingScanned as usize],
         ms(c[C::PendingUs as usize]),
     );
