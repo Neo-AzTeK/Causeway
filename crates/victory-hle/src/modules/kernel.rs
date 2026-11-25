@@ -281,7 +281,10 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
             type Filter = extern "system" fn(*const c_void) -> i32;
             // SAFETY: the title registered this filter.
             let filter: Filter = unsafe { std::mem::transmute(filter) };
-            filter(info)
+            let answer = filter(info);
+            // invariant(a_crash_log_has_what_the_titles_filter_said): after it ran
+            host::log_after_title_filter();
+            answer
         }
     }
 }
@@ -518,6 +521,10 @@ mod host {
         victory_loader::note_title_output(line);
     }
 
+    pub(super) fn log_after_title_filter() {
+        victory_loader::log_after_title_filter();
+    }
+
     /// Our caller's callers, as `module+rva`.
     pub(super) fn callers() -> String {
         let mut frames = [std::ptr::null_mut(); 12];
@@ -598,6 +605,8 @@ mod host {
 
     pub(super) fn note_title_output(_: &str) {}
 
+    pub(super) fn log_after_title_filter() {}
+
     pub(super) fn callers() -> String {
         String::new()
     }
@@ -668,6 +677,44 @@ mod tests {
         assert_eq!(last_error(), 0);
         assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 17), 17);
         assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
+    }
+
+    /// A title's filter says why it crashed, or where it saved its report,
+    /// after our report is written.
+    #[cfg(windows)]
+    #[test]
+    fn a_crash_log_has_what_the_titles_filter_said() {
+        use windows_sys::Win32::Foundation::EXCEPTION_BREAKPOINT;
+        use windows_sys::Win32::System::Diagnostics::Debug::RaiseException;
+        const LOG: &str = "VICTORY_TEST_FILTER_LOG";
+        extern "system" fn title_filter(_: *const c_void) -> i32 {
+            OutputDebugStringA(c"saved the title report".as_ptr().cast());
+            1 // EXCEPTION_EXECUTE_HANDLER: the process ends
+        }
+        if let Some(log) = std::env::var_os(LOG) {
+            victory_loader::log_crashes_to(log.into());
+            SetUnhandledExceptionFilter(title_filter as *const () as usize);
+            // A thread of its own: the test harness catches nothing here.
+            // SAFETY: nobody handles it, so it reaches the filter.
+            unsafe { RaiseException(EXCEPTION_BREAKPOINT as u32, 0, 0, std::ptr::null()) };
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("crashes.log");
+        let name = "modules::kernel::tests::a_crash_log_has_what_the_titles_filter_said";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env(LOG, &log)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "the breakpoint ends the process");
+        let report = std::fs::read_to_string(&log).unwrap();
+        let (ours, after) = report
+            .split_once("VIctory: after the title's crash filter")
+            .unwrap_or_else(|| panic!("no entry after the filter: {report}"));
+        assert!(ours.contains("unhandled exception 0x80000003"), "{ours}");
+        assert!(!ours.contains("saved the title report"), "{ours}");
+        assert!(after.contains("  title said: saved the title report"), "{after}");
     }
 
     fn w(text: &str) -> Vec<u16> {

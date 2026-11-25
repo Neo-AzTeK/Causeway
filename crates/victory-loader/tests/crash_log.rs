@@ -63,3 +63,58 @@ fn first_chance_breakpoint_logging() {
         }
     }
 }
+
+const TEST_ENTRIES: &str = "VICTORY_TEST_CRASH_ENTRIES";
+
+/// Several threads fault at once when a title stops itself, and each must
+/// leave its own entry.
+#[test]
+fn concurrent_entries_do_not_interleave() {
+    const THREADS: usize = 16;
+    const EACH: usize = 50;
+    if let Some(log) = std::env::var_os(TEST_ENTRIES) {
+        victory_loader::log_crashes_to(PathBuf::from(log));
+        let start = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let start = &start;
+                s.spawn(move || {
+                    start.wait();
+                    for i in 0..EACH {
+                        victory_loader::log_crash(&format!("entry {t} {i} end"));
+                    }
+                });
+            }
+        });
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("crashes.log");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "concurrent_entries_do_not_interleave"])
+        .env(TEST_ENTRIES, &log)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output.status);
+    let report = std::fs::read_to_string(&log).unwrap();
+    let mut lines = report.lines();
+    let mut entries = 0;
+    while let Some(header) = lines.next() {
+        let whole = header.starts_with("unix time ")
+            && header.matches("unix time").count() == 1
+            && header.matches(", process ").count() == 1;
+        assert!(whole, "header: {header:?}");
+        let body = lines.next().unwrap_or_default();
+        assert!(
+            body.starts_with("entry ") && body.ends_with(" end"),
+            "after {header:?}: {body:?}"
+        );
+        // The host line, then the blank line that ends the entry.
+        let host = lines.next().unwrap_or_default();
+        assert!(host.starts_with("  host: "), "{host:?}");
+        assert_eq!(lines.next(), Some(""));
+        entries += 1;
+    }
+    assert_eq!(entries, THREADS * EACH);
+}

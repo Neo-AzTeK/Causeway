@@ -85,8 +85,23 @@ fn append_to_log(text: &str) {
         .map_or(0, |d| d.as_secs());
     let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
     if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+        // One write call per entry: threads that fault together each add
+        // one, and `write!` on a file makes a call per piece.
+        // invariant(concurrent_entries_do_not_interleave): entries stay whole
+        let entry = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+        let _ = f.write_all(entry.as_bytes());
     }
+}
+
+/// For an unhandled-exception filter, after the title's own filter returned:
+/// logs the title's latest debug output again. What it says while handling
+/// the crash (the reason, or where it saved its own report) comes after our
+/// report.
+pub fn log_after_title_filter() {
+    append_to_log(&format!(
+        "VIctory: after the title's crash filter\n{}",
+        title_output()
+    ));
 }
 
 /// The title's last lines of debug output, kept for crash reports.
@@ -676,6 +691,12 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
+    // A title that stops itself (`int3`) has often just tested what its
+    // registers point at: an object's counts and sizes say which check failed.
+    #[cfg(feature = "diagnostics")]
+    if to_file && code == EXCEPTION_BREAKPOINT {
+        register_memory(context).into_iter().for_each(&mut line);
+    }
     if to_file {
         let end = report_end();
         eprint!("{end}");
@@ -692,6 +713,52 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
             file.display()
         );
     }
+}
+
+/// A line for each register pointing at readable data: its first eight
+/// quadwords. Image pages (code, constants, globals) are left out.
+#[cfg(any(feature = "diagnostics", test))]
+fn register_memory(c: &CONTEXT) -> Vec<String> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let registers = [
+        ("rax", c.Rax),
+        ("rbx", c.Rbx),
+        ("rcx", c.Rcx),
+        ("rdx", c.Rdx),
+        ("rsi", c.Rsi),
+        ("rdi", c.Rdi),
+        ("rbp", c.Rbp),
+        ("r8", c.R8),
+        ("r9", c.R9),
+        ("r10", c.R10),
+        ("r11", c.R11),
+        ("r12", c.R12),
+        ("r13", c.R13),
+        ("r14", c.R14),
+        ("r15", c.R15),
+    ];
+    let line = |(name, at): (&str, u64)| {
+        let mut words = [0u64; 8];
+        let mut read = 0;
+        // SAFETY: fails, rather than faults, where `at` is not readable;
+        // writes at most `words`' size into it.
+        let ok = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                at as *const _,
+                words.as_mut_ptr().cast(),
+                size_of_val(&words),
+                &mut read,
+            )
+        };
+        if ok == 0 || module_of(at as usize).is_some() {
+            return None;
+        }
+        let words: Vec<_> = words.iter().map(|w| format!("{w:#x}")).collect();
+        Some(format!("  [{name}] {}", words.join(" ")))
+    };
+    registers.into_iter().filter_map(line).collect()
 }
 
 /// Return addresses of the faulting thread's frames, from the faulting
@@ -941,6 +1008,22 @@ mod tests {
         let captured = capture_frames();
         std::hint::black_box(&captured);
         captured
+    }
+
+    #[test]
+    fn register_memory_shows_what_registers_point_at() {
+        let data: [u64; 8] = [0x1111, 2, 3, 4, 5, 6, 7, 0x8888];
+        // SAFETY: a zeroed CONTEXT is valid.
+        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        context.Rcx = std::hint::black_box(&data).as_ptr() as u64;
+        context.Rdx = 0x10; // nothing there
+        context.R8 = u64::MAX; // outside the address space
+        context.R9 = register_memory_shows_what_registers_point_at as *const () as u64;
+        assert_eq!(
+            register_memory(&context),
+            ["  [rcx] 0x1111 0x2 0x3 0x4 0x5 0x6 0x7 0x8888"]
+        );
+        std::hint::black_box(&data);
     }
 
     #[test]
