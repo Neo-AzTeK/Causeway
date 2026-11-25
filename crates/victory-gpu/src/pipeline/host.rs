@@ -670,7 +670,12 @@ impl HostPipeline {
             // Refuse before creating: the host answers a wave size it lacks
             // with E_INVALIDARG, which says nothing.
             if let Some(wave) = wave_refusal(&host.caps, &code_bytes(&code(0))) {
-                tracing::warn!(?shaders, %wave, "host pipeline refused: wave size");
+                // What stops it running as two waves of 32.
+                let why = stages
+                    .first()
+                    .and_then(|(s, _)| s.translated())
+                    .and_then(|t| t.host.wave64_why.as_deref());
+                tracing::warn!(?shaders, %wave, why, "host pipeline refused: wave size");
                 return None;
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {

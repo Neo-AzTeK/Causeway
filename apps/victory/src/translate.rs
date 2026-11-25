@@ -75,6 +75,8 @@ struct Tally {
     /// Emitted compute programs written for waves of 64 that ask for no more
     /// than 32 lanes: run as two halves where `halves` allows.
     cs_halves: usize,
+    /// Why the `cs_wave64` ones ask for waves of 64.
+    wave64_why: BTreeMap<String, usize>,
     /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
@@ -139,6 +141,9 @@ impl Tally {
         self.cs_pipelines += other.cs_pipelines;
         self.cs_wave64 += other.cs_wave64;
         self.cs_halves += other.cs_halves;
+        for (k, n) in other.wave64_why {
+            *self.wave64_why.entry(k).or_default() += n;
+        }
         self.ms_programs += other.ms_programs;
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
@@ -299,6 +304,9 @@ pub fn run(
         "             {} compute programs require waves of 64 (refused by hosts with waves of 32)",
         t.cs_wave64
     );
+    for (why, n) in &t.wave64_why {
+        println!("               {n}: {why}");
+    }
     println!(
         "             {} wave64 compute programs run on waves of 32 (two halves or fewer lanes)",
         t.cs_halves
@@ -600,6 +608,13 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
+                    // The container's hash as the GPU side logs it.
+                    let size = bytes
+                        .get(24..28)
+                        .and_then(|b| b.try_into().ok())
+                        .map_or(0, u32::from_le_bytes) as usize;
+                    let hash = blake3::hash(bytes.get(..size).unwrap_or(&bytes)).to_hex()[..16]
+                        .to_owned();
                     let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP, mesh_as_compute: false };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
@@ -610,6 +625,16 @@ fn translate(
                                     .is_none_or(|(least, _)| least <= 32)
                             {
                                 t.cs_halves += 1;
+                            }
+                            if shader.stage == HwStage::Cs
+                                && emit::required_waves(&shader.dxil)
+                                    .is_some_and(|(least, _)| least > 32)
+                            {
+                                let why = shader.wave64_why.clone().unwrap_or("unnamed".into());
+                                if t.list {
+                                    t.lines.push(format!("{}  wave64 {hash}: {why}", label()));
+                                }
+                                *t.wave64_why.entry(why).or_default() += 1;
                             }
                             check(shader, t, checks, label);
                         }

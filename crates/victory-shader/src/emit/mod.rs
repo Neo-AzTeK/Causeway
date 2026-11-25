@@ -361,6 +361,9 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Why a compute program asks the host for waves of 64: what stops it
+    /// running as two halves (`emit/halves.rs`). For logs and the census.
+    pub wave64_why: Option<String>,
 }
 
 impl HostShader {
@@ -479,7 +482,7 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
-    let first = emit_once(c, native, p, st, io, res, options);
+    let mut first = emit_once(c, native, p, st, io, res, options);
     let needs64 = |s: &HostShader| {
         s.stage == HwStage::Cs && required_waves(&s.dxil).is_some_and(|(least, _)| least > 32)
     };
@@ -494,10 +497,15 @@ pub fn emit_with(
                 let io = io::raise(&p, &alt)?;
                 emit_once(c, &alt, &p, &st?, &io, &res, options)
             };
-            if let Ok(s) = again()
-                && !needs64(&s)
-            {
-                return Ok(s);
+            match again() {
+                Ok(s) if !needs64(&s) => return Ok(s),
+                // This attempt decides the refusal: its reason is the one.
+                Ok(s) => {
+                    if let Ok(first) = &mut first {
+                        first.wave64_why = s.wave64_why;
+                    }
+                }
+                Err(_) => {}
             }
         }
     }
@@ -618,6 +626,7 @@ fn emit_once(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        wave64_why: l.wave64_why.map(str::to_owned),
     })
 }
 
@@ -991,6 +1000,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            wave64_why: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1008,6 +1018,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                wave64_why: None,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

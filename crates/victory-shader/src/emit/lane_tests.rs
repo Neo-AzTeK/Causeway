@@ -598,6 +598,47 @@ fn a_wave64_sum_runs_on_two_waves_of_32() {
 }
 
 #[test]
+fn a_wave64_16_bit_sum_runs_on_two_waves_of_32() {
+    // Lane l holds 1.0 (f16) in its low half and l in its high half. The sum
+    // starts at lane `hi`'s value, so the result keeps that lane's high half:
+    // one in the upper host wave, one in the lower.
+    for hi in [40u32, 5] {
+        let mut body = vec![
+            0x3404_0090, // v_lshlrev_b32 v2, 16, v0
+            0x3804_04FF,
+            0x0000_3C00, // v_or_b32 v2, 0x3c00, v2
+            0xBE96_25C1, // s_or_saveexec_b64 s[22:23], -1
+            0xD501_0001,
+            0x005A_0480, // v_cndmask_b32 v1, 0, v2, s[22:23]
+            0xD760_0004,
+            0x101 | (128 + hi) << 9, // v_readlane_b32 s4, v1, hi
+            0x7E10_0204,             // v_mov_b32 v8, s4
+        ];
+        for k in (0..64).filter(|&k| k != hi) {
+            body.extend([
+                0xD760_0004,
+                0x101 | (128 + k) << 9, // v_readlane_b32 s4, v1, k
+                0x6410_1004,            // v_add_f16 v8, s4, v8
+            ]);
+        }
+        body.extend([
+            0xD760_0005,
+            0x0001_0108, // v_readlane_b32 s5, v8, 0
+            0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+            0x7E10_0205, // v_mov_b32 v8, s5
+        ]);
+        assert_eq!(waves_required(&body), Some((32, 32)), "two halves, hi {hi}");
+        // Lanes 48 and up have their EXEC bit clear: they add nothing.
+        for (threads, sum) in [(64, 0x5400), (48, 0x5200)] {
+            if let Some(got) = on_waves_of_32(&body, threads) {
+                let want = hi << 16 | sum;
+                assert_eq!(got, vec![want; threads as usize], "{threads} threads, hi {hi}");
+            }
+        }
+    }
+}
+
+#[test]
 fn wave64_lane_reads_run_on_two_waves_of_32() {
     let lane = [
         0xD765_0001,
