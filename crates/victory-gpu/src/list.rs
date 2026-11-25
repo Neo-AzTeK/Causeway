@@ -916,6 +916,8 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("clear target {:#x} to {color:?}", record.resource as usize));
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -954,6 +956,10 @@ extern "system" fn clear_dsv(
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!("clear depth {:#x} flags {flags} depth {depth} stencil {stencil}", record.resource as usize)
+        });
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
