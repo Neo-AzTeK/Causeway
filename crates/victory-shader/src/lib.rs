@@ -13,6 +13,7 @@ pub mod gfx10;
 pub mod io;
 pub mod ir;
 pub mod native;
+pub mod range;
 pub mod resource;
 pub mod structure;
 
@@ -26,6 +27,8 @@ pub use native::{
 /// Builds with the same one translate alike at the same
 /// [`emit::loop_limit`]; no other run-time setting changes a translation.
 pub const BUILD_HASH: &str = env!("VICTORY_SHADER_BUILD_HASH");
+/// [`BUILD_HASH`] under the name VIctory's shader and pipeline caches use.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
