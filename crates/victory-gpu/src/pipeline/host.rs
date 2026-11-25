@@ -860,13 +860,14 @@ impl HostPipeline {
 }
 
 /// The pixel inputs of `ps` that the outputs of `vs` do not cover (same
-/// semantic, register and components), as `name index rRow mMask`; system
+/// semantic, component type, register and components), as `name index
+/// type T rRow mMask`; system
 /// values the rasteriser makes are left out. Empty if a signature does not
 /// parse.
 fn unlinked(vs: &[u8], ps: &[u8]) -> Vec<String> {
     use victory_shader::{Container, FourCC};
-    /// Name, index, system value, register, mask.
-    type Element = (String, u32, u32, u32, u8);
+    /// Name, index, system value, component type, register, mask.
+    type Element = (String, u32, u32, u32, u32, u8);
     let elements = |c: &[u8], part: FourCC| -> Option<Vec<Element>> {
         let c = Container::parse(c).ok()?;
         let d = c.part(part)?.data;
@@ -876,7 +877,7 @@ fn unlinked(vs: &[u8], ps: &[u8]) -> Vec<String> {
                 let at = word(4)? as usize + 32 * i;
                 let name = d.get(word(at + 4)? as usize..)?.split(|&b| b == 0).next()?;
                 let name = String::from_utf8_lossy(name).into_owned();
-                Some((name, word(at + 8)?, word(at + 12)?, word(at + 20)?, *d.get(at + 24)?))
+                Some((name, word(at + 8)?, word(at + 12)?, word(at + 16)?, word(at + 20)?, *d.get(at + 24)?))
             })
             .collect()
     };
@@ -889,10 +890,10 @@ fn unlinked(vs: &[u8], ps: &[u8]) -> Vec<String> {
         .filter(|i| matches!(i.2, 0..=3))
         .filter(|i| {
             !outs.iter().any(|o| {
-                o.0.eq_ignore_ascii_case(&i.0) && o.1 == i.1 && o.3 == i.3 && o.4 & i.4 == i.4
+                o.0.eq_ignore_ascii_case(&i.0) && o.1 == i.1 && o.3 == i.3 && o.4 == i.4 && o.5 & i.5 == i.5
             })
         })
-        .map(|i| format!("{} {} r{} m{:#x}", i.0, i.1, i.3, i.4))
+        .map(|i| format!("{} {} type {} r{} m{:#x}", i.0, i.1, i.3, i.4, i.5))
         .collect()
 }
 

@@ -666,14 +666,30 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
-                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                            let root = self.roots_ref(compute).get(usize::from(u.slot));
+                            let offset = match root {
                                 Some(&Root::View(address)) => crate::shadow::find(address, 1)
                                     .and_then(|s| u32::try_from(s.offset(address)).ok()),
                                 _ => None,
                             };
                             match offset {
                                 Some(offset) => offset,
-                                None => return false,
+                                None => {
+                                    let why = match root {
+                                        Some(Root::View(_)) => "root view offset: outside title buffers",
+                                        _ => "root view offset: no root view set",
+                                    };
+                                    #[cfg(feature = "diagnostics")]
+                                    {
+                                        static SEEN: AtomicU64 = AtomicU64::new(0);
+                                        if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+                                            let root = root.map(|r| format!("{r:?}"));
+                                            tracing::warn!(slot = u.slot, ?root, compute, mesh_pass = self.mesh_pass, pipeline = %p.name, "{why}: dropped");
+                                        }
+                                    }
+                                    not_run(why);
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
