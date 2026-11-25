@@ -559,7 +559,7 @@ impl State {
                 0 => crate::memory::heap(),
                 h => crate::descriptor::heap(h as This).host(),
             };
-            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes()) else {
+            let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes(list)) else {
                 once!("a shader marking its writes without a view heap: dropped");
                 not_run("write marks without a view heap");
                 return false;

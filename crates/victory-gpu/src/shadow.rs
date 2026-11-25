@@ -692,10 +692,10 @@ impl Marks {
     }
 }
 
-/// The buffer views' written-pages bitmap: the buffer, its mapping (bits
-/// as dwords) and host GPU address.
+/// The buffer views' written-pages bitmap (in video memory), its marks read
+/// back at `data` (bits as dwords), and its host GPU address.
 struct Bitmap {
-    _buffer: ID3D12Resource,
+    bits: crate::host::MarkBits,
     data: usize,
     gpu: u64,
 }
@@ -710,16 +710,13 @@ fn bitmap() -> Option<&'static Bitmap> {
     static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
     BITMAP
         .get_or_init(|| {
-            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
-            let (buffer, data) = host()?.shared_buffer(bytes)?;
-            crate::host::name(&buffer, || "views' written pages".into());
-            // SAFETY: our mapped buffer of `bytes` bytes.
-            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            let bits = host()?.mark_bits(u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8))?;
+            crate::host::name(&bits.gpu, || "views' written pages".into());
             // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let gpu = unsafe { bits.gpu.GetGPUVirtualAddress() };
             Some(Bitmap {
-                _buffer: buffer,
-                data: data as usize,
+                data: bits.data,
+                bits,
                 gpu,
             })
         })
@@ -727,9 +724,12 @@ fn bitmap() -> Option<&'static Bitmap> {
 }
 
 /// The host GPU address of the buffer views' written-pages bitmap, for the
-/// root UAV of shaders that mark their writes.
-pub(crate) fn view_writes() -> Option<u64> {
-    bitmap().map(|b| b.gpu)
+/// root UAV of shaders of `list` that mark their writes: it is read back
+/// after the list's submissions.
+pub(crate) fn view_writes(list: &crate::host::HostList) -> Option<u64> {
+    let b = bitmap()?;
+    list.read_marks(&b.bits);
+    Some(b.gpu)
 }
 
 /// After a submission: every page its shaders marked as written through
