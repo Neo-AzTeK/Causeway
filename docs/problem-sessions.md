@@ -131,12 +131,21 @@ cargo xtask alone -- cargo test -q -p victory-gpu --locked
 ```
 
 When it refuses, wait for the other run and try again later. A plain
-`cargo test` or build still starts during a run: before one, check that this
-prints nothing (it needs no cargo):
+`cargo test` or build still starts during a run: before one, or before an
+offline scan, check that no title is running. This must print nothing (it needs
+no cargo):
 
 ```powershell
-Get-Process victory -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='victory.exe'" | Where-Object CommandLine -notmatch '^("[^"]*"|[^"\s]\S*)\s+(translate|census)(\s|$)'
 ```
+
+It lists every `victory.exe` except the offline scans (`translate`, `census`),
+so a title, or one whose command line cannot be read, still makes you wait. An
+offline scan alone does not hold up a build; it does take CPU, and a build in
+its own worktree cannot replace the `victory.exe` it runs. The lock is
+unchanged: `smoke` and `alone` still refuse beside any `victory.exe`, so GPU
+tests wait for a scan too, and a scan that uses the GPU (`translate
+--pipelines`) runs through `alone`.
 
 A branch made before `alone` existed has no such command: merge `main` into it
 first.
