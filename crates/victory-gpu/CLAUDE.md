@@ -24,3 +24,24 @@
   or table slots.
 - Debug code sits behind `feature = "diagnostics"`: also run clippy with
   `--all-features`. Its variables are in `docs/debugging.md`.
+
+## Writing tests here
+
+- Memory a test hands to `shadow`/`watch` (a buffer view, `for_view`, `find`,
+  `register`) is never a `Vec` or a stack array. `shadow::loose` copies the
+  whole 4 MiB window around an address and write-protects it; over the host
+  heap that faults the allocator into the guard handler on the thread holding
+  `GUARDS`, which waits for itself (a hang about every second run, in a later
+  test). Use `watch::tests::pool` (write-watched) or
+  `watch::tests::owned_window` (alone in its window).
+- A test that hangs must not wait for the 15-minute chain limit: run the
+  test binary directly with `timeout 60 <exe> --test-threads=1 <filters>`;
+  single-threaded libtest prints `test name ...` before each test, so the
+  last line names the stuck one. Narrow with two filters (culprit + victim).
+- No wall-clock bounds near a tick or a few milliseconds, and no "consecutive"
+  assertions on scheduled events: a loaded host (other sessions build and use
+  the GPU) wakes threads 15-30 ms late. Assert order and "not the time-out".
+  Check a timing test under load before merging: 24 busy loops, 80 runs.
+- A test that needs the host GPU returns when `host()` is `None`; say so
+  (`eprintln!("skipped: no host GPU")`) in new tests so a silent pass is
+  visible with `--nocapture`.
