@@ -119,7 +119,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
             Some(if failed.is_empty() {
                 format!("refused {:?}", p.shaders)
             } else {
-                failed.join(" + ")
+                format!("untranslated {}", failed.join(" + "))
             })
         }
     }
@@ -161,8 +161,44 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads, unless
+/// `VICTORY_PIPELINE_WAIT_MS` says otherwise.
 const BUDGET: Duration = Duration::from_millis(500);
+
+/// The budget `value` (milliseconds, from `VICTORY_PIPELINE_WAIT_MS`)
+/// asks for; the default if it is unset or not a number.
+fn parse_budget(value: Option<&str>) -> Duration {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).map_or(BUDGET, Duration::from_millis)
+}
+
+fn budget() -> Duration {
+    static B: OnceLock<Duration> = OnceLock::new();
+    *B.get_or_init(|| parse_budget(std::env::var("VICTORY_PIPELINE_WAIT_MS").ok().as_deref()))
+}
+
+/// Why a draw was dropped, from a reason [`missing`] gave (diagnostics):
+/// 0 refused, 1 still being made, 2 other.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cause_of(why: &str) -> usize {
+    if why.starts_with("refused") || why.starts_with("untranslated") {
+        0
+    } else if why == "being made" {
+        1
+    } else {
+        2
+    }
+}
+
+/// Draws dropped by cause (refused, being made, other) from per-reason
+/// counts (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn by_cause(drops: &[(String, u64)]) -> [u64; 3] {
+    let mut sums = [0; 3];
+    for (why, n) in drops {
+        sums[cause_of(why)] += n;
+    }
+    sums
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -224,7 +260,7 @@ fn wait(p: &Pending, frame: u64) {
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = budget().saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -345,6 +381,30 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait budget is 500 ms unless the variable gives milliseconds.
+    #[test]
+    fn the_wait_budget_is_configurable() {
+        assert_eq!(parse_budget(None), Duration::from_millis(500));
+        assert_eq!(parse_budget(Some("x")), Duration::from_millis(500));
+        assert_eq!(parse_budget(Some(" 2000 ")), Duration::from_millis(2000));
+        assert_eq!(parse_budget(Some("0")), Duration::ZERO);
+    }
+
+    /// Drops are summed by cause, by draws and not by reasons.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn drops_are_summed_by_cause() {
+        let drops = [
+            ("refused [a]".to_owned(), 5),
+            ("refused [b]".to_owned(), 2),
+            ("untranslated compute 01".to_owned(), 1),
+            ("being made".to_owned(), 7),
+            ("skipped shader 0123".to_owned(), 1),
+            ("dispatch: prepare failed".to_owned(), 3),
+        ];
+        assert_eq!(by_cause(&drops), [8, 7, 4]);
+    }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,
     /// once, unless a worker has taken it.

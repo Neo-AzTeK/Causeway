@@ -382,6 +382,13 @@ pub(crate) fn note_why(why: String) {
     *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
 }
 
+/// Draws dropped by cause (refused, being made, other) in `drops`
+/// (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn drops_by_cause(drops: &[(String, u64)]) -> [u64; 3] {
+    make::by_cause(drops)
+}
+
 /// The drops counted since the last call, most first (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn take_drops() -> Vec<(String, u64)> {

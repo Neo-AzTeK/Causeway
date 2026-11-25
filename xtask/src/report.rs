@@ -168,6 +168,8 @@ fn plain(line: &str) -> String {
 #[derive(Default)]
 pub struct Log {
     rates: Vec<Rate>,
+    /// Draws per frame dropped as refused, still being made, other.
+    causes: Vec<[f64; 3]>,
     /// The highest frame a line names.
     frames: u64,
     /// A host device, and a diagnostics build, were seen.
@@ -224,6 +226,33 @@ const NOT_MADE: &[&str] = &[
 ];
 
 impl Log {
+    /// Draws per frame dropped as refused, still compiling and other, from
+    /// a "dropped by cause" line of the host.
+    fn causes(line: &str) -> Option<[f64; 3]> {
+        let (_, rest) = line.split_once("dropped by cause: refused ")?;
+        let (refused, rest) = rest.split_once(", compiling ")?;
+        let (compiling, rest) = rest.split_once(", other ")?;
+        let other = rest.split_whitespace().next()?;
+        Some([refused, compiling, other].map(|n| n.parse().unwrap_or(0.0)))
+    }
+
+    /// The mean of the cause lines, as a table row for the drops area.
+    fn cause_table(&self) -> Option<String> {
+        if self.causes.is_empty() {
+            return None;
+        }
+        let n = self.causes.len() as f64;
+        let mean = |i: usize| self.causes.iter().map(|c| c[i]).sum::<f64>() / n;
+        Some(format!(
+            "dropped draws per frame by cause (mean of {} lines): refused {:.1}, \
+             still compiling {:.1}, other {:.1}",
+            self.causes.len(),
+            mean(0),
+            mean(1),
+            mean(2)
+        ))
+    }
+
     pub fn parse(text: &str) -> Log {
         let mut log = Log::default();
         for line in text.lines() {
@@ -295,6 +324,9 @@ impl Log {
         self.device |= line.contains("host D3D12 device ready");
         self.warp |= line.contains("on the software adapter (WARP)");
         self.diagnostics |= line.contains("copies per frame: ");
+        if let Some(causes) = Self::causes(line) {
+            self.causes.push(causes);
+        }
         // Some refusals are logged once per reason; the drops name each.
         if let Some((_, shaders)) = line.split_once("without a host pipeline: refused ") {
             let reason = || "reason not logged".to_owned();
@@ -452,7 +484,11 @@ impl Log {
             }
         });
 
-        add("drawn vs dropped", self.drops(&world));
+        let (status, mut detail) = self.drops(&world);
+        if let Some(table) = self.cause_table() {
+            detail = format!("{detail}; {table}");
+        }
+        add("drawn vs dropped", (status, detail));
 
         // What is clean passes only if the log has those modules' warnings.
         let count = |n: usize, detail: String, modules: &[&str]| match n {
@@ -1042,6 +1078,15 @@ mod tests {
         let a = areas.iter().find(|a| a.name == "pipelines refused").unwrap();
         assert_eq!(a.status, Status::Fail);
         assert!(a.detail.starts_with("4: "), "{}", a.detail);
+    }
+
+    #[test]
+    fn drops_are_reported_by_cause() {
+        let line = gpu("INFO", "host: dropped by cause: refused 3.0, compiling 9.0, other 0.5 draws/frame");
+        let text = healthy() + &line + &line.replace("compiling 9.0", "compiling 5.0");
+        let areas = judge(&text, None);
+        let a = areas.iter().find(|a| a.name == "drawn vs dropped").unwrap();
+        assert!(a.detail.contains("refused 3.0, still compiling 7.0, other 0.5"), "{}", a.detail);
     }
 
     #[test]
