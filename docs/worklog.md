@@ -5,6 +5,12 @@ Newest state first inside each section. No game data here (rule #1): counts,
 error kinds, branches and commits only.
 
 ## State (update at every merge)
+- 2026-11-25 (GTX 1070, Pascal, wave32, no mesh shaders, 1,000,000-slot view
+  heap): main has view slots past a capped host heap taken from the pool
+  (2863ff3), host textures resident only once the GPU may reach them
+  (32f83df), the typed-store check for unordered views in no format, plain
+  committed memory never guarded inside a tracked range. On that GPU the title reaches
+  the world at ~1 fps; world pipelines with mesh shaders are refused there.
 - 2026-11-25: main has Caps (`caps.rs`, `docs/hardware-range.md`), wave plan
   and memory plan read from Caps, test-gate hang fixed (tests own their
   4 MiB window), smoke digest, DRED in smoke, `VICTORY_SURVIVE_REMOVAL=1`
@@ -21,6 +27,8 @@ error kinds, branches and commits only.
   pixels non-flat in the saved frame: no 3D scene yet.
 
 ## Next, ranked by effect on the picture
+00. Texture refresh at ~3 MB/s: menus at 0.4 fps after ~40 s (smoke 12), so
+   runs on the GTX 1070 do not reach the world unattended. Blocks every run.
 0. (frame-wait hunt, see log) Real cost is GPU time before the removal
    (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
 1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
@@ -45,6 +53,9 @@ error kinds, branches and commits only.
 8. Unimplemented device methods (two slots seen in smoke 9).
 
 ## Open decisions (owner)
+- Decided 2026-11-25 (owner: yes): emulate mesh shaders as compute for GPUs
+  without them (GTX 1070 class), native path kept where Caps has mesh tier >= 1;
+  being built by the design session.
 - Pass the other AI the review of 2863ff3, 32f83df, 433ecf7.
 - Whether a device removal should recreate the device (device lifetime).
 
@@ -80,6 +91,33 @@ the guest `s_barrier` in a loop is lane-uniform.
   (2^20 per-lane limit), and a wave-aggregated atomic at its end (`s_bcnt1`,
   `s_ff1` on EXEC, `v_readfirstlane`, `v_cmpx` on a lane index) that picks a
   leader per half. Keep skipping it. No adapter verified (no launch).
+- 2026-11-25: smoke 12 (main be98212, GTX 1070, 300 s): menus 30-36 fps for
+  ~40 s, then 0.3-0.4 fps to the end: 2.3-2.9 s/frame in texture preparation
+  (`Staging::refresh`, 7.6-9.5 MB/frame read, ~3 MB/s; 5-7 draws, GPU 4 ms).
+  At that rate scripted 0.2 s presses are missed: never reached the world (the
+  "A Player" select screen needs Enter by hand). 84 refused, 16 untranslated,
+  no removal. Proposed its own session (texture-refresh-speed).
+- 2026-11-25: merged from the GTX 1070 sessions: fits() checks the texture's
+  format for an unordered view in no format (#1754 path; unit test); watch:
+  plain committed pages inside a tracked 4 MiB window are not guarded
+  (victory-gpu lib tests x20 on GTX 1070: 9 hangs -> 0, one zero-read left in
+  draw root_views). Not merged: claude/vigilant-wu-adb5cb (wave-wide
+  structuring of one-wave64 groups on wave32) breaks main's
+  a_wave64_skip_over_a_lane_read_is_left_out_for_two_waves_of_32 (now needs
+  32, test expects 64); back to its session. Adapters verified: GTX 1070
+  (tests only, no title run on this merge). One workspace run failed
+  bindless::tests::heap_views_are_current (round 0 dword 0 read 0) while
+  another session used the GPU; 5/5 lib runs pass on the merge and on main,
+  and a second workspace run passed: same open zero-read under load.
+- 2026-11-25: finding (GTX 1070, release, 2 runs): world ~1 fps is GPU time;
+  two compute programs take about half (GPU 520-980 ms/frame, ~290 ms without
+  them); ~200 ms/frame of CPU preparation does not overlap the GPU. Matches
+  Next item 0. Residency (32f83df): loading screen GPU 229 -> 3 ms, process
+  memory dedicated/shared 6.9/8.6 -> 5.4/4.5 GB; world fps unchanged.
+- 2026-11-25: finding (GTX 1070, first title run, 300 s, menus): the title
+  asks 1,245,184 view slots; the host heap caps at 1,000,000 (fixed by
+  2863ff3). Mesh shader emulation as compute designed in a session
+  (`mesh-emulation-design.md`, not in the repo), not implemented: open decision.
 - 2026-11-25: smoke 11 (main 4f4befe, skip a1f6cdf8874960a9, 300 s): no removal,
   0.7 fps (prep 609, GPU 239, copy-back 137, other 483 ms), 1376 drawn,
   dropped 299 refused + 130 compiling + 461 other; still no visible 3D (0.0%
