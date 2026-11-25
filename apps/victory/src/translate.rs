@@ -64,6 +64,9 @@ struct Tally {
     cs_emitted: usize,
     cs_validated: usize,
     cs_pipelines: usize,
+    /// Emitted compute programs requiring waves of more than 32 lanes
+    /// (refused by hosts with waves of 32).
+    cs_wave64: usize,
     /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
@@ -126,6 +129,7 @@ impl Tally {
         self.cs_emitted += other.cs_emitted;
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
+        self.cs_wave64 += other.cs_wave64;
         self.ms_programs += other.ms_programs;
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
@@ -281,6 +285,10 @@ pub fn run(
     println!(
         "             {} emitted of {} compute programs; {} validated, {} pipelines",
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
+    );
+    println!(
+        "             {} compute programs require waves of 64 (refused by hosts with waves of 32)",
+        t.cs_wave64
     );
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
@@ -615,6 +623,14 @@ fn check(
             format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
             &shader.dxil,
         );
+    }
+    if shader.stage == HwStage::Cs
+        && emit::required_waves(&shader.dxil).is_some_and(|(least, _)| least > 32)
+    {
+        t.cs_wave64 += 1;
+        if t.list {
+            t.lines.push(format!("{}  requires waves of 64", label()));
+        }
     }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {

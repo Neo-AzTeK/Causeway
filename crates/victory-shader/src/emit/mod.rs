@@ -229,6 +229,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
+pub use container::required_waves;
 pub use shader::{
     HEAP_SAMPLERS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_MARK_NONE,
     VIEW_MARKS, VIEW_STRIDES, VIEW_TABLE_HEADER, VIEW_WRITE_BITS, VIEW_WRITES,
