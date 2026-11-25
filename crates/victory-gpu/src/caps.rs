@@ -27,7 +27,7 @@ pub mod reference;
 mod tests;
 
 pub use planner::{
-    BindingClass, BindingPlan, BudgetSource, MemoryPlan, WaveNeed, WavePlan, atomics64_heap,
+    BindingClass, BindingPlan, BudgetSource, FALLBACK_BUDGET, MemoryPlan, WaveNeed, WavePlan, atomics64_heap,
     binding_plan, format_choice, memory_plan, mesh_shaders, min_lod_clamp, wave_plan,
 };
 

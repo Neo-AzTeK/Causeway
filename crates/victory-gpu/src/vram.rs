@@ -8,14 +8,17 @@
 //! first, until usage is back to [`TARGET_PCT`]; the closer to the budget, the
 //! shorter the idle time that qualifies. No size is fixed: every figure is a
 //! share of the budget. [`resolve`] picks the (budget, usage) pair: the
-//! query's, or when it fails the adapter's dedicated (or half the shared)
-//! memory against the bytes the host made resident, or [`FALLBACK_BUDGET`]
-//! when the adapter reports nothing.
+//! query's, or when it fails the `MemoryPlan` budget (`caps::memory_plan`: the
+//! probe's figure, else dedicated or half the shared memory by UMA, else a
+//! fixed guess) against the bytes the host made resident. This module asks the
+//! adapter for no capability: only the live usage, which `Caps` leaves out.
 //!
 //! Eviction runs under the submission lock, before the lists run
 //! (`resource::make_resident`): the host waits for every submission, so no
 //! evicted texture is in flight. Evicted textures are made resident again
 //! the next time anything hands them to the GPU (`resource::residency`).
+
+use crate::caps::MemoryPlan;
 
 /// Usage, in percent of the budget, from which idle textures are evicted.
 pub(crate) const START_PCT: u64 = 75;
@@ -33,9 +36,6 @@ pub(crate) const IDLE_HIGH_MS: u64 = 250;
 /// Idle time from [`CRITICAL_PCT`] on (a texture a list touched in the last
 /// 50 ms stays: it may be in the list about to run).
 pub(crate) const IDLE_CRITICAL_MS: u64 = 50;
-/// The budget when the query fails and the adapter reports no memory size
-/// either (a guess; every real adapter has a better figure).
-pub(crate) const FALLBACK_BUDGET: u64 = 4 << 30;
 /// Time between samples of the budget.
 pub(crate) const SAMPLE_MS: u64 = 250;
 /// Time between log lines of budget and usage.
@@ -73,29 +73,13 @@ pub(crate) fn decide(budget: u64, usage: u64) -> Decision {
     Decision { free: usage.saturating_sub(target), idle_ms }
 }
 
-/// What the host knows of the adapter.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Adapter {
-    /// `DedicatedVideoMemory`.
-    pub(crate) dedicated: u64,
-    /// `SharedSystemMemory`.
-    pub(crate) shared: u64,
-}
-
 /// The (budget, usage) to decide on: the query's `(budget, current usage)`,
-/// else (adapter size or [`FALLBACK_BUDGET`], bytes `own` the host made
-/// resident). A query that reports no budget counts as failed.
-pub(crate) fn resolve(query: Option<(u64, u64)>, adapter: Adapter, own: u64) -> (u64, u64) {
+/// else (the plan's budget, bytes `own` the host made resident). A query that
+/// reports no budget counts as failed.
+pub(crate) fn resolve(query: Option<(u64, u64)>, plan: MemoryPlan, own: u64) -> (u64, u64) {
     match query {
         Some((budget, usage)) if budget > 0 => (budget, usage),
-        _ => {
-            let budget = match (adapter.dedicated, adapter.shared) {
-                (0, 0) => FALLBACK_BUDGET,
-                (0, shared) => shared / 2,
-                (dedicated, _) => dedicated,
-            };
-            (budget, own)
-        }
+        _ => (plan.budget, own),
     }
 }
 
@@ -132,7 +116,7 @@ mod host {
 
     struct Monitor {
         adapter: Option<IDXGIAdapter3>,
-        info: Adapter,
+        plan: MemoryPlan,
         state: Mutex<State>,
     }
 
@@ -143,9 +127,12 @@ mod host {
 
     static MONITOR: OnceLock<Monitor> = OnceLock::new();
 
-    /// The host's adapter (`None`: the query is not available).
-    pub(crate) fn init(adapter: Option<IDXGIAdapter3>, info: Adapter) {
-        let _ = MONITOR.set(Monitor { adapter, info, state: Mutex::new(State { sampled: None, logged: None }) });
+    /// The host's adapter for live usage (`None`: the query is not
+    /// available) and the caps the budget plan comes from.
+    pub(crate) fn init(adapter: Option<IDXGIAdapter3>, caps: &crate::caps::Caps) {
+        let plan = crate::caps::memory_plan(caps);
+        tracing::info!("video memory plan: {} MB ({:?})", plan.budget >> 20, plan.source);
+        let _ = MONITOR.set(Monitor { adapter, plan, state: Mutex::new(State { sampled: None, logged: None }) });
     }
 
     /// Local-segment (budget, usage) of the adapter, if it answers.
@@ -169,7 +156,7 @@ mod host {
         }
         state.sampled = Some(now);
         let asked = monitor.adapter.as_ref().and_then(query);
-        let (budget, usage) = resolve(asked, monitor.info, own);
+        let (budget, usage) = resolve(asked, monitor.plan, own);
         let decision = decide(budget, usage);
         if state.logged.is_none_or(|t| now.duration_since(t).as_millis() >= u128::from(LOG_MS)) {
             state.logged = Some(now);
@@ -177,7 +164,7 @@ mod host {
                 "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB, evicting {:.0} MB",
                 usage as f64 / 1e6,
                 budget as f64 / 1e6,
-                if asked.is_some() { "DXGI" } else { "query failed: adapter size" },
+                if asked.is_some() { "DXGI" } else { "query failed: caps plan" },
                 own as f64 / 1e6,
                 decision.free as f64 / 1e6,
             );
@@ -258,22 +245,40 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_query_falls_back_to_the_adapter_then_to_a_default() {
+    fn a_failed_query_falls_back_to_the_plan_then_to_a_default() {
+        use crate::caps::{BudgetSource, Caps, FALLBACK_BUDGET, MemoryCaps, memory_plan};
+        let caps = |uma, budget, dedicated, shared| Caps {
+            uma,
+            memory: MemoryCaps { budget, dedicated, shared },
+            ..Caps::unknown()
+        };
         let own = 3 * GB;
-        let dedicated = Adapter { dedicated: 8 * GB, shared: 16 * GB };
-        let integrated = Adapter { dedicated: 0, shared: 16 * GB };
-        // The query wins.
-        assert_eq!(resolve(Some((7 * GB, 5 * GB)), dedicated, own), (7 * GB, 5 * GB));
-        // Failed or empty: the adapter's own size, the host's own bytes.
-        assert_eq!(resolve(None, dedicated, own), (8 * GB, own));
-        assert_eq!(resolve(Some((0, 5 * GB)), dedicated, own), (8 * GB, own));
-        assert_eq!(resolve(None, integrated, own), (8 * GB, own));
-        // Nothing known: the fixed default.
-        assert_eq!(resolve(None, Adapter::default(), own), (FALLBACK_BUDGET, own));
-        // And the policy still works on the fallback: 3 GB of 4 GB is pressure.
-        let (budget, usage) = resolve(None, Adapter::default(), own);
+        // Fake adapters: small VRAM, UMA with a tiny dedicated window,
+        // large VRAM with a probe-time budget, discrete (the 2060 SUPER
+        // class) with no budget, nothing known.
+        let small = memory_plan(&caps(Some(false), None, 2 * GB, 16 * GB));
+        let uma = memory_plan(&caps(Some(true), None, GB / 8, 16 * GB));
+        let large = memory_plan(&caps(Some(false), Some(21 * GB), 24 * GB, 64 * GB));
+        let discrete = memory_plan(&caps(Some(false), None, 8 * GB, 16 * GB));
+        let nothing = memory_plan(&Caps::unknown());
+        assert_eq!([small.budget, uma.budget, large.budget], [2 * GB, 8 * GB, 21 * GB]);
+        // As the old adapter fallback: dedicated size on a discrete card.
+        assert_eq!(discrete.budget, 8 * GB);
+        assert_eq!((nothing.budget, nothing.source), (FALLBACK_BUDGET, BudgetSource::Fallback));
+        for plan in [small, uma, large, discrete, nothing] {
+            // The live query wins.
+            assert_eq!(resolve(Some((7 * GB, 5 * GB)), plan, own), (7 * GB, 5 * GB));
+            // Failed or empty: the plan's budget, the host's own bytes.
+            assert_eq!(resolve(None, plan, own), (plan.budget, own));
+            assert_eq!(resolve(Some((0, 5 * GB)), plan, own), (plan.budget, own));
+        }
+        // The policy still works on the fallback: 3 GB of 4 GB is pressure.
+        let (budget, usage) = resolve(None, nothing, own);
         assert!(decide(budget, usage).free > 0);
         assert_eq!(decide(budget, 2 * GB).free, 0);
+        // A small card is under pressure at the same own bytes, a large one not.
+        assert!(decide(small.budget, own).free > 0);
+        assert_eq!(decide(large.budget, own).free, 0);
     }
 
     #[test]

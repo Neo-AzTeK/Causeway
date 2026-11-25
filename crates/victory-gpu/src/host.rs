@@ -226,13 +226,7 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         let info = adapter.as_ref().and_then(|a| a.GetDesc1().ok());
-        crate::vram::init(
-            adapter.clone(),
-            info.as_ref().map_or_else(Default::default, |d| crate::vram::Adapter {
-                dedicated: d.DedicatedVideoMemory as u64,
-                shared: d.SharedSystemMemory as u64,
-            }),
-        );
+        crate::vram::init(adapter.clone(), &crate::caps::Caps::probe(&device, &[]));
         if let Some(desc) = info {
             tracing::info!(
                 adapter = %adapter_name(&desc),
