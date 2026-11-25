@@ -786,15 +786,129 @@ pub(crate) struct HostTexture {
     bytes: u64,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
+    /// Its [`residency`] level, raised only (under its lock).
+    residency: std::sync::atomic::AtomicU8,
+}
+
+/// Host textures in video memory only once the GPU may reach them. The
+/// title makes far more textures than it draws with (streaming: 8 GB made,
+/// 3 GB used), and a GPU of 8 GB pages them all over the bus. Title
+/// textures are made not resident; anything handing their host resource
+/// out (views, barriers, copies, lists: [`host_resource`], [`host_copy`])
+/// raises them to [`LOW`], a list's use to [`NORMAL`]. Heap-indexing
+/// shaders read any view of the heap, so a view is enough to need
+/// residency. Raised textures are made resident before the next submission
+/// runs ([`make_resident`], under the submission lock): a texture raised
+/// while recording a list is resident when the list runs.
+// shortcut: never evicted again; a texture lists stop using stays resident
+// (the memory manager may still move a low-priority one out).
+#[cfg(windows)]
+mod residency {
+    /// Not resident: made so, nothing reached it yet.
+    pub(super) const NOT_RESIDENT: u8 = 0;
+    /// Resident at the lowest priority: it has a view (or a use outside
+    /// lists) but no list used it, so the memory manager moves it out of
+    /// video memory first.
+    pub(super) const LOW: u8 = 1;
+    /// Resident at the normal priority: a list used it.
+    pub(super) const NORMAL: u8 = 2;
+
+    /// Of host textures raised in order (each with its level before and
+    /// after; one texture's raises come in rising order), those to make
+    /// resident (raised from [`NOT_RESIDENT`]) and the priority level each
+    /// raised one ends at, once per texture (`key` tells them apart).
+    pub(super) fn plan<T: Clone>(raised: &[(T, u8, u8)], key: impl Fn(&T) -> usize) -> (Vec<T>, Vec<(T, u8)>) {
+        let make = raised.iter().filter(|r| r.1 == NOT_RESIDENT).map(|r| r.0.clone()).collect();
+        let mut last = std::collections::HashMap::new();
+        for (i, r) in raised.iter().enumerate() {
+            last.insert(key(&r.0), i);
+        }
+        let levels = raised
+            .iter()
+            .enumerate()
+            .filter(|&(i, r)| last[&key(&r.0)] == i)
+            .map(|(_, r)| (r.0.clone(), r.2))
+            .collect();
+        (make, levels)
+    }
+}
+#[cfg(windows)]
+use residency::{LOW, NORMAL, NOT_RESIDENT};
+
+/// Host textures raised since the last submission ([`residency`]): the
+/// resource and its level before and after.
+#[cfg(windows)]
+static RAISED: std::sync::Mutex<Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Pageable, u8, u8)>> =
+    std::sync::Mutex::new(Vec::new());
+/// Bytes of live host textures made resident (or made so), and the time
+/// making them resident took since the last stats line (microseconds).
+#[cfg(windows)]
+static RESIDENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static RESIDENT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Makes the host textures raised since the last submission resident and
+/// sets their priorities ([`residency`]). The submission's caller holds
+/// the submission lock, so raises that came before it are all here.
+#[cfg(windows)]
+pub(crate) fn make_resident(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    // Held through the calls: a raise seen by another thread (its fast
+    // path) is resident before that thread's submission runs.
+    let mut raised = RAISED.lock().unwrap_or_else(|e| e.into_inner());
+    if raised.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (make, levels) = residency::plan(&raised, |p| p.as_raw() as usize);
+    raised.clear();
+    if !make.is_empty() {
+        let make: Vec<Option<ID3D12Pageable>> = make.into_iter().map(Some).collect();
+        // SAFETY: live resources (held by the list).
+        if let Err(e) = unsafe { device.MakeResident(&make) } {
+            tracing::warn!(error = %e, count = make.len(), "host textures not made resident");
+        }
+    }
+    if let Ok(device) = device.cast::<ID3D12Device1>() {
+        let (objects, priorities): (Vec<_>, Vec<_>) = levels
+            .into_iter()
+            .map(|(p, level)| {
+                let priority = if level == LOW {
+                    D3D12_RESIDENCY_PRIORITY_MINIMUM
+                } else {
+                    D3D12_RESIDENCY_PRIORITY_NORMAL
+                };
+                (Some(p), priority)
+            })
+            .unzip();
+        // SAFETY: as many priorities as live objects.
+        let set = unsafe { device.SetResidencyPriority(objects.len() as u32, objects.as_ptr(), priorities.as_ptr()) };
+        if let Err(e) = set {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(error = %e, "host texture residency priorities not set"));
+        }
+    }
+    RESIDENT_US.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bytes of live host textures resident, and milliseconds spent making
+/// them resident since the last call.
+#[cfg(windows)]
+pub(crate) fn resident_counts() -> (u64, f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (RESIDENT.load(Relaxed), RESIDENT_US.swap(0, Relaxed) as f64 / 1e3)
 }
 
 #[cfg(windows)]
 impl HostTexture {
-    /// A host texture made outside the title's resources (twins).
+    /// A host texture made outside the title's resources (twins), or not
+    /// resident (`resident` false: [`residency`]).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
         castable: Vec<u32>,
+        resident: bool,
     ) -> Self {
         let bytes = crate::host::host().map_or(0, |h| {
             // SAFETY: plain queries on a live resource.
@@ -802,6 +916,9 @@ impl HostTexture {
         });
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        if resident {
+            RESIDENT.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
         HostTexture {
             texture,
             state: state.into(),
@@ -811,15 +928,46 @@ impl HostTexture {
             twin: std::sync::OnceLock::new(),
             bytes,
             used: false.into(),
+            residency: if resident { NORMAL } else { NOT_RESIDENT }.into(),
         }
     }
 
     /// A list uses it: counted the first time (diagnostics of how much of
-    /// the host textures' memory the GPU ever touches).
+    /// the host textures' memory the GPU ever touches), resident at the
+    /// normal priority from the list's submission on.
     pub(crate) fn note_used(&self) {
         if !self.used.swap(true, std::sync::atomic::Ordering::Relaxed) {
             USED.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
+        self.raise(NORMAL);
+    }
+
+    /// Its [`residency`] level becomes at least `level`, from the next
+    /// submission on.
+    fn raise(&self, level: u8) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        // A level seen here was queued under the lock, which the next
+        // submission takes.
+        if self.residency.load(Acquire) >= level {
+            return;
+        }
+        let mut raised = RAISED.lock().unwrap_or_else(|e| e.into_inner());
+        let before = self.residency.load(Acquire);
+        if before >= level {
+            return;
+        }
+        use windows::core::Interface;
+        raised.push((self.texture.cast().expect("a resource is pageable"), before, level));
+        self.residency.store(level, Release);
+        if before == NOT_RESIDENT {
+            RESIDENT.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Its level, for tests.
+    #[cfg(test)]
+    fn residency(&self) -> u8 {
+        self.residency.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -861,6 +1009,9 @@ impl Drop for HostTexture {
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         if *self.used.get_mut() {
             USED.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        if *self.residency.get_mut() != NOT_RESIDENT {
+            RESIDENT.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -980,7 +1131,11 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    // Whoever asks may hand it to the GPU ([`residency`]).
+    resource(this).host.as_deref().map(|h| {
+        h.raise(LOW);
+        &h.texture
+    })
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -989,7 +1144,11 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    let host = resource(this).host.clone();
+    if let Some(h) = &host {
+        h.raise(LOW);
+    }
+    host
 }
 
 /// Resource flags as the host has them.
@@ -1253,6 +1412,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
+    let mut resident = false;
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     if !castable_formats.is_empty()
@@ -1275,12 +1435,13 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             SamplerFeedbackMipRegion: Default::default(),
         };
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+        let made;
         // SAFETY: a host description and our out pointer; the list and the
         // clear value live through the call.
-        let made = unsafe {
+        (made, resident) = not_resident_first(|flags| unsafe {
             device.CreateCommittedResource3(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                flags,
                 &desc1,
                 D3D12_BARRIER_LAYOUT_COMMON,
                 clear_value,
@@ -1288,7 +1449,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
                 Some(&formats),
                 &mut texture,
             )
-        };
+        });
         if let Err(e) = made {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -1302,29 +1463,48 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
+        let made;
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
-        let made = unsafe {
+        (made, resident) = not_resident_first(|flags| unsafe {
             host.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                flags,
                 std::ptr::from_ref(d).cast(),
                 D3D12_RESOURCE_STATES(initial as i32),
                 clear_value,
                 &mut texture,
             )
-        };
+        });
         if let Err(e) = made {
             tracing::warn!(error = %e, desc = ?d, "no host texture");
         }
     }
     let texture = texture?;
+    if resident {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(desc = ?d, "the host refuses textures made not resident: they are made resident"));
+    }
     crate::host::name(&texture, || {
         // Its address, for the lifetime notes (`life`) of a freed one.
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
     let initial = crate::host::legal_state(&texture, initial);
-    Some(HostTexture::new(texture, initial, castable_formats))
+    Some(HostTexture::new(texture, initial, castable_formats, resident))
+}
+
+/// Runs `create` (a texture's creation) with the heap flag that makes it
+/// not resident ([`residency`]), again without if the host refuses: the
+/// result and whether the texture is resident.
+#[cfg(windows)]
+fn not_resident_first(
+    mut create: impl FnMut(windows::Win32::Graphics::Direct3D12::D3D12_HEAP_FLAGS) -> windows::core::Result<()>,
+) -> (windows::core::Result<()>, bool) {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, D3D12_HEAP_FLAG_NONE};
+    match create(D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT) {
+        Ok(()) => (Ok(()), false),
+        Err(_) => (create(D3D12_HEAP_FLAG_NONE), true),
+    }
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -2244,6 +2424,45 @@ pub(crate) mod tests {
     /// copy, and clearing one the host cannot render to leaves the device
     /// alive.
     #[cfg(windows)]
+    #[test]
+    fn raised_textures_are_made_resident_once_at_their_last_level() {
+        use super::residency::{LOW, NORMAL, NOT_RESIDENT, plan};
+        // a: a view, then a list; b: a list first; c: resident already.
+        let raised = [('a', NOT_RESIDENT, LOW), ('b', NOT_RESIDENT, NORMAL), ('a', LOW, NORMAL), ('c', LOW, NORMAL)];
+        let (make, levels) = plan(&raised, |&c| c as usize);
+        assert_eq!(make, ['a', 'b']);
+        assert_eq!(levels, [('b', NORMAL), ('a', NORMAL), ('c', NORMAL)]);
+        assert_eq!(plan(&[('a', NOT_RESIDENT, LOW)], |&c| c as usize), (vec!['a'], vec![('a', LOW)]));
+    }
+
+    #[test]
+    fn title_textures_are_resident_once_the_gpu_may_reach_them() {
+        use super::residency::{LOW, NORMAL, NOT_RESIDENT};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let mut desc = texture(64, 64, 28, 1);
+        desc.flags = 1;
+        let mut image = null;
+        let clear = [28, 0, 0, 0, 0];
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0x4, clear.as_ptr().cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let copy = resource(image).host.clone().expect("a host texture");
+        assert_eq!(copy.residency(), NOT_RESIDENT);
+        assert!(host_resource(image).is_some());
+        assert_eq!(copy.residency(), LOW);
+        // A list clears it: made resident before it runs.
+        crate::list::tests::clear(image);
+        assert_eq!(copy.residency(), NORMAL);
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop(copy);
+        assert_eq!(resource_release(image), 0);
+    }
+
     #[test]
     fn textures_lose_the_uses_the_host_lacks() {
         let Some(host) = crate::host::host() else {
