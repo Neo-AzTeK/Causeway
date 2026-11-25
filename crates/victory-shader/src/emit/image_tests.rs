@@ -5,7 +5,7 @@
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::host::{Dispatch, Host, Root, View};
-use super::{HostShader, lower, validator};
+use super::{HostShader, VIEW_INFO_SLOT, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -161,6 +161,27 @@ pub(super) fn run_on(
     views: &[View],
     adapters: &[(&'static str, bool)],
 ) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+    run_info(shader, views, &[], adapters)
+}
+
+/// [`run`] with the view info the host keeps (`VIEW_INFO_SLOT`): a stride and
+/// a record count for each heap slot, as the title's descriptors name them.
+pub(super) fn run_with_info(
+    shader: &HostShader,
+    views: &[View],
+    info: &[[u32; 2]],
+) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+    let out = run_info(shader, views, info, &[("hardware", false), ("warp", true)]);
+    assert!(!out.is_empty());
+    out
+}
+
+fn run_info(
+    shader: &HostShader,
+    views: &[View],
+    info: &[[u32; 2]],
+    adapters: &[(&'static str, bool)],
+) -> Vec<(&'static str, Vec<Vec<u32>>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -184,12 +205,23 @@ pub(super) fn run_on(
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if shader.root_srvs.contains(&VIEW_INFO_SLOT) {
+            // Root views follow the user data, by register (CBVs first).
+            let mut at: Vec<(u8, bool)> = shader.root_cbvs.iter().map(|&r| (r, false)).collect();
+            at.extend(shader.root_srvs.iter().map(|&r| (r, true)));
+            at.sort_unstable();
+            let param = 1 + at.iter().position(|&v| v == (VIEW_INFO_SLOT, true)).unwrap();
+            let mut data = info.concat();
+            data.resize(data.len().max(8), 0);
+            roots.push((param as u32, Root::View { srv: true, data }));
+        }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],

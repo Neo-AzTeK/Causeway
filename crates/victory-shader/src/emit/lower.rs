@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, flags};
+use super::shader::{Shader, VIEW_INFO_SLOT, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -3359,6 +3359,8 @@ impl<'a> Lower<'a> {
         let u = if uav { 0x1000 } else { 0 };
         // Bytes per record of a buffer sized in bytes.
         let mut records = 1;
+        // The real record count is the host's (see `view_info`).
+        let mut host_records = false;
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
@@ -3382,7 +3384,7 @@ impl<'a> Lower<'a> {
                     if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
                         records = stride;
                     } else if stride != 0 {
-                        return Err("a structured buffer of unknown stride");
+                        host_records = true;
                     }
                     (11 | u, 0)
                 };
@@ -3413,8 +3415,12 @@ impl<'a> Lower<'a> {
                 };
                 let props = match stride {
                     0 => (11, 0),
-                    // The title's view may not have the stride the code names.
-                    _ => return Err("a structured buffer of unknown stride"),
+                    // The title's view may not have the stride the code names:
+                    // the host says what it has.
+                    _ => {
+                        host_records = true;
+                        (11, 0)
+                    }
                 };
                 (props, None)
             }
@@ -3472,7 +3478,12 @@ impl<'a> Lower<'a> {
             }
             None => {
                 let mut n = field(self, 0);
-                if records > 1 {
+                if host_records {
+                    // Only a program that reads the count asks the host.
+                    if u32::from(first) + 2 < count {
+                        n = self.view_info(&src, 1)?;
+                    }
+                } else if records > 1 {
                     let size = self.s.m.i32(records);
                     n = self.s.m.bin(c, Bin::UDiv, n, size);
                 }
@@ -3688,6 +3699,37 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Dword `field` (0: stride in bytes, 1: record count) of the descriptor
+    /// `src` names, as the title wrote it: the host keeps one pair per heap
+    /// slot in the root SRV [`VIEW_INFO_SLOT`] and drops both from its raw
+    /// views. Zero where the host has no view.
+    // shortcut: a stride that is not a multiple of 4 is taken as it is; the
+    // host's view of it is not raw, which byte addresses do not follow.
+    fn view_info(&mut self, src: &Source, field: u32) -> Result<V, Why> {
+        if matches!(src, Source::Built { .. }) {
+            return Err("a root UAV or typed root view");
+        }
+        let index = self.lane_heap_index(src, false)?;
+        let c = self.cur;
+        let h = self.s.root_srv_handle(VIEW_INFO_SLOT);
+        let eight = self.s.m.i32(8);
+        let at = self.s.m.bin(c, Bin::Mul, index, eight);
+        let k = self.s.m.i32(4 * field);
+        let at = self.s.m.bin(c, Bin::Add, at, k);
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mask = self.s.m.i8(1);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, u, mask, al],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        Ok(self.as_int(x))
+    }
+
     /// The byte at `off` of element `index` of a structured buffer, whose
     /// host view is raw (`victory-gpu`'s `raw_view`): scalar and unindexed
     /// loads address the same views by byte, which hosts scale by a
@@ -3699,11 +3741,12 @@ impl<'a> Lower<'a> {
             return Err("a root UAV or typed root view");
         }
         let stride = self.used_kind(src).map_or(0, |u| u.stride);
-        if stride < 4 || !stride.is_multiple_of(4) {
-            return Err("a structured buffer of unknown stride");
-        }
+        let stride = if stride >= 4 && stride.is_multiple_of(4) {
+            self.s.m.i32(stride)
+        } else {
+            self.view_info(src, 0)?
+        };
         let c = self.cur;
-        let stride = self.s.m.i32(stride);
         let start = self.s.m.bin(c, Bin::Mul, index, stride);
         Ok(self.s.m.bin(c, Bin::Add, start, off))
     }

@@ -29,6 +29,14 @@
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
 //!   address the title sets is the buffer's.
+//! * **View info** (added 2026-11-25): a buffer descriptor the code reads
+//!   the record count of, or indexes with a stride the container does not
+//!   have, is answered from a root SRV `t`[`VIEW_INFO_SLOT`] in
+//!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`] like a title's:
+//!   dword 0 of heap slot `i` (at byte `8 * i`) is the stride the title's
+//!   descriptor names, dword 1 its record count. The host fills it for
+//!   every buffer view it makes (raw conversion drops both) and binds it
+//!   itself.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -105,7 +113,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INFO_SLOT};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

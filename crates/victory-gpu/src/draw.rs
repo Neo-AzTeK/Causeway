@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::VIEW_INFO_SLOT;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -499,6 +500,27 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == VIEW_INFO_SLOT {
+                        // The host's own: the title's views of the heap, as it described them.
+                        let info = (self.heaps[0] != 0)
+                            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                            .flatten()
+                            .and_then(|h| h.info_address());
+                        let Some((gpu, buffer)) = info else {
+                            once!("a shader reads view info of a heap that has none");
+                            continue;
+                        };
+                        list.keep(&buffer);
+                        // SAFETY: an open list; the buffer is kept.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
