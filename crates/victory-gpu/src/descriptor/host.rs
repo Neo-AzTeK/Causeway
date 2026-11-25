@@ -1136,22 +1136,23 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
-        return !typeless;
-    }
-    let cast = castable.contains(&view);
-    if family(view) != family(own) && !cast {
-        once!(view, own, "view format of another family");
-        return false;
-    }
+    let cast = view != 0 && castable.contains(&view);
     // Every unordered view, not only a cast one: a typed unordered view in a
     // format the host cannot store to (B5G5R5A1_UNORM on NVIDIA) is an
     // invalid call, and the host removes the device for it (#1754).
     // shortcut: the view is null, so the title's writes to that texture are
     // lost; packed 16-bit formats need their own unordered path.
-    let stored = viewed_format(own, view, typeless, cast);
-    if unordered && !typed_store(stored) {
+    if let Some(stored) = stored_format(own, view, typeless, cast, unordered)
+        && !typed_store(stored)
+    {
         once!(view, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
+    if view == 0 {
+        return !typeless;
+    }
+    if family(view) != family(own) && !cast {
+        once!(view, own, "view format of another family");
         return false;
     }
     if let Some(format) = format
@@ -1168,6 +1169,14 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
 /// the view is castable to, else the texture's own. Pure, for testing.
 fn viewed_format(own: u32, view: u32, typeless: bool, cast: bool) -> u32 {
     if view != 0 && (typeless || cast) { view } else { own }
+}
+
+/// The format the host must store to through typed unordered views for an
+/// `unordered` view of `own` asked in `view` (0: none, the texture's own)
+/// to be made: none for a shader view, or a typeless texture viewed in no
+/// format (refused anyway). Pure, for testing.
+fn stored_format(own: u32, view: u32, typeless: bool, cast: bool, unordered: bool) -> Option<u32> {
+    (unordered && (view != 0 || !typeless)).then(|| viewed_format(own, view, typeless, cast))
 }
 
 /// Whether a view without a description of `resource` (a title texture)
@@ -1606,6 +1615,21 @@ mod tests {
         assert_eq!(viewed_format(R16_TYPELESS, R16_UINT, true, false), R16_UINT);
         assert_eq!(viewed_format(R16_UINT, B5G5R5A1, false, true), B5G5R5A1);
         assert_eq!(viewed_format(R16_UINT, 56, false, false), R16_UINT);
+    }
+
+    /// An unordered view in no format (no description, or UNKNOWN) of a
+    /// typed texture is made in the texture's format, so that format is
+    /// checked too: a B5G5R5A1 texture so viewed was let through (#1754).
+    #[test]
+    fn unordered_views_in_no_format_check_the_textures() {
+        const B5G5R5A1: u32 = 86;
+        const R16_TYPELESS: u32 = 53;
+        const R16_UINT: u32 = 57;
+        assert_eq!(stored_format(B5G5R5A1, 0, false, false, true), Some(B5G5R5A1));
+        assert_eq!(stored_format(B5G5R5A1, B5G5R5A1, false, false, true), Some(B5G5R5A1));
+        assert_eq!(stored_format(R16_TYPELESS, R16_UINT, true, false, true), Some(R16_UINT));
+        assert_eq!(stored_format(R16_TYPELESS, 0, true, false, true), None);
+        assert_eq!(stored_format(B5G5R5A1, 0, false, false, false), None);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
