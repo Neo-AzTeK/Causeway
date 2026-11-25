@@ -672,6 +672,29 @@ pub(crate) mod tests {
         p
     }
 
+    /// `words` dwords counting up from 0 in memory that owns the whole 4 MiB
+    /// window around it ([`crate::shadow`]'s loose copies take windows):
+    /// never on the host heap. A copy of a window write-protects all of it,
+    /// so one over the heap faults the host's own allocations into the
+    /// handler on the thread holding the guards, which then waits for itself
+    /// (a hang about every second run). Leaked: the loose copy outlives the
+    /// test (shortcut: never freed).
+    pub(crate) fn owned_window(words: usize) -> *const u32 {
+        const WINDOW: usize = 4 << 20;
+        assert!(words * 4 <= WINDOW);
+        // SAFETY: a fresh allocation, leaked.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * WINDOW, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert!(p != 0);
+        let start = p.next_multiple_of(WINDOW) as *mut u32;
+        for k in 0..words {
+            // SAFETY: inside the allocation.
+            unsafe { start.add(k).write(k as u32) };
+        }
+        start
+    }
+
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };

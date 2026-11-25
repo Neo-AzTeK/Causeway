@@ -1708,8 +1708,8 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return;
         };
-        let memory: Vec<u32> = (0..1024).collect();
-        let at = (memory.as_ptr() as u64).next_multiple_of(32);
+        let memory = crate::watch::tests::owned_window(1024);
+        let at = (memory as u64).next_multiple_of(32);
         for (address, element) in [(at, 32), (at + 16, 32), (at + 20, 48), (at + 4, 12)] {
             // Four elements from the second on, of a buffer of sixteen.
             let mut resource = [0u32; 14];
@@ -1821,8 +1821,8 @@ mod tests {
         // The title's heap, and a buffer view recorded at its slot 9.
         let mut slots = vec![[0u32; 8]; 12];
         let handle = |slots: &mut [[u32; 8]], i: usize| slots[i].as_mut_ptr() as u64;
-        let memory: Vec<u32> = (0..1024).collect();
-        let at = (memory.as_ptr() as u64).next_multiple_of(32);
+        let memory = crate::watch::tests::owned_window(1024);
+        let at = (memory as u64).next_multiple_of(32);
         let mut resource = [0u32; 14];
         (resource[0], resource[4]) = (1, 16 * 32);
         let mut desc = [0u32; 16];
@@ -1842,7 +1842,6 @@ mod tests {
         super::super::record(handle(&mut slots, 11), View::Placed(false, resource, desc));
         assert!(heap.mirror(11, handle(&mut slots, 11), false).is_some());
         assert_eq!(remap(11), slot, "taken again");
-        drop(memory);
     }
 
     #[test]
