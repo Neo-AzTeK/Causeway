@@ -333,3 +333,37 @@ fn a_64_bit_compare_and_swap_or_subtraction_carries_across_the_dwords() {
         assert_eq!(out[0], want, "{label}");
     }
 }
+
+#[test]
+fn a_gradient_sample_with_clamp_raises_the_level_to_the_clamp() {
+    // Zero gradients select level 0 (10.0); the clamp after the coordinates
+    // (1.0) is the least level, so the sample reads level 1 (20.0).
+    let body = [
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0A02,
+        0xFA00_0020, // s_load_dwordx4 s[40:43], s[4:5], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0x7E10_02F2, // v_mov_b32 v8, 1.0
+        0xF08C_0108,
+        0x0043_0C02, // image_sample_d_cl v12, v[2:8], s[12:19], s[8:11] dmask:0x1
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+    ];
+    let shader = build(&body, ResourceType::Srv, false);
+    let levels = [10.0f32, 20.0, 30.0].map(|r| [r, 0.0, 0.0, 1.0]);
+    for (label, out) in run(&shader, &[View::Mips(&levels), View::RawUav(32)]) {
+        let red: Vec<f32> = out[0].iter().map(|&x| f32::from_bits(x)).collect();
+        assert_eq!(red, vec![20.0f32; 32], "{label}");
+    }
+}
