@@ -390,7 +390,18 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 }
                                 let one = std::time::Instant::now();
                                 let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP);
+                                    victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP, false);
+                                // A mesh program also as hosts without mesh
+                                // shaders make it (the cache keys the two
+                                // apart): which one runs is the host's.
+                                let mesh = done.as_ref().is_ok_and(|s| s.stage == HwStage::Ms);
+                                let (done, cached) = if mesh {
+                                    let (compute, also) =
+                                        victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP, true);
+                                    (done.and(compute), cached && also)
+                                } else {
+                                    (done, cached)
+                                };
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {
@@ -589,7 +600,7 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP };
+                    let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP, mesh_as_compute: false };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;

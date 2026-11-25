@@ -40,6 +40,7 @@ mod indirect;
 pub mod list;
 #[cfg(windows)]
 mod memory;
+mod mesh;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

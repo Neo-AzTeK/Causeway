@@ -127,6 +127,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
     lower::lower(&lower::Parts {
+        mesh_compute: false,
         native,
         p: &p,
         st: &st,
