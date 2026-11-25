@@ -1201,7 +1201,7 @@ mod tests {
             + &gpu(
                 "WARN",
                 "pipeline::host: host pipeline refused: wave size shaders=[compute 01] \
-                 wave=the host GPU lacks widgets: needs a mode=2, has none",
+                 why=\"made up\" wave=the host GPU lacks widgets: needs a mode=2, has none",
             );
         let areas = judge(&text, None);
         let a = areas.iter().find(|a| a.name == "pipelines refused").unwrap();

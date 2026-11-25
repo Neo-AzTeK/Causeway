@@ -588,7 +588,7 @@ mod tests {
     fn refusal(hash: &str, reason: &str) -> String {
         format!(
             "{T}  WARN victory_gpu::pipeline::host: host pipeline refused: wave size \
-             shaders=[compute {hash}] wave={reason}\n"
+             shaders=[compute {hash}] why=\"made up\" wave={reason}\n"
         )
     }
 

@@ -2690,6 +2690,9 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        // Drained every window, as `drops` is, so both cover the same frames.
+        #[cfg(feature = "diagnostics")]
+        let missing = crate::pipeline::indirect_missing_line(frames);
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -2738,7 +2741,7 @@ impl Meter {
                         *n as f64 / frames
                     );
                 }
-                if let Some(line) = crate::pipeline::indirect_missing_line(frames) {
+                if let Some(line) = missing {
                     tracing::info!("{line}");
                 }
             }

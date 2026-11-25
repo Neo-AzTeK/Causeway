@@ -675,7 +675,8 @@ impl HostPipeline {
                     .first()
                     .and_then(|(s, _)| s.translated())
                     .and_then(|t| t.host.wave64_why.as_deref());
-                tracing::warn!(?shaders, %wave, why, "host pipeline refused: wave size");
+                // `wave` stays last: `xtask` reads it to the end of the line.
+                tracing::warn!(?shaders, why, %wave, "host pipeline refused: wave size");
                 return None;
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {

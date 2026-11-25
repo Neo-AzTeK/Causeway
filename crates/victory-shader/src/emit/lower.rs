@@ -3241,7 +3241,7 @@ impl<'a> Lower<'a> {
             Op::MaxI => pick(self, pred::SGT),
             Op::MinF => self.max_min(false, a, b),
             Op::MaxF => self.max_min(true, a, b),
-            // Taken before (`Shape::Half`), and not in a wave of 64.
+            // Taken before (`Shape::Half`); a wave of 64 adds two f32 sums instead.
             Op::AddH => unreachable!("a 16-bit sum is not combined"),
         }
     }
