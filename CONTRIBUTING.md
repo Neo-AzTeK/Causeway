@@ -13,10 +13,13 @@ scene is visible.
 Nothing from the game, or derived from it, enters the repo: no files, dumps,
 disassembly, screenshots or snapshots. No new policy exceptions without the
 owner's decision. `cargo xtask policy` (also the pre-commit hook,
-`cargo xtask install-hooks`) enforces it. Details: `docs/asset-policy.md`.
+`cargo xtask setup`) enforces it. Details: `docs/asset-policy.md`.
 
-Run `cargo xtask install-hooks` once per clone: it installs that hook and makes
-`gh` target this repository rather than the parent of the fork.
+Run `cargo xtask setup --game-dir <folder>` once per clone: it installs that
+hook, makes `gh` target this repository rather than the parent of the fork, and
+writes the ignored `victory.toml` (the title's folder, never overwritten) and
+`victory.hardware.toml` (this machine's GPUs; run it again after a hardware or
+driver change).
 
 ## Flow (KISS, owner's decision 2026-11-24)
 

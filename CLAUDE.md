@@ -6,6 +6,12 @@ Everything a contributor must follow (rule #1 no game data, KISS flow, checks,
 hardware range, GPU runs) is in `CONTRIBUTING.md`: Read it. This file adds only
 what agents need.
 
+## This machine
+
+`victory.toml` has the title's folder, `victory.hardware.toml` this machine's
+GPUs (both ignored by git). If either is missing, run `cargo xtask setup` first
+and ask the owner for the title's folder if none is set.
+
 ## Where things are
 
 | Need | File |

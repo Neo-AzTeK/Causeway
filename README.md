@@ -79,7 +79,7 @@ focus:
 ## Development
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
+cargo xtask setup                        # once per clone: hooks, local files
 cargo test --workspace                   # needs no game data
 ```
 
