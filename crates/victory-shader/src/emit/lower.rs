@@ -60,6 +60,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The device samples with a least-level clamp (TiledResources tier 2).
+    pub min_lod_clamp: bool,
 }
 
 enum Stop {
@@ -6469,6 +6471,9 @@ impl<'a> Lower<'a> {
                     }
                     // `_cl`: the least level, after the coordinates.
                     let clamp = if name == "image_sample_d_cl" {
+                        if !self.x.min_lod_clamp {
+                            return Err("a sample with a least-level clamp the device lacks");
+                        }
                         let x = addr_val(self, first + grads + coords)?;
                         to_float(self, x)
                     } else {
@@ -7521,6 +7526,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            min_lod_clamp: false,
         })
         .map(|_| ())
     }
@@ -7571,6 +7577,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            min_lod_clamp: false,
         })
     }
 
@@ -7699,6 +7706,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            min_lod_clamp: false,
         }).unwrap();
 
         let container =

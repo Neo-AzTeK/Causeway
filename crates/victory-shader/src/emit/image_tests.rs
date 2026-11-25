@@ -48,6 +48,18 @@ pub(super) fn translate_group(
     threads: u32,
     lds: u32,
 ) -> Result<HostShader, ShaderError> {
+    translate_caps(body, view, (wave64, threads, lds), true)
+}
+
+/// [`translate_group`] on a device that samples with a least-level clamp or
+/// not; `group` is wave64, threads and LDS blocks.
+pub(super) fn translate_caps(
+    body: &[u32],
+    view: (ResourceType, u8, u32),
+    group: (bool, u32, u32),
+    min_lod_clamp: bool,
+) -> Result<HostShader, ShaderError> {
+    let (wave64, threads, lds) = group;
     let (image, dwords, stride) = view;
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
@@ -102,6 +114,7 @@ pub(super) fn translate_group(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        min_lod_clamp,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -366,4 +379,39 @@ fn a_gradient_sample_with_clamp_raises_the_level_to_the_clamp() {
         let red: Vec<f32> = out[0].iter().map(|&x| f32::from_bits(x)).collect();
         assert_eq!(red, vec![20.0f32; 32], "{label}");
     }
+}
+
+#[test]
+fn a_clamped_gradient_sample_is_refused_without_the_device_capability() {
+    // Same program as above: with no least-level clamp on the device it
+    // stays a clean refusal, never an unclamped (wrong) sample.
+    let body = [
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0A02,
+        0xFA00_0020, // s_load_dwordx4 s[40:43], s[4:5], 0x20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280,
+        0x7E08_0280,
+        0x7E0A_0280,
+        0x7E0C_0280,
+        0x7E0E_0280,
+        0x7E10_02F2, // v_mov_b32 v8, 1.0
+        0xF08C_0108,
+        0x0043_0C02, // image_sample_d_cl v12, v[2:8], s[12:19], s[8:11] dmask:0x1
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+    ];
+    let view = (ResourceType::Srv, 8, 0);
+    let err = translate_caps(&body, view, (false, 32, 0), false).err();
+    assert!(
+        format!("{err:?}").contains("least-level clamp"),
+        "refusal: {err:?}"
+    );
+    assert!(translate_caps(&body, view, (false, 32, 0), true).is_ok());
 }
