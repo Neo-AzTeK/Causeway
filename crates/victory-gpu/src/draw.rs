@@ -167,6 +167,26 @@ thread_local! {
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
+/// Takes the reason [`not_run`] last gave, so that no later drop inherits it
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn take_not_run() -> &'static str {
+    match NOT_RUN.with(|w| w.replace("")) {
+        "" => "reason not named",
+        why => why,
+    }
+}
+
+/// Notes `why` unless a more specific reason was noted already.
+fn not_run_unless_named(why: &'static str) {
+    #[cfg(feature = "diagnostics")]
+    if NOT_RUN.with(|w| w.get().is_empty()) {
+        not_run(why);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = why;
+}
+
 /// Notes why the draw or dispatch being prepared cannot run (diagnostics).
 fn not_run(why: &'static str) {
     #[cfg(feature = "diagnostics")]
@@ -660,14 +680,20 @@ impl State {
                             };
                             match offset {
                                 Some(offset) => offset,
-                                None => return false,
+                                None => {
+                                    not_run("root view offset: no root view set, or it is outside title buffers");
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
                             let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
                             match self.root_view(list, compute, u.slot, uav) {
-                                Some((slot, _)) => slot,
-                                None => return false,
+                                Ok((slot, _)) => slot,
+                                Err(why) => {
+                                    not_run(why);
+                                    return false;
+                                }
                             }
                         }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
@@ -789,26 +815,33 @@ impl State {
 
     /// The heap index of a raw view (`uav`: unordered access) of the host
     /// copy holding the root view the title set at root parameter `slot`,
-    /// and the root address's byte offset in it: a dynamic slot of the view
+    /// and the root address's byte offset in it, else why the draw must be
+    /// dropped. The index is a dynamic slot of the view
     /// heap the shader indexes, made once per list and copy; the range from
     /// the root address brought up to date at submission
-    /// (`victory_shader::emit`, "Root SRVs and root UAVs"). None if the
-    /// draw must be dropped: no root view set, or no dynamic slot.
+    /// (`victory_shader::emit`, "Root SRVs and root UAVs").
     /// The copy is brought up to date from the root address to its end: a
     /// shader reaches wherever data its root view leads to lie (a vertex
     /// fetch's streams sit at offsets in the root view's own header).
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
-    fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
+    fn root_view(
+        &mut self,
+        list: &HostList,
+        compute: bool,
+        slot: u8,
+        uav: bool,
+    ) -> Result<(u32, u32), &'static str> {
         let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
-            return None;
+            return Err("root view not set by the title");
         };
         let Some(shadow) = crate::shadow::find(address, 1) else {
-            not_run("root view outside title buffers");
-            return None;
+            return Err("root view outside title buffers");
         };
-        let offset = u32::try_from(shadow.offset(address)).ok()?;
+        let Ok(offset) = u32::try_from(shadow.offset(address)) else {
+            return Err("root view 4 GiB or more into its copy");
+        };
         shadow.refresh(list, address, shadow.left(address));
         if uav {
             // Writes through the view are marked wherever they land in the
@@ -819,31 +852,25 @@ impl State {
         let (key, host) = match self.heaps[0] {
             0 => match crate::memory::heap() {
                 Some(host) => (MEMORY_HEAP, host),
-                None => {
-                    not_run("root views: no title-memory heap");
-                    return None;
-                }
+                None => return Err("root views: no title-memory heap"),
             },
             h => (
                 std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
                 match crate::descriptor::heap(h as This).host() {
                     Some(host) => host,
-                    None => {
-                        not_run("root views: the bound view heap has no host heap");
-                        return None;
-                    }
+                    None => return Err("root views: the bound view heap has no host heap"),
                 },
             ),
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
-            return Some((index, offset));
+            return Ok((index, offset));
         }
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
                 once!("no dynamic slots for root views: dropped");
-                return None;
+                return Err("no dynamic slots for root views");
             };
             self.dynamic.push((key, first, ROOT_VIEW_RUN));
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
@@ -856,7 +883,7 @@ impl State {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }
         self.root_slots.insert((key, copy, uav), index);
-        Some((index, offset))
+        Ok((index, offset))
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -1072,7 +1099,10 @@ impl State {
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
-                Err(_) => false,
+                Err(_) => {
+                    not_run("the host list has no DispatchMesh");
+                    false
+                }
             }
         };
         if !ran {
@@ -1167,7 +1197,8 @@ impl State {
             |compute| self.bind_mesh_pass(list, e, compute),
         );
         if !ran {
-            not_run("emulated indirect mesh dispatch");
+            // Not over the reason a pass that did not bind gave.
+            not_run_unless_named("emulated indirect mesh dispatch not recorded");
         }
         self.set_topology(list, self.topology);
         ran
@@ -1680,6 +1711,9 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // No reason of an earlier call for this one.
+        #[cfg(feature = "diagnostics")]
+        NOT_RUN.with(|w| w.set(""));
         // A call with no host pipeline cannot run, and that is the common
         // case while the world builds its pipelines: #400 measures 1 400-1 750
         // indirect calls a frame dropped this way. Drop it here, before the
@@ -1688,9 +1722,12 @@ impl State {
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            // Counted once, under the pipeline's own reason.
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
-            why("no host pipeline");
+            {
+                crate::pipeline::note_indirect_drop(kind, self.pipeline as This);
+                list.note_op(|| format!("DROPPED indirect kind {kind} max {max} (no host pipeline) {}", crate::pipeline::shaders_of(self.pipeline as This)));
+            }
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
@@ -1737,8 +1774,9 @@ impl State {
             crate::indirect::done(list, &args.buffer);
             let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
             let ran = self.execute_mesh_emulated(list, e, (args.gpu(arguments), count), (stride, max));
+            #[cfg(feature = "diagnostics")]
             if !ran {
-                why("emulated mesh dispatch not run");
+                why(&format!("emulated mesh dispatch not run: {}", take_not_run()));
             }
             return ran;
         }
@@ -1755,7 +1793,10 @@ impl State {
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
+                _ => {
+                    not_run("another kind of pipeline");
+                    false
+                }
             },
             _ => false,
         };
@@ -1764,14 +1805,14 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
+                    crate::pipeline::note_indirect_drop(kind, self.pipeline as This);
                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
                 }
                 Some(p) => why(&format!(
                     "prepare failed (compute {}, mesh {}): {}",
                     p.compute,
                     p.mesh,
-                    NOT_RUN.with(|w| w.replace(""))
+                    take_not_run()
                 )),
             }
             return false;
@@ -2099,6 +2140,43 @@ void main(uint3 id : SV_DispatchThreadID) {
         );
         assert_eq!(made, S_OK);
         out
+    }
+
+    /// A root view that cannot be made says why, so the draw it drops is not
+    /// counted with an empty reason.
+    #[test]
+    fn a_root_view_that_cannot_be_made_names_why() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        assert_eq!(state.root_view(&list, true, 0, false), Err("root view not set by the title"));
+    }
+
+    /// An indirect call without a host pipeline is one drop, under the
+    /// pipeline's reason (it was counted a second time as "indirect kind 2:
+    /// no host pipeline", among the draws lost to other causes).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn an_indirect_call_without_a_pipeline_is_dropped_once() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        crate::pipeline::take_drops();
+        // Kind 7: no other test's calls.
+        assert!(!State::default().execute_indirect(&list, (7, 12, 1), 0, None));
+        let drops = crate::pipeline::take_drops();
+        let of_it: Vec<_> = drops
+            .iter()
+            .filter(|(why, _)| why == "no pipeline set" || why.starts_with("indirect kind 7"))
+            .collect();
+        assert_eq!(of_it, [&("no pipeline set".to_owned(), 1)]);
+        let line = crate::pipeline::indirect_missing_line(1.0).unwrap();
+        assert!(line.contains("kind 7 no pipeline set 1.0"), "{line}");
     }
 
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through

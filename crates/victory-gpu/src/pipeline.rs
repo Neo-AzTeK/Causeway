@@ -366,17 +366,43 @@ pub(crate) fn shaders_of(this: This) -> String {
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
-    let why = if this.is_null() {
-        Some("no pipeline set".to_owned())
-    } else {
-        let p = pipeline(this);
-        skipped_shader(p)
-            .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
-    };
-    if let Some(why) = why {
+    if let Some(why) = drop_reason(this) {
         note_why(why);
     }
+}
+
+/// [`note_drop`] for an indirect call of kind `kind`: counted once among the
+/// drops, and by kind and root cause for [`indirect_missing_line`].
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_indirect_drop(kind: u32, this: This) {
+    if let Some(why) = drop_reason(this) {
+        let mut missing = INDIRECT_MISSING.lock().unwrap_or_else(|e| e.into_inner());
+        make::count_indirect(&mut missing, kind, &why);
+        note_why(why);
+    }
+}
+
+/// The log line splitting by kind and root cause the indirect calls without
+/// a host pipeline since the last one (also counted in [`take_drops`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn indirect_missing_line(frames: f64) -> Option<String> {
+    let missing = std::mem::take(&mut *INDIRECT_MISSING.lock().unwrap_or_else(|e| e.into_inner()));
+    make::indirect_line(&missing, frames)
+}
+#[cfg(all(windows, feature = "diagnostics"))]
+static INDIRECT_MISSING: Mutex<make::IndirectMissing> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Why a draw or dispatch of `this` has no host pipeline to run on; `None`
+/// if it has one after all.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn drop_reason(this: This) -> Option<String> {
+    if this.is_null() {
+        return Some("no pipeline set".to_owned());
+    }
+    let p = pipeline(this);
+    skipped_shader(p)
+        .map(|hash| format!("skipped shader {hash}"))
+        .or_else(|| make::missing(&p.host))
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).
