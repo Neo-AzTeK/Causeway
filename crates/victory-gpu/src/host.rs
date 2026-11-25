@@ -2588,6 +2588,12 @@ impl Meter {
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                let [refused, compiling, other] =
+                    crate::pipeline::drops_by_cause(&drops).map(|n| n as f64 / frames);
+                tracing::info!(
+                    "dropped by cause: refused {refused:.1}, compiling {compiling:.1}, \
+                     other {other:.1} draws/frame"
+                );
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
