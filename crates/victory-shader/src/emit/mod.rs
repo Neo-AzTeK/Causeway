@@ -233,6 +233,7 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+mod skips;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -240,6 +241,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
+pub use container::required_waves;
 pub use shader::{
     HEAP_SAMPLERS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_MARK_NONE,
     VIEW_MARKS, VIEW_STRIDES, VIEW_TABLE_HEADER, VIEW_WRITE_BITS, VIEW_WRITES,
@@ -430,8 +432,45 @@ pub fn emit(
     emit_with(c, native, p, st, io, res, Options::default())
 }
 
-/// [`emit`] made as `options` say.
+/// [`emit`] made as `options` say. A program of waves of 64 that still asks
+/// the host for them is made once more with the skips left out that keep a
+/// host wave from exchanging with its partner (module `skips`), and that is
+/// kept if it asks for no more than 32 lanes.
 pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    let first = emit_once(c, native, p, st, io, res, options);
+    let needs64 = |s: &HostShader| {
+        s.stage == HwStage::Cs && required_waves(&s.dxil).is_some_and(|(least, _)| least > 32)
+    };
+    if native.wave64 && native.stage == HwStage::Cs && first.as_ref().is_ok_and(needs64) {
+        let skips = skips::find(p);
+        if !skips.is_empty() {
+            let mut alt = native.clone();
+            alt.code = skips::leave_out(&native.code, &skips);
+            let again = || -> Result<HostShader, ShaderError> {
+                let (p, st) = crate::range::build(&alt.patched_code(), alt.wave64, alt.vgprs)?;
+                let res = resource::track(&p, &alt.layout, alt.stage, st.as_ref().ok())?;
+                let io = io::raise(&p, &alt)?;
+                emit_once(c, &alt, &p, &st?, &io, &res, options)
+            };
+            if let Ok(s) = again()
+                && !needs64(&s)
+            {
+                return Ok(s);
+            }
+        }
+    }
+    first
+}
+
+fn emit_once(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

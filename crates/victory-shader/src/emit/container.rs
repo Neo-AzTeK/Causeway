@@ -168,6 +168,25 @@ pub(crate) struct Psv<'a> {
     pub wave_size: Option<u32>,
 }
 
+/// The wave sizes (least, most) a shader's container requires, from its
+/// runtime information (`PSV0`); `None` if any will do.
+pub fn required_waves(container: &[u8]) -> Option<(u32, u32)> {
+    let word = |at: usize| -> Option<u32> {
+        let bytes = container.get(at..at.checked_add(4)?)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+    // After the hash, version and size: the parts' count and offsets.
+    let part = (0..word(28)? as usize)
+        .map_while(|i| Some(word(32 + 4 * i)? as usize))
+        .find(|&at| word(at) == Some(u32::from_le_bytes(*b"PSV0")))?;
+    // The part's name and size, the information's size, the information.
+    if word(part + 8)? < 24 {
+        return None;
+    }
+    let range = (word(part + 12 + 16)?, word(part + 12 + 20)?);
+    (range != (0, u32::MAX)).then_some(range)
+}
+
 /// `PSV0` with runtime info version 2 (validator 1.6).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
