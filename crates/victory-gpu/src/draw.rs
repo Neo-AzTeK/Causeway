@@ -35,6 +35,21 @@ enum Root {
     View(u64),
 }
 
+impl Root {
+    /// The address a shader reading this root parameter as a root view
+    /// takes: a root view's, or the first two dwords of root constants.
+    /// The console passes both as user registers, and titles set constants
+    /// holding an address where their shader reads a root view (a world
+    /// compute pass's slot 8, 14 dwords whose first two are an address).
+    fn address(&self) -> Option<u64> {
+        match self {
+            Root::View(address) => Some(*address),
+            Root::Constants(c) if c.len() >= 2 => Some(u64::from(c[0]) | u64::from(c[1]) << 32),
+            _ => None,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -385,8 +400,10 @@ impl State {
     /// view's address (title memory).
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
-            (Some(Root::View(address)), RootType::Descriptor) if dword < 2 => {
-                (address >> (32 * dword)) as u32
+            (Some(r @ (Root::View(_) | Root::Constants(_))), RootType::Descriptor)
+                if dword < 2 && r.address().is_some() =>
+            {
+                (r.address().unwrap_or_default() >> (32 * dword)) as u32
             }
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
                 Some(heap) => (handle - heap.start) as u32,
@@ -648,16 +665,16 @@ impl State {
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
-                        && let Some(Root::View(address)) =
-                            self.roots_ref(compute).get(usize::from(u.slot))
-                        && let Some(shadow) = crate::shadow::find(*address, 1)
+                        && let Some(address) =
+                            self.roots_ref(compute).get(usize::from(u.slot)).and_then(Root::address)
+                        && let Some(shadow) = crate::shadow::find(address, 1)
                     {
                         let uav = t.used.iter().any(|r| {
                             r.slot == u.slot
                                 && r.root == RootType::Descriptor
                                 && r.kind == ResourceType::Uav
                         });
-                        roots.push((*address, uav.then_some(shadow)));
+                        roots.push((address, uav.then_some(shadow)));
                     }
                     let fresh = made
                         .iter()
@@ -667,22 +684,23 @@ impl State {
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
                             let root = self.roots_ref(compute).get(usize::from(u.slot));
-                            let offset = match root {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
+                            let offset = match root.and_then(Root::address) {
+                                Some(address) => crate::shadow::find(address, 1)
                                     .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
+                                None => None,
                             };
                             match offset {
                                 Some(offset) => offset,
                                 None => {
-                                    let why = match root {
-                                        Some(Root::View(_)) => "root view offset: outside title buffers",
-                                        _ => "root view offset: no root view set",
+                                    let why = match root.and_then(Root::address) {
+                                        Some(_) => "root view offset: outside title buffers",
+                                        None => "root view offset: no root view set",
                                     };
                                     #[cfg(feature = "diagnostics")]
                                     {
-                                        static SEEN: AtomicU64 = AtomicU64::new(0);
-                                        if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+                                        // Eight of each: mesh passes, the rest.
+                                        static SEEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+                                        if SEEN[usize::from(self.mesh_pass)].fetch_add(1, Ordering::Relaxed) < 8 {
                                             let root = root.map(|r| format!("{r:?}"));
                                             tracing::warn!(slot = u.slot, ?root, compute, mesh_pass = self.mesh_pass, pipeline = %p.name, "{why}: dropped");
                                         }
@@ -737,12 +755,12 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let Some(address) = self.roots_ref(compute).get(usize::from(slot)).and_then(Root::address)
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
+                    let Some(gpu) = root_view(list, address, kind == 1, kind == 2) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -829,7 +847,7 @@ impl State {
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
-        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+        let Some(address) = self.roots_ref(compute).get(usize::from(slot)).and_then(Root::address) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             return None;
         };
@@ -2044,6 +2062,30 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A shader reading a root parameter as a root view takes the address
+    /// the title set there, as a root view or as the first two dwords of
+    /// root constants (as the console's user registers carry both); the
+    /// mesh pass reads the graphics ones.
+    #[test]
+    fn root_view_addresses_come_from_views_and_constants() {
+        let mut s = State::default();
+        let address = 0xD_72C8_0000u64;
+        s.set_constants(true, 8, &[address as u32, (address >> 32) as u32, 0, 0, 2, 2], 0);
+        s.set_view(false, 3, 0x1234_5000);
+        s.set_table(true, 2, 0x10);
+        let read = |s: &State, compute, slot: u8, dword| s.user_value(compute, slot, RootType::Descriptor, dword);
+        assert_eq!((read(&s, true, 8, 0), read(&s, true, 8, 1)), (0x72C8_0000, 0xD));
+        assert_eq!(s.roots_ref(true).get(8).and_then(Root::address), Some(address));
+        assert_eq!(s.roots_ref(false).get(3).and_then(Root::address), Some(0x1234_5000));
+        assert_eq!(s.roots_ref(true).get(2).and_then(Root::address), None, "a table is no address");
+        // One dword of constants is no address either.
+        s.set_constants(true, 9, &[7], 0);
+        assert_eq!(s.roots_ref(true).get(9).and_then(Root::address), None);
+        // The emulated mesh pass's compute bind reads the graphics roots.
+        s.mesh_pass = true;
+        assert_eq!(s.roots_ref(true).get(3).and_then(Root::address), Some(0x1234_5000));
+    }
+
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
