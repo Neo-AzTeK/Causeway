@@ -36,8 +36,8 @@ error kinds, branches and commits only.
   pixels non-flat in the saved frame: no 3D scene yet.
 
 ## Next, ranked by effect on the picture
-(Owner goal: >= 30 fps in the world. GTX 1070 order: mesh emulation (branch
-claude/mesh-emulation, testing), then world CPU preparation 220 ms/frame
+(Owner goal: >= 30 fps in the world. GTX 1070 order: mesh emulation (merged;
+~83 indirect calls/frame still not run), then world CPU preparation 220 ms/frame
 (copies ~89 ms for ~75 MB, ~130 ms unattributed), then GPU 145 ms.)
 0. (frame-wait hunt, see log) Real cost is GPU time before the removal
    (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
@@ -75,6 +75,18 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: merged claude/mesh-emulation (1958bb6): mesh programs made as
+  compute + indexed draw where Caps has mesh tier 0 (native kept for >= 1,
+  byte-identical per independent review). GTX 1070 run (ceefcd3, before the
+  review fixes): dropped/frame 2130 -> 275, drawn 451 -> 510, 2.1 fps (GPU
+  193 -> 234 ms); sky, sea, figures, HUD now draw, ground mostly black.
+  Review fixes: all primitive slots culled (also on the native path when
+  threads < max primitives: slots were undefined, now culled; not run on a
+  mesh-tier GPU), compute indices clamped, indirect overflow counted and
+  logged (shortcut), warm cache makes the compute form. Open: ~83 indirect
+  mesh calls/frame "emulated mesh dispatch not run" (cause not logged), one
+  E_INVALIDARG pipeline. Adapters: GTX 1070 and WARP (tests); no RTX, Intel
+  or wave64 host run.
 - 2026-11-25: GTX 1070 smokes 13-14 (main 93d7987, `VICTORY_SHADER_LOOP_LIMIT=64`):
   13 (420 s, fresh save) menus/loading 30 fps throughout, the scripted keys
   loop on the terms-of-use checkbox (ticked by hand). 14 (900 s, `--data-dir`
