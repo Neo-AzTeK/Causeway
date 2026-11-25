@@ -37,14 +37,19 @@ enum Root {
 
 impl Root {
     /// The address a shader reading this root parameter as a root view
-    /// takes: a root view's, or the first two dwords of root constants.
-    /// The console passes both as user registers, and titles set constants
-    /// holding an address where their shader reads a root view (a world
-    /// compute pass's slot 8, 14 dwords whose first two are an address).
+    /// takes: a root view's.
+    /// shortcut: titles also set root constants whose first two dwords are
+    /// an address where their shader reads a root view (a world compute
+    /// pass's slot 8: ~370 dispatches a frame dropped, "root view offset:
+    /// no root view set"). Reading those addresses drew them, but they lie
+    /// in title memory outside buffers, at ring positions: each root view
+    /// refreshed its 4 MiB window to the end (0.7-2.2 GB of copies a frame,
+    /// +300-700 ms preparing) and the windows, never freed, ran system
+    /// memory out after 8 minutes (mesh-emu-5). Take them once copies of
+    /// such memory are bounded to what the shader reads and freed.
     fn address(&self) -> Option<u64> {
         match self {
             Root::View(address) => Some(*address),
-            Root::Constants(c) if c.len() >= 2 => Some(u64::from(c[0]) | u64::from(c[1]) << 32),
             _ => None,
         }
     }
@@ -890,6 +895,7 @@ impl State {
         if run_heap != key || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
                 once!("no dynamic slots for root views: dropped");
+                not_run("no dynamic slots for root views");
                 return None;
             };
             self.dynamic.push((key, first, ROOT_VIEW_RUN));
@@ -2063,19 +2069,18 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 #[cfg(test)]
 mod tests {
     /// A shader reading a root parameter as a root view takes the address
-    /// the title set there, as a root view or as the first two dwords of
-    /// root constants (as the console's user registers carry both); the
-    /// mesh pass reads the graphics ones.
+    /// of the root view the title set there, not root constants (see
+    /// `Root::address`); the mesh pass reads the graphics ones.
     #[test]
-    fn root_view_addresses_come_from_views_and_constants() {
+    fn root_view_addresses_come_from_views_only() {
         let mut s = State::default();
         let address = 0xD_72C8_0000u64;
         s.set_constants(true, 8, &[address as u32, (address >> 32) as u32, 0, 0, 2, 2], 0);
         s.set_view(false, 3, 0x1234_5000);
         s.set_table(true, 2, 0x10);
         let read = |s: &State, compute, slot: u8, dword| s.user_value(compute, slot, RootType::Descriptor, dword);
-        assert_eq!((read(&s, true, 8, 0), read(&s, true, 8, 1)), (0x72C8_0000, 0xD));
-        assert_eq!(s.roots_ref(true).get(8).and_then(Root::address), Some(address));
+        assert_eq!((read(&s, false, 3, 0), read(&s, false, 3, 1)), (0x1234_5000, 0));
+        assert_eq!(s.roots_ref(true).get(8).and_then(Root::address), None, "constants holding {address:#x}");
         assert_eq!(s.roots_ref(false).get(3).and_then(Root::address), Some(0x1234_5000));
         assert_eq!(s.roots_ref(true).get(2).and_then(Root::address), None, "a table is no address");
         // One dword of constants is no address either.
