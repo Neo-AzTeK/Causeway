@@ -28,8 +28,10 @@ error kinds, branches and commits only.
 2. Dropped draws per frame: indirect kind 10 "prepare failed (mesh)" 468,
    indirect kind 2 "no host pipeline" 358, still compiling 230, "title memory
    without a view heap or page table" 168.
-3. Removal in submission 7982 (40 compute programs in one list, GPU timeout?):
-   bisect which program hangs; one error, one session.
+3. Program `a1f6cdf8874960a9` (compute, loops; smoke 11 skipped it: no removal,
+   slow submissions 4.5 s -> 250-285 ms): find why it runs so long on the host
+   (loop bound, s_barrier lane-uniformity, wave32 lowering) and fix it, then
+   stop skipping it. One error, one session.
 4. Refused pipelines: 63 need 64 lanes (the skips cannot be left out); lower
    them on wave32 or fall back.
 5. Untranslated: descriptor read only as data (pixel, compute), lane mask read
@@ -50,6 +52,10 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: smoke 11 (main 4f4befe, skip a1f6cdf8874960a9, 300 s): no removal,
+  0.7 fps (prep 609, GPU 239, copy-back 137, other 483 ms), 1376 drawn,
+  dropped 299 refused + 130 compiling + 461 other; still no visible 3D (0.0%
+  non-flat). One run, so the program is the likely cause, not proven.
 - 2026-11-25: frame-wait hunt (from smoke-out10 log, no run): the 2.4 s "other"
   median was a digest artifact. Before the removal (12:36:32) world lines show
   GPU 4-27 s/frame (4.6 s at 546 draws, 0.76 s at 5114 draws, preparing 0.4-0.5 s,
