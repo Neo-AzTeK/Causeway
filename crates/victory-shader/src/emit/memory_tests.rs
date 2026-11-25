@@ -407,7 +407,11 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         min_lod_clamp: false,
     })
     .expect("lower");
-    assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
+    // (Only the host's own view-stride table, which every heap access reads.)
+    assert!(
+        l.root_srvs.iter().all(|&slot| slot == super::VIEW_STRIDES) && !l.memory,
+        "no root descriptor, no title memory"
+    );
     let marks: Vec<(u32, u32)> = l
         .user_data
         .iter()

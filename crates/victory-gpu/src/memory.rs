@@ -670,9 +670,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        // SAFETY: a plain query of the live heap.
-        let room = crate::memory::heap().is_some_and(|h| unsafe { h.heap.GetDesc().NumDescriptors } >= victory_shader::emit::HEAP_VIEWS);
-        assert!(!room || (pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18), "past the dynamic slots: {pairs:?}");
+        // Pairs take slots past the (at least 2^16) dynamic ones where the heap has room.
+        let past = crate::memory::heap().map_or(0, |h| h.count() + (1 << 16));
+        assert!(pairs.0 >= past && pairs.1 >= past, "past the dynamic slots ({past}): {pairs:?}");
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {

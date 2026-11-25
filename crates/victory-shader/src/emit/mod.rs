@@ -69,8 +69,8 @@
 //!   addressed at element × the view's stride + offset, the stride from
 //!   the view-stride table: root SRV `t`[`VIEW_STRIDES`] in
 //!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
-//!   `i` the host keeps at the byte stride of the buffer view at heap
-//!   index `i`.
+//!   [`VIEW_TABLE_HEADER`] + `i` the host keeps at the byte stride of the
+//!   buffer view at heap index `i`.
 //! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
 //!   loads through a descriptor taken from the resource heap itself (root
 //!   type 5, so no used-resource entry) read a raw buffer view, not a
@@ -82,21 +82,24 @@
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
-//!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
-//!   many slots, those past its own null, so an index past the heap (data
-//!   still wrong; the console would read whatever memory follows its heap)
-//!   reads nothing instead of faulting the device.
+//! * **Heap indices** (added 2026-11-24) are clamped to the host's last
+//!   view heap index (samplers: [`HEAP_SAMPLERS`] − 1), so an index past the
+//!   heap (data still wrong; the console would read whatever memory follows
+//!   its heap) reads nothing instead of faulting the device. Hosts cap
+//!   their view heaps differently (1,000,000 slots on NVIDIA), so the
+//!   limit is not a constant: it is dword 0 of the view-stride table (the
+//!   header, [`VIEW_TABLE_HEADER`] dwords), which every shader taking a
+//!   view heap index lists in [`HostShader::root_srvs`].
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV
-//!   `t`[`VIEW_STRIDES`], which then covers every index below
-//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
-//!   unordered access the index below), which the host keeps a null raw
-//!   buffer SRV (UAV). The index comes from data, and a texture descriptor
-//!   read as a buffer one is a wild address (the texture's shifted 8 bits
-//!   down: GPU faults at low addresses).
+//!   `t`[`VIEW_STRIDES`], which covers every index of the heap, dynamic
+//!   slots too); where it holds 0 (no buffer view there) the shader reads
+//!   the heap index in header dword 1 instead (for unordered access the
+//!   index below), which the host keeps a null raw buffer SRV (UAV). The
+//!   index comes from data, and a texture descriptor read as a buffer one
+//!   is a wild address (the texture's shifted 8 bits down: GPU faults at
+//!   low addresses).
 //! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
 //!   added 2026-11-24): whether the shader takes descriptors from the
 //!   resource heap itself, and unordered access views among them; the
@@ -211,8 +214,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_STRIDES,
+    HEAP_SAMPLERS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_STRIDES,
+    VIEW_TABLE_HEADER,
 };
 
 /// The loop limit without an override: 2^20.

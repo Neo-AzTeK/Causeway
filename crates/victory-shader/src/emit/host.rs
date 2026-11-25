@@ -17,6 +17,61 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// The root parameter that holds each root signature's view-stride table
+/// (by the signature's address), so a run that gave no table for it gets a
+/// default one: header only, no buffer views.
+static STRIDE_TABLES: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The root parameter of `root`'s view-stride table, if it has one.
+fn stride_table_param(root: &ID3D12RootSignature) -> Option<u32> {
+    let tables = STRIDE_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    tables.iter().find(|t| t.0 == root.as_raw() as usize).map(|t| t.1)
+}
+
+/// An upload buffer holding `data`.
+fn upload_dwords(dev: &ID3D12Device, data: &[u32]) -> Result<ID3D12Resource, String> {
+    let mut b: Option<ID3D12Resource> = None;
+    // SAFETY: a plain committed upload buffer, mapped for one copy.
+    unsafe {
+        dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: (data.len() * 4).next_multiple_of(256) as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut b,
+        )
+        .map_err(err)?;
+        let b = b.ok_or_else(|| "no buffer".to_string())?;
+        let mut p = std::ptr::null_mut();
+        b.Map(0, None, Some(&mut p)).map_err(err)?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), data.len());
+        b.Unmap(0, None);
+        Ok(b)
+    }
+}
+
+/// The view-stride table of a view heap of `slots` slots without buffer
+/// views: the header (the last slot, which is also the null SRV's), zeros.
+fn empty_stride_table(slots: usize) -> Vec<u32> {
+    let last = slots.max(1) as u32 - 1;
+    let mut table = vec![last, last];
+    table.resize(super::VIEW_TABLE_HEADER as usize + slots, 0);
+    table
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -160,6 +215,10 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
+        // The view-stride table goes last, so the parameters before it keep
+        // their places whether or not a shader reads it.
+        let strides = views.iter().position(|&v| v == (super::VIEW_STRIDES, 1));
+        let strides = strides.map(|i| views.remove(i));
         let mut views: Vec<(u32, u32, u8)> = views
             .into_iter()
             .map(|(slot, kind)| (u32::from(slot), super::ROOT_CBV_SPACE, kind))
@@ -172,6 +231,10 @@ impl Host {
         }
         if stages.iter().any(|(s, _)| s.view_addresses) {
             views.push((1, super::MEMORY_SPACE, 1));
+        }
+        let table_param = strides.map(|_| (stages.len() + views.len()) as u32);
+        if let Some((slot, _)) = strides {
+            views.push((u32::from(slot), super::ROOT_CBV_SPACE, 1));
         }
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
@@ -236,7 +299,12 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            let key = root.as_raw() as usize;
+            let mut tables = STRIDE_TABLES.lock().unwrap_or_else(|e| e.into_inner());
+            tables.retain(|t| t.0 != key);
+            tables.extend(table_param.map(|p| (key, p)));
+            Ok(root)
         }
     }
 
@@ -587,6 +655,16 @@ impl Host {
                 user_data.as_ptr().cast(),
                 0,
             );
+            // The probe takes its table's descriptor from the heap, so it
+            // reads the view-stride table too (the heap's limit).
+            let _table = match stride_table_param(&root) {
+                Some(param) => {
+                    let b = upload_dwords(dev, &empty_stride_table(1))?;
+                    list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                    Some(b)
+                }
+                None => None,
+            };
             list.Dispatch(1, 1, 1);
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -1060,6 +1138,22 @@ impl Host {
                     Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
+            // A shader that clamps heap indices reads the view-stride table.
+            if let Some(param) = stride_table_param(root) {
+                let data = empty_stride_table(d.textures.len().max(1));
+                let b = make(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    &buf_desc((data.len() * 4).next_multiple_of(256) as u64),
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                    None,
+                )?;
+                let mut p = std::ptr::null_mut();
+                b.Map(0, None, Some(&mut p)).map_err(err)?;
+                std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), data.len());
+                b.Unmap(0, None);
+                list.SetGraphicsRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                keep.push(b);
+            }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
@@ -1220,9 +1314,9 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
-    /// below it.
+    /// Last in the list: the host's null raw buffer UAV in its slot and the
+    /// SRV in one more, which ends the heap (the slot the view-stride
+    /// table's header names).
     NullBuffers,
 }
 
@@ -1374,7 +1468,7 @@ impl Host {
                 Ok(b)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => d.views.len() + 1,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1731,10 +1825,8 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
-                        let (mut srv_at, mut uav_at) = (at, at);
-                        srv_at.ptr += (null - i) * view_size;
-                        uav_at.ptr += (null - 1 - i) * view_size;
+                        let (mut srv_at, uav_at) = (at, at);
+                        srv_at.ptr += view_size;
                         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
                             Format: DXGI_FORMAT_R32_TYPELESS,
                             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -1814,6 +1906,14 @@ impl Host {
                         uavs.push((b, None, n, rb));
                     }
                 }
+            }
+            // A shader that clamps heap indices reads the view-stride table.
+            if let Some(param) = stride_table_param(root)
+                && !d.roots.iter().any(|(p, _)| *p == param)
+            {
+                let b = upload(&empty_stride_table(slots))?;
+                list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                keep.push(b);
             }
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);

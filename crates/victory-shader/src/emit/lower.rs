@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_STRIDES, VIEW_TABLE_HEADER, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -4932,7 +4932,12 @@ impl<'a> Lower<'a> {
             _ => self.lane_heap_index(src, false)?,
         };
         let c = self.cur;
+        let last = self.s.view_limit();
+        let over = self.s.m.cmp(c, pred::IUGT, index, last);
+        let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
+        let header = self.s.m.i32(VIEW_TABLE_HEADER);
+        let index = self.s.m.bin(c, Bin::Add, index, header);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         let iu = self.s.m.undef(self.s.t.i32);
@@ -5179,11 +5184,13 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.view_limit();
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
+        let header = self.s.m.i32(VIEW_TABLE_HEADER);
+        let at = self.s.m.bin(c, Bin::Add, index, header);
+        let at = self.s.m.bin(c, Bin::Mul, at, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
         let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
@@ -5192,8 +5199,13 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
-        let null = self.s.m.i32(null);
+        let null = self.s.view_null();
+        let null = if props.0 & 0x1000 != 0 {
+            let one = self.s.m.i32(1);
+            self.s.m.bin(c, Bin::Sub, null, one)
+        } else {
+            null
+        };
         self.s.m.select(c, none, null, index)
     }
 
