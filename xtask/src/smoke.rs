@@ -211,6 +211,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         // Device-removed data costs little; without it a removal in an
         // unwatched run is "no breadcrumbs" (`clean` drops the caller's).
         ("VICTORY_D3D12_DRED".into(), "1".into()),
+        // A removal is logged (the digest still reports it) and the run goes
+        // on to its end, so the rest of the menus and the log are kept.
+        ("VICTORY_SURVIVE_REMOVAL".into(), "1".into()),
         ("VICTORY_KEYS".into(), keys.clone().into()),
         ("VICTORY_CAPTURE".into(), frames.clone().into_os_string()),
         ("VICTORY_CAPTURE_FRAMES".into(), capture_frames(args.seconds).into()),

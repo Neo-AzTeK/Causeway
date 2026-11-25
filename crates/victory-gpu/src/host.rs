@@ -93,6 +93,16 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// draws nothing at seconds per frame.
 static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
 
+/// Set once a device removal was logged and survived: later submissions
+/// skip the GPU (see `survive_removal`).
+static REMOVAL_SURVIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `VICTORY_SURVIVE_REMOVAL=1`: a device removal after a submission is
+/// logged and the run goes on without the GPU, instead of ending it.
+fn survive_removal() -> bool {
+    std::env::var_os("VICTORY_SURVIVE_REMOVAL").is_some_and(|v| v == "1")
+}
+
 /// Sets what a host GPU failure does (the runtime's crash report).
 pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
@@ -1091,8 +1101,24 @@ impl Host {
         }
     }
 
+    /// After a removal survived (`VICTORY_SURVIVE_REMOVAL=1`): nothing runs
+    /// and nothing is read back from the dead device; only the writes that
+    /// tell the title a list is done, so it does not wait for ever.
+    fn finish_without_gpu(runs: &[&HostList]) {
+        for list in runs {
+            for &(at, what, bytes) in &list.deferred().writes {
+                what.write(at as *mut u8, bytes);
+            }
+        }
+        release_retired();
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        if REMOVAL_SURVIVED.load(Ordering::Relaxed) {
+            Self::finish_without_gpu(runs);
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1256,14 +1282,24 @@ impl Host {
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
+            let what = format!(
                 "host GPU device removed after a submission of {} lists{}{}{}{}",
                 runs.len(),
                 journal_text(),
                 self.removal_data(runs),
                 last_notes(runs),
                 removed_during(runs, removed_in)
-            ));
+            );
+            // shortcut: opt-in, for runs that should log a removal and go on
+            // (menus, audio, scripts); no device is made again, so nothing
+            // draws afterwards and the title's GPU output is lost.
+            if !survive_removal() {
+                fail(format_args!("{what}"));
+            }
+            tracing::error!("{what}; VICTORY_SURVIVE_REMOVAL=1: the run goes on without the GPU");
+            REMOVAL_SURVIVED.store(true, Ordering::Relaxed);
+            Self::finish_without_gpu(runs);
+            return;
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
