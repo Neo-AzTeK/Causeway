@@ -38,6 +38,8 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    /// What the device can do, asked once (`Caps::probe`); planners read it.
+    pub(crate) caps: crate::caps::Caps,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -269,8 +271,10 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        let caps = crate::caps::Caps::probe(&device, &[]);
         Ok(Host {
             device,
+            caps,
             queue,
             fence,
             submitted: Mutex::new(0),

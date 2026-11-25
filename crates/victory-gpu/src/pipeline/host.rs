@@ -15,6 +15,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
 use super::{Shader, Translated, fallback};
+use crate::caps::{Caps, Refusal, WaveNeed, WavePlan, wave_plan};
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -557,8 +558,8 @@ impl HostPipeline {
         if compute.is_some() {
             // Refuse before creating: the host answers a wave size it lacks
             // with E_INVALIDARG, which says nothing.
-            if let Some(wave) = wave_mismatch(&code_bytes(&code(0)), wave_lanes(&host.device)) {
-                tracing::warn!(?shaders, wave, "host pipeline refused: wave size");
+            if let Some(wave) = wave_refusal(&host.caps, &code_bytes(&code(0))) {
+                tracing::warn!(?shaders, %wave, "host pipeline refused: wave size");
                 return None;
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -578,7 +579,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    let wave = wave_mismatch(&code_bytes(&code(0)), wave_lanes(&host.device));
+                    let wave = wave_refusal(&host.caps, &code_bytes(&code(0))).map(|r| r.to_string());
                     tracing::warn!(error = %e, ?shaders, wave, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -790,33 +791,17 @@ fn mesh_pipeline(
     )
 }
 
-/// The wave sizes (least, most) the host GPU may run shaders at.
-fn wave_lanes(device: &ID3D12Device) -> Option<(u32, u32)> {
-    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    // SAFETY: the query writes its own structure of the given size.
-    unsafe {
-        device
-            .CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS1,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-            .ok()?
-    };
-    Some((options.WaveLaneCountMin, options.WaveLaneCountMax))
-}
-
-/// For the log, why a host with wave sizes `host` refuses a shader that
-/// requires one: a console wave64 program whose result depends on its lanes
-/// cannot run on a GPU with waves of 32.
-fn wave_mismatch(container: &[u8], host: Option<(u32, u32)>) -> Option<String> {
-    let (need, have) = (required_waves(container)?, host?);
-    (need.0 > have.1 || need.1 < have.0).then(|| {
-        format!(
-            "requires waves of {} to {} lanes, the host has {} to {}",
-            need.0, need.1, have.0, have.1
-        )
-    })
+/// Why this host cannot run a compute shader whose container requires a wave
+/// size (a console wave64 program whose result depends on its lanes), by the
+/// caps' wave plan. Assumes the probed wave range and, for a host that picks
+/// its own size within a range, shader model 6.6 pinning (the shader carries
+/// its own `[WaveSize]`). An unknown range refuses (planner rule 1).
+fn wave_refusal(caps: &Caps, container: &[u8]) -> Option<Refusal> {
+    let (min, max) = required_waves(container)?;
+    match wave_plan(caps, WaveNeed::Lanes { min, max, pinnable: true }) {
+        WavePlan::Refuse(r) => Some(r),
+        WavePlan::Native | WavePlan::Pinned(_) => None,
+    }
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -897,18 +882,36 @@ mod tests {
         c
     }
 
-    /// A refused pipeline's log line says so when its shader requires a
-    /// wave size the host lacks, and only then.
+    /// A pipeline is refused when its shader requires a wave size the host
+    /// lacks, and only then: fake caps for wave32, wave64, 32..64 with and
+    /// without pinning, and an unknown range.
     #[test]
-    fn wave_sizes_the_host_lacks_are_named() {
-        let wave64 = container(64, 64);
-        assert_eq!(
-            wave_mismatch(&wave64, Some((32, 32))).as_deref(),
-            Some("requires waves of 64 to 64 lanes, the host has 32 to 32")
-        );
-        assert_eq!(wave_mismatch(&wave64, Some((32, 64))), None);
-        assert_eq!(wave_mismatch(&container(0, u32::MAX), Some((32, 32))), None);
-        assert_eq!(wave_mismatch(&wave64, None), None);
+    fn wave_sizes_the_host_lacks_are_refused() {
+        use crate::caps::{ShaderModel, reference};
+        let (wave64, wave32, any) = (container(64, 64), container(32, 32), container(0, u32::MAX));
+        let turing = reference::nvidia_modern();
+        let gcn = reference::amd_gcn();
+        let mut rdna = reference::amd_rdna();
+        let mut unknown = reference::amd_rdna();
+        unknown.wave = None;
+        // The owner's wave32-only card: as before, wave64 is refused.
+        let r = wave_refusal(&turing, &wave64).expect("refused").to_string();
+        assert!(r.contains("64 to 64") && r.contains("32 to 32"), "{r}");
+        assert!(wave_refusal(&turing, &wave32).is_none());
+        assert!(wave_refusal(&turing, &any).is_none());
+        // Wave64 only: the mirror image.
+        assert!(wave_refusal(&gcn, &wave64).is_none());
+        assert!(wave_refusal(&gcn, &wave32).is_some());
+        // 32..64 with pinning (SM 6.6): both served.
+        rdna.shader_model = Some(ShaderModel::SM6_6);
+        assert!(wave_refusal(&rdna, &wave64).is_none());
+        assert!(wave_refusal(&rdna, &wave32).is_none());
+        // 32..64 without pinning: a clean refusal, not E_INVALIDARG.
+        rdna.shader_model = Some(ShaderModel(0x65));
+        assert!(wave_refusal(&rdna, &wave64).is_some());
+        // Unknown range: refuse what needs a size, run what does not.
+        assert!(wave_refusal(&unknown, &wave64).is_some());
+        assert!(wave_refusal(&unknown, &any).is_none());
         for n in 0..wave64.len() {
             // Cut short: no panic.
             let _ = required_waves(&wave64[..n]);
