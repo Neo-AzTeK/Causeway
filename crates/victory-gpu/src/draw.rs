@@ -167,6 +167,19 @@ thread_local! {
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
+/// Notes why the draw or dispatch being prepared cannot run, unless an
+/// inner step named it already (diagnostics).
+fn not_run_unless_named(why: &'static str) {
+    #[cfg(feature = "diagnostics")]
+    NOT_RUN.with(|w| {
+        if w.get().is_empty() {
+            w.set(why);
+        }
+    });
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = why;
+}
+
 /// Notes why the draw or dispatch being prepared cannot run (diagnostics).
 fn not_run(why: &'static str) {
     #[cfg(feature = "diagnostics")]
@@ -1166,11 +1179,11 @@ impl State {
             (stride, max),
             |compute| self.bind_mesh_pass(list, e, compute),
         );
-        if !ran {
-            not_run("emulated indirect mesh dispatch");
+        if let Err(e) = ran {
+            not_run_unless_named(e);
         }
         self.set_topology(list, self.topology);
-        ran
+        ran.is_ok()
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -1738,7 +1751,8 @@ impl State {
             let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
             let ran = self.execute_mesh_emulated(list, e, (args.gpu(arguments), count), (stride, max));
             if !ran {
-                why("emulated mesh dispatch not run");
+                #[cfg(feature = "diagnostics")]
+                why(&format!("emulated mesh: {}", NOT_RUN.with(|w| w.replace(""))));
             }
             return ran;
         }

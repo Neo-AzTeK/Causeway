@@ -477,7 +477,7 @@ pub(crate) fn run_direct(
 /// `bind(true)` binds the compute pass, which runs the dispatches, and
 /// `bind(false)` the draw pass, which runs the draws (`signatures`:
 /// [`signatures`]). Replaces the list's compute pipeline; its topology is a
-/// triangle list after. False if a step could not be recorded.
+/// triangle list after. The step that could not be recorded, if one.
 #[cfg(windows)]
 pub(crate) fn run_indirect(
     list: &crate::host::HostList,
@@ -487,7 +487,7 @@ pub(crate) fn run_indirect(
     (args, count): (u64, Option<u64>),
     (stride, max): (u32, u32),
     mut bind: impl FnMut(bool) -> bool,
-) -> bool {
+) -> Result<(), &'static str> {
     let records = max.min(RECORDS);
     if max > records {
         static PAST: std::sync::Once = std::sync::Once::new();
@@ -497,10 +497,11 @@ pub(crate) fn run_indirect(
     note_lost(scratch);
     let per_group = (layout.stride * layout.max_vertices, layout.max_primitives, capacity);
     if !convert(list, scratch, (args, count), (stride, records), per_group) {
-        return false;
+        return Err("no mesh record converter");
     }
     let l = &list.list;
-    let ran = bind(true) && {
+    let computed = bind(true);
+    let drawn = computed && {
         // SAFETY: an open list with the compute pass bound; our buffers
         // live for good.
         unsafe {
@@ -531,7 +532,11 @@ pub(crate) fn run_indirect(
             D3D12_RESOURCE_STATE_COMMON,
         )]);
     }
-    ran
+    match (computed, drawn) {
+        (false, _) => Err("compute pass not bound"),
+        (true, false) => Err("draw pass not bound"),
+        (true, true) => Ok(()),
+    }
 }
 
 /// Logs the groups indirect calls lost past the scratch, each time the
@@ -969,7 +974,8 @@ mod gpu_tests {
             (gpu, Some(gpu + 48)),
             (12, 4),
             binder(&list, &p, &heap),
-        ));
+        )
+        .is_ok());
         let (lit, commands) = finish(host, list, &rt, (&scratch.commands, 0, u64::from(DRAWS_AT + 4 * DRAW_RECORD)));
         assert!(lit.iter().all(|&l| l), "{} of 256 texels drawn", lit.iter().filter(|&&l| l).count());
         // SAFETY: a live buffer.
@@ -1001,7 +1007,8 @@ mod gpu_tests {
             (gpu, None),
             (12, 1),
             binder(&list, &p, &heap),
-        ));
+        )
+        .is_ok());
         let (lit, _) = finish(host, list, &rt, (&scratch.commands, 0, 4));
         assert!(lit.iter().all(|&l| !l), "a record past the scratch drew");
         // SAFETY: as above.
