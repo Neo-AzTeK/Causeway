@@ -225,7 +225,15 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+        let info = adapter.as_ref().and_then(|a| a.GetDesc1().ok());
+        crate::vram::init(
+            adapter.clone(),
+            info.as_ref().map_or_else(Default::default, |d| crate::vram::Adapter {
+                dedicated: d.DedicatedVideoMemory as u64,
+                shared: d.SharedSystemMemory as u64,
+            }),
+        );
+        if let Some(desc) = info {
             tracing::info!(
                 adapter = %adapter_name(&desc),
                 vendor = format_args!("{:#06x}", desc.VendorId),
@@ -1019,6 +1027,7 @@ impl Host {
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
+            list.touch_textures();
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1585,6 +1594,15 @@ impl HostList {
         }
         let wanted = legal_state(texture, wanted);
         self.track(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// Stamps the host textures the list holds as used now, resident again if
+    /// eviction took them since it was recorded (`crate::vram`).
+    fn touch_textures(&self) {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, _, copy) in states.values() {
+            copy.touch();
+        }
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
