@@ -151,13 +151,27 @@ fn mirror(handle: u64) {
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32, id: u64) {
+    with_host_heap(heap, |host| host.release(first, n, id));
+}
+
+/// Marks take `id` of that heap's dynamic slots as run (its list has been
+/// submitted and waited for): the slots may be taken back.
+#[cfg(windows)]
+pub(crate) fn retire_dynamic(heap: usize, id: u64) {
+    with_host_heap(heap, |host| host.retire(id));
+}
+
+/// Runs `f` on the host heap behind the title heap at `heap`, if it still
+/// exists.
+#[cfg(windows)]
+fn with_host_heap(heap: usize, f: impl FnOnce(&host::HostHeap)) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        f(host);
     }
 }
 
