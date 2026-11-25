@@ -102,6 +102,7 @@ pub(super) fn translate_group(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -117,6 +118,7 @@ pub(super) fn translate_group(
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     })
 }
 

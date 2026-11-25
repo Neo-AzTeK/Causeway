@@ -373,6 +373,10 @@ impl Host {
         if stages.iter().any(|(s, _)| s.view_addresses) {
             views.push((1, super::MEMORY_SPACE, 1));
         }
+        if stages.iter().any(|(s, _)| s.view_marks) {
+            views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
+            views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
+        }
         let table_param = strides.map(|_| (stages.len() + views.len()) as u32);
         if let Some((slot, _)) = strides {
             views.push((u32::from(slot), super::ROOT_CBV_SPACE, 1));
@@ -394,12 +398,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter as i32),
+                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
@@ -904,6 +920,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -919,6 +936,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     })
 }
 
@@ -1017,6 +1035,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         view_addresses: false,
         heap: false,
         heap_writes: false,
+        view_marks: false,
     }
 }
 
