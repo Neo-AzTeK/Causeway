@@ -87,7 +87,9 @@ the guest `s_barrier` in a loop is lane-uniform.
   branch: copies up to 64 KiB placed on 64 KiB blocks of 32 MiB
   buffer-only heaps (resource heap tier 1 and 2), a dead copy's block free
   after the next submission has run; committed buffer as before past 64 KiB
-  or if the host refuses. Bench: placed+mapped 5.2 us vs committed 150 us.
+  or if the host refuses (kept: not asked again). Views of a placed copy
+  reach its length rounded up to 256, zeroed at placement, as a buffer of
+  its own (review). Bench: placed+mapped 5.2 us vs committed 150 us.
   Not verified in the title: runs pcost-3/-4 (and mesh-emu-3, another
   branch) crashed at title start before the host device (0xc0000005 in the
   title image, write 0x0), with ~8 GB of 43 GB commit free on the machine.

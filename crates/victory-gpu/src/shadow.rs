@@ -149,6 +149,18 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// The bytes of its buffer host views may reach: a copy placed on a
+    /// heap block reaches its own length rounded up to 256 (zeros past it),
+    /// as a buffer of its own did, not the rest of the block (an older
+    /// copy's bytes).
+    pub(crate) fn host_len(&self) -> u64 {
+        if self.block.is_some() {
+            return self.len.next_multiple_of(256);
+        }
+        // SAFETY: a live buffer.
+        unsafe { self.buffer.GetDesc() }.Width
+    }
+
     /// After a submission whose shaders wrote title memory at addresses they
     /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`:
     /// the bytes of the page (cut to the copy) that differ from title memory
@@ -1005,7 +1017,14 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // ms (0.56 in the world), ~58 per world frame (GTX 1070, run pcost-1).
     let placed = (len <= BLOCK).then(placed_buffer).flatten();
     let (buffer, data, block) = match placed {
-        Some((buffer, data, block)) => (buffer, data, Some(block)),
+        Some((buffer, data, block)) => {
+            // Zeros where an older copy's bytes are, up to what views reach
+            // ([`Shadow::host_len`]), as in a buffer of its own: views read
+            // them before a refresh, and past its length.
+            // SAFETY: the mapped block holds `BLOCK` bytes.
+            unsafe { std::ptr::write_bytes(data, 0, len.next_multiple_of(256) as usize) };
+            (buffer, data, Some(block))
+        }
         None => {
             let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
             (buffer, data, None)
@@ -1014,8 +1033,8 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    // A block holds an older copy's bytes: a new copy takes every page (or
-    // the whole of untracked memory) at its first refresh.
+    // A new copy takes every page (or the whole of untracked memory) at
+    // its first refresh.
     let shadow = Shadow::new(buffer, data, gpu, address, len, block);
     map.insert((address, len), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
@@ -1093,12 +1112,28 @@ pub(crate) fn blocks_cooled() {
     blocks().cooled();
 }
 
+/// The host refused a view-copy heap or a buffer placed on one: copies of
+/// views get buffers of their own from then on, without asking again (a
+/// 32 MiB heap per copy, under the blocks' lock).
+static NOT_PLACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The host refused to place a view copy (see [`NOT_PLACED`]).
+fn not_placed(error: Option<windows::core::Error>, what: &str) {
+    if !NOT_PLACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(error = ?error, "{what}: copies of views get buffers of their own");
+    }
+}
+
 /// A mapped buffer of [`BLOCK`] bytes, which shaders may write, placed on a
 /// free block of a view-copy heap (CPU memory, as
-/// [`crate::host::Host::shared_buffer`]); none if the host refuses.
+/// [`crate::host::Host::shared_buffer`]); none if the host refuses (and
+/// from then on).
 fn placed_buffer() -> Option<(ID3D12Resource, *mut u8, Block)> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    if NOT_PLACED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let device = &host()?.device;
     let properties = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_CUSTOM,
@@ -1117,11 +1152,18 @@ fn placed_buffer() -> Option<(ID3D12Resource, *mut u8, Block)> {
         };
         let mut heap = None;
         // SAFETY: plain creation.
-        match unsafe { device.CreateHeap(&desc, &mut heap) } {
+        let made = unsafe { device.CreateHeap(&desc, &mut heap) };
+        #[cfg(test)]
+        let made = if tests::REFUSE_HEAP.load(std::sync::atomic::Ordering::Relaxed) {
+            heap = None;
+            Err(windows::core::Error::empty())
+        } else {
+            made
+        };
+        match made {
             Ok(()) => heap,
             Err(e) => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| tracing::warn!(error = %e, "no view-copy heap: copies of views get buffers of their own"));
+                not_placed(Some(e), "no view-copy heap");
                 None
             }
         }
@@ -1149,11 +1191,16 @@ fn placed_buffer() -> Option<(ID3D12Resource, *mut u8, Block)> {
                 b.Map(0, None, Some(&mut data))
             })
     };
+    #[cfg(test)]
+    let made = if tests::REFUSE_PLACEMENT.load(std::sync::atomic::Ordering::Relaxed) {
+        Err(windows::core::Error::empty())
+    } else {
+        made
+    };
     match (made, buffer) {
         (Ok(()), Some(buffer)) => Some((buffer, data.cast(), block)),
         (made, _) => {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(error = ?made.err(), "view copy not placed: a buffer of its own"));
+            not_placed(made.err(), "view copy not placed");
             blocks.free.push(block);
             None
         }
@@ -1243,8 +1290,52 @@ fn merge_gpu_bytes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    /// The host refuses view-copy heaps, placed buffers (as if).
+    pub(super) static REFUSE_HEAP: AtomicBool = AtomicBool::new(false);
+    pub(super) static REFUSE_PLACEMENT: AtomicBool = AtomicBool::new(false);
+    /// Tests that refuse placing view copies, and those that need it, one
+    /// at a time.
+    pub(crate) static PLACING: Mutex<()> = Mutex::new(());
+
+    /// A host that refuses a view-copy heap or a buffer placed on one: the
+    /// copy gets a buffer of its own, which its views reach as before, and
+    /// the host is not asked again (a 32 MiB heap per copy, under a lock).
+    #[test]
+    fn refused_view_copy_heaps_and_placements_fall_back_to_buffers() {
+        let _placing = PLACING.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::watch::tests::pool(3);
+        register(p, p as u64, 3 * PAGE as u64);
+        if host().is_none() {
+            unregister(p, p as u64);
+            eprintln!("skipped: no host GPU");
+            return;
+        }
+        let copy_at = |k: u64| for_view(p as u64 + 4 + 16 * k, 4000, 16).unwrap();
+        for (refuse, k) in [(&REFUSE_PLACEMENT, 0), (&REFUSE_HEAP, 1)] {
+            // No free block: a heap is asked for.
+            let free = std::mem::take(&mut blocks().free);
+            refuse.store(true, Relaxed);
+            let (copy, own) = copy_at(k);
+            refuse.store(false, Relaxed);
+            blocks().free.extend(free);
+            assert!(own && copy.block.is_none(), "a buffer of its own");
+            assert!(NOT_PLACED.load(Relaxed), "the refusal is kept");
+            assert_eq!(copy.host_len(), 4000u64.next_multiple_of(256));
+            let start = p + 4 + 16 * k as usize;
+            assert!(copy.update(start, 4000) > 0);
+            // SAFETY: words of our pool.
+            let title = (0..4).map(|w| unsafe { ((start + 4 * w) as *const u32).read_unaligned() });
+            assert_eq!(copy.read_host(start as u64, 4), title.collect::<Vec<_>>());
+            let (again, _) = copy_at(k + 2);
+            assert!(again.block.is_none(), "not asked again, blocks free or not");
+            NOT_PLACED.store(false, Relaxed);
+        }
+        unregister(p, p as u64);
+    }
 
     /// A dead view copy's block is free again only once a submission has
     /// run (one running may still read it); heaps are made as blocks run
@@ -1273,11 +1364,13 @@ mod tests {
 
     /// Ring positions change every world frame: copies of views off their
     /// buffer's elements are placed on heap blocks (a buffer of their own
-    /// cost 0.56 ms, ~58 per frame), one over a block a dead copy used gets
-    /// all of its own bytes at its first refresh; longer ones still get a
-    /// buffer of their own.
+    /// cost 0.56 ms, ~58 per frame), one over a block a dead copy used
+    /// reads zeros as far as its views reach (its length rounded up to 256)
+    /// and all of its own bytes after its first refresh; longer ones still
+    /// get a buffer of their own.
     #[test]
     fn view_copies_are_placed_on_heap_blocks() {
+        let _placing = PLACING.lock().unwrap_or_else(|e| e.into_inner());
         let p = crate::watch::tests::pool(3);
         let size = 3 * PAGE;
         register(p, p as u64, size as u64);
@@ -1309,6 +1402,10 @@ mod tests {
                 hit.then_some(copy)
             })
             .expect("the dead copy's block is reused");
+        assert_eq!(second.host_len(), 3072, "not the block's 64 KiB");
+        // SAFETY: the mapped block's first bytes.
+        let reach = unsafe { std::slice::from_raw_parts(second.data, 3072) };
+        assert!(reach.iter().all(|&b| b == 0), "zeros, not the dead copy's bytes");
         assert!(second.update(p + 8, 3000) > 0, "its first refresh copies");
         assert_eq!(second.read_host(p as u64 + 8, 4), words(p as u64 + 8));
         let (long, own) = for_view(p as u64 + 4, BLOCK + 4096, 16).unwrap();
