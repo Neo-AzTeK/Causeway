@@ -617,6 +617,11 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+mod fallback;
+#[cfg(windows)]
+pub use fallback::counts as fallback_counts;
+#[cfg(windows)]
+pub(crate) use fallback::drew as fallback_drew;
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
