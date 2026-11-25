@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Cast, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -20,8 +20,11 @@ pub const VIEW_STRIDES: u8 = 255;
 /// of its view heap: dword 0 is the last heap index (the heap has that many
 /// slots and one more; hosts cap their heaps differently, so the shader
 /// reads it), dword 1 the index of the null raw buffer SRV (the null raw
-/// UAV is the one below).
-pub const VIEW_TABLE_HEADER: u32 = 2;
+/// UAV is the one below), dword 2 the first title slot the host remaps
+/// and dword 3 how many remap entries follow the strides (at least one):
+/// entry `i` is the host slot of title slot dword 2 + `i` (`emit`, "Title
+/// slots past the host heap").
+pub const VIEW_TABLE_HEADER: u32 = 4;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
@@ -123,6 +126,7 @@ pub(crate) struct Shader {
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
+    view_remap: Option<(V, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -192,6 +196,7 @@ impl Shader {
             view_marks: None,
             view_writes: None,
             view_index: std::collections::HashMap::new(),
+            view_remap: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -552,6 +557,49 @@ impl Shader {
         let v = self.view_table_dword(1);
         self.view_null = Some(v);
         v
+    }
+
+    /// The host slot of title view heap index `index` (a resource heap
+    /// index): itself below the first remapped title slot (header dword 2),
+    /// else its remap entry, the last for an index past them (module notes,
+    /// "Title slots past the host heap").
+    pub fn remap_view(&mut self, block: usize, index: V) -> V {
+        let (first, entries) = match self.view_remap {
+            Some(r) => r,
+            None => {
+                let r = (self.view_table_dword(2), self.view_table_dword(3));
+                self.view_remap = Some(r);
+                r
+            }
+        };
+        let last = self.view_limit();
+        let past = self.m.cmp(block, pred::IUGE, index, first);
+        // Below `first` the difference wraps and is clamped too: the load
+        // stays in the table either way.
+        let at = self.m.bin(block, Bin::Sub, index, first);
+        let one = self.m.i32(1);
+        let max = self.m.bin(block, Bin::Sub, entries, one);
+        let over = self.m.cmp(block, pred::IUGT, at, max);
+        let at = self.m.select(block, over, max, at);
+        // Entries follow the header and a stride per host slot (`last` + 1).
+        let skip = self.m.i32(VIEW_TABLE_HEADER + 1);
+        let at = self.m.bin(block, Bin::Add, at, last);
+        let at = self.m.bin(block, Bin::Add, at, skip);
+        let four = self.m.i32(4);
+        let at = self.m.bin(block, Bin::Mul, at, four);
+        let table = self.root_srv_handle(VIEW_STRIDES);
+        let (undef, mask) = (self.m.undef(self.t.i32), self.m.i8(1));
+        let r = self.op(
+            block,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.t.res_ret,
+            139,
+            &[table, at, undef, mask, four],
+        );
+        let x = self.m.extract(block, r, 0);
+        let slot = self.m.cast(block, Cast::Bitcast, x, self.t.i32);
+        self.m.select(block, past, slot, index)
     }
 
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when

@@ -90,6 +90,15 @@
 //!   limit is not a constant: it is dword 0 of the view-stride table (the
 //!   header, [`VIEW_TABLE_HEADER`] dwords), which every shader taking a
 //!   view heap index lists in [`HostShader::root_srvs`].
+//! * **Title slots past the host heap** (added 2026-11-25): a host may
+//!   hold fewer view slots than the title's heap (NVIDIA: 1,000,000, the
+//!   title 1,245,184). Indices a shader takes from the resource heap itself
+//!   (title slots) from header dword 2 on read their remap entry, which
+//!   follows the strides (header dword 3 entries, the index past them
+//!   clamped to the last): the host slot the host made that title slot in,
+//!   or its null SRV. Table indices are the host's own and are not
+//!   remapped. Where the host holds the whole heap, dword 2 is the heap's
+//!   end and the one entry the null SRV: as the clamp.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV

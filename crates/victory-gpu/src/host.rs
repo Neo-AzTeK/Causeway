@@ -1001,6 +1001,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Last before the lists run: every texture they reach is raised by
+        // now (`resource::residency`).
+        crate::resource::make_resident(&self.device);
         let prepared = std::time::Instant::now();
         // One ExecuteCommandLists per run (with its prelude): the scheduler
         // can preempt between calls, which one 8-list call gave it no chance
@@ -2529,11 +2532,15 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
+            let (resident, resident_ms) = crate::resource::resident_counts();
             tracing::info!(
-                "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
+                "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists, {:.0} MB resident, {:.1} ms/frame making them so), \
+                 title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
                  copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
                 bytes as f64 / 1e6,
                 used as f64 / 1e6,
+                resident as f64 / 1e6,
+                resident_ms / frames,
                 saved as f64 / 1e6,
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,

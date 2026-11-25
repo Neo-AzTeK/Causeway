@@ -64,11 +64,13 @@ fn upload_dwords(dev: &ID3D12Device, data: &[u32]) -> Result<ID3D12Resource, Str
 }
 
 /// The view-stride table of a view heap of `slots` slots without buffer
-/// views: the header (the last slot, which is also the null SRV's), zeros.
+/// views: the header (the last slot, which is also the null SRV's; no
+/// title slot remapped: one entry, from the heap's end), zeros, the entry.
 fn empty_stride_table(slots: usize) -> Vec<u32> {
-    let last = slots.max(1) as u32 - 1;
-    let mut table = vec![last, last];
-    table.resize(super::VIEW_TABLE_HEADER as usize + slots, 0);
+    let slots = slots.max(1) as u32;
+    let mut table = vec![slots - 1, slots - 1, slots, 1];
+    table.resize((super::VIEW_TABLE_HEADER + slots) as usize, 0);
+    table.push(slots - 1);
     table
 }
 

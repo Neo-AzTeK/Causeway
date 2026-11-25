@@ -1106,6 +1106,9 @@ impl State {
                 continue;
             };
             if index >= host.count() {
+                #[cfg(feature = "diagnostics")]
+                crate::descriptor::host::census::PAST_TABLES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 fresh.push(u.slot);
             }
         }
