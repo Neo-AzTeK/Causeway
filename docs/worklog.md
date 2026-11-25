@@ -13,18 +13,30 @@ error kinds, branches and commits only.
   (0x887A0005, then ended) about 3 minutes in; 64 pipelines refused, 63 for
   wave 64. The world's 3D scene is not reached yet.
 
+- Smoke 10 (main 162672f, 300 s, survive-removal on): ran to the end, in the
+  world: 0.4 fps (2.4 s/frame, mostly waits), 1743 draws/frame, lost per frame:
+  refused 377, compiling 230, other 1245. One removal at ~3.5 min (submission
+  7982 of 1 list, 40 compute programs, journal in smoke-out10/run/log.txt);
+  after it only 56 programs refused as "device suspended". Only 0.4% of
+  pixels non-flat in the saved frame: no 3D scene yet.
+
 ## Next, ranked by effect on the picture
-1. Reach the world without a removal: log of a survive-removal smoke names the
-   submission (DRED, journal). One error, one session.
-2. Refused pipelines: 63 need 64 lanes (the skips cannot be left out); lower
+1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
+   (present, pacing, fences). Biggest lever on everything else.
+2. Dropped draws per frame: indirect kind 10 "prepare failed (mesh)" 468,
+   indirect kind 2 "no host pipeline" 358, still compiling 230, "title memory
+   without a view heap or page table" 168.
+3. Removal in submission 7982 (40 compute programs in one list, GPU timeout?):
+   bisect which program hangs; one error, one session.
+4. Refused pipelines: 63 need 64 lanes (the skips cannot be left out); lower
    them on wave32 or fall back.
-3. Untranslated: descriptor read only as data (pixel, compute), lane mask read
+5. Untranslated: descriptor read only as data (pixel, compute), lane mask read
    as data, barycentrics read directly.
-4. Descriptor table full ("no free dynamic descriptor slots", "no free pool
+6. Descriptor table full ("no free dynamic descriptor slots", "no free pool
    slot"): the other AI owns descriptors and heaps; report to it.
-5. Caps wave 2: emit `Options` plumbing for the wave plan; shader-facing caps
+7. Caps wave 2: emit `Options` plumbing for the wave plan; shader-facing caps
    and the cache key from Caps; device lifetime (new device after loss).
-6. Unimplemented device methods (two slots seen in smoke 9).
+8. Unimplemented device methods (two slots seen in smoke 9).
 
 ## Open decisions (owner)
 - Pass the other AI the review of 2863ff3, 32f83df, 433ecf7.
@@ -36,5 +48,6 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: smoke 10 reached the world (0.4 fps, one removal survived).
 - 2026-11-25: merged check-health, run-digest, device-removal, wave64-refusals,
   caps wave plan, caps memory plan; added `VICTORY_SURVIVE_REMOVAL`.
