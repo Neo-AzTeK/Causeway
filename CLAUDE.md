@@ -11,9 +11,7 @@ what agents need.
 | Need | File |
 |------|------|
 | rules, flow, checks, hardware range | `CONTRIBUTING.md` |
-| current state, next work, owner decisions (local, ignored) | `.local/handoff.md` |
-| run log, recipes (local, ignored) | `.local/log.md`, `.local/recipes.md` |
-| cost, delegation, reading, handoff workflow | `docs/agent-workflow.md` |
+| cost, delegation, reading, output | `docs/agent-workflow.md` |
 | cross-crate flow, import resolution | `docs/architecture.md` |
 | debug variables, smoke runs | `docs/debugging.md` |
 | capabilities, planners, fakes | `docs/hardware-range.md`, `docs/gpu-review-checklist.md` |
@@ -21,10 +19,6 @@ what agents need.
 | asset policy | `docs/asset-policy.md` |
 | crate notes | `crates/victory-{shader,gpu,hle}/CLAUDE.md`: Read before working there |
 | briefing a session or agent | skill `task-brief`; agents `scout`, `reviewer` |
-
-Start of a session: read `.local/handoff.md` before choosing work. In a
-worktree, the local files are in the main checkout (`git rev-parse
---git-common-dir`, its parent folder), not in the worktree.
 
 ## Agent rules
 
@@ -40,7 +34,6 @@ worktree, the local files are in the main checkout (`git rev-parse
 - Grep, then read at most 150 lines; never a source file over 800 lines whole
   (`lower.rs`); at most 60 lines of output per command; do not re-read a file
   after editing it. Details: `docs/agent-workflow.md`.
-- End early, before context fills: commit what is verified, update
-  `.local/handoff.md`, say what is unverified, tell the owner to wipe context.
+- Commit what is verified before a long step; say what is unverified.
 - Correctness beats saving tokens: before changing a function, read all of it,
   its callers and its tests.

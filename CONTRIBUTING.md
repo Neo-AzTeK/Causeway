@@ -66,9 +66,3 @@ full log kept (`cargo xtask smoke`, see `docs/debugging.md`). Scripted menu
 skipping must not tick the game's legal terms without the owner's OK for that
 launch: use a data directory already set up.
 
-## Working notes
-
-Handoff state, the ranked next-work list and the run log are personal and
-local: `.local/` is gitignored (see `docs/agent-workflow.md`). Durable facts
-belong in the tracked docs: adapters in `docs/adapters.md`, design in
-`docs/architecture.md`, debugging switches in `docs/debugging.md`.
