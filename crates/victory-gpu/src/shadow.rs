@@ -210,6 +210,7 @@ impl Shadow {
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
+            let mut dirty: Vec<(usize, usize)> = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -243,21 +244,30 @@ impl Shadow {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::BackMergeUs, t2.elapsed().as_micros() as u64);
                     // Only the 4 KiB pages the GPU changed: the rest of the
-                    // piece is title memory as it is, and rewriting it cost
-                    // seconds a frame in the world.
-                    #[cfg(feature = "diagnostics")]
-                    let t3 = std::time::Instant::now();
-                    for (off, len) in page_runs(pages, phase, n) {
-                        crate::watch::writing(start + at + off, len);
-                        crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                        written += len;
-                    }
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
+                    // piece is title memory as it is. The copy now equals
+                    // title memory there, so the writes below come from it,
+                    // joined across pieces into few calls.
+                    dirty.extend(page_runs(pages, phase, n).into_iter().map(|(o, l)| (start + at + o, start + at + o + l)));
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
+            #[cfg(feature = "diagnostics")]
+            let t3 = std::time::Instant::now();
+            for (a, b) in join(std::mem::take(&mut dirty)) {
+                #[cfg(feature = "diagnostics")]
+                let t5 = std::time::Instant::now();
+                crate::watch::writing(a, b - a);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackGuardUs, t5.elapsed().as_micros() as u64);
+                // SAFETY: inside the mapping.
+                crate::host::write_mapped(a as *mut u8, unsafe { self.data.add(a - start) }, b - a);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackWrites, 1);
+                written += b - a;
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
