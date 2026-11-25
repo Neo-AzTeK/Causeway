@@ -162,8 +162,16 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// it in the list (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
-    let why = NOT_RUN.with(|w| w.replace(""));
-    if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
+    // A skip or a missing host pipeline is the pipeline's own reason.
+    let own = crate::pipeline::is_skipped(pipeline as This)
+        || crate::pipeline::host_pipeline(pipeline as This).is_none();
+    let why = if own {
+        NOT_RUN.with(|w| w.set(""));
+        ""
+    } else {
+        take_not_run()
+    };
+    if own {
         crate::pipeline::note_drop(pipeline as This);
     } else {
         crate::pipeline::note_why(format!("{kind}: {why}"));
