@@ -160,6 +160,13 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     rest.split_whitespace().next()
 }
 
+/// The `wave` field: why a pipeline was refused before the host was asked.
+/// It is the line's last field, and its text (any `Display`) is not quoted.
+fn wave_reason(line: &str) -> Option<&str> {
+    let value = line.split_once(" wave=")?.1.trim();
+    Some(value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value))
+}
+
 /// Without terminal escape sequences (`ESC [ ... letter`).
 fn plain(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
@@ -390,7 +397,7 @@ impl Log {
             let shaders = field(line, "shaders").unwrap_or("?").to_owned();
             // A refusal made before the host was asked has no `error`: its
             // reason is the `wave` field, or else the message.
-            let reason = match field(line, "wave") {
+            let reason = match wave_reason(line) {
                 Some(wave) if !line.contains(" error=") => clip(wave),
                 _ if line.contains(" error=") => error(line),
                 _ => message(line),
@@ -1194,11 +1201,12 @@ mod tests {
             + &gpu(
                 "WARN",
                 "pipeline::host: host pipeline refused: wave size shaders=[compute 01] \
-                 wave=\"requires waves of 64 to 64 lanes, the host has 32 to 32\"",
+                 wave=the host GPU lacks widgets: needs a mode=2, has none",
             );
         let areas = judge(&text, None);
         let a = areas.iter().find(|a| a.name == "pipelines refused").unwrap();
-        assert!(a.detail.contains("requires waves of 64 to 64"), "{}", a.detail);
+        let whole = "the host GPU lacks widgets: needs a mode=2, has none";
+        assert!(a.detail.contains(whole), "{}", a.detail);
     }
 
     #[test]
