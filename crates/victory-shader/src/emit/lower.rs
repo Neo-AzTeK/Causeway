@@ -4320,6 +4320,25 @@ impl<'a> Lower<'a> {
                 if used.kind == ResourceType::Cbv {
                     return Err("a constant buffer's descriptor read as data");
                 }
+                // Raw and structured sizes differ: a use that is neither a
+                // scalar load nor a raw buffer access (a typed one) of the
+                // same descriptor leaves the kind unknown.
+                let other = self.x.res.descriptors.iter().any(|d| {
+                    let ui = &self.x.p.blocks[d.site.0].insts[d.site.1];
+                    !(matches!(ui.fields, Fields::Smem { .. })
+                        || matches!(ui.fields, Fields::Buffer { format: None, .. })
+                            && !ui.name().contains("_format_"))
+                        && d.source.leaves().into_iter().any(|l| {
+                            matches!(*l, Source::Loaded { load, .. }
+                                if load == site
+                                    || self.scalar.get(&load).is_some_and(|a| {
+                                        address.is_some_and(|b| same(a, b))
+                                    }))
+                        })
+                });
+                if other {
+                    return Err("a scalar memory read as data");
+                }
                 // The host view is raw: its size is in bytes.
                 let props = match used.stride {
                     0 | 1 => (11 | u, 0),
