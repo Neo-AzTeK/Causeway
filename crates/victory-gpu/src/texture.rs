@@ -283,15 +283,45 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
     }
 }
 
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Microseconds the last refresh spent in: take, read, detile, committed, hash.
+    static PHASES: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+}
+
+#[cfg(feature = "diagnostics")]
+fn phase(i: usize, since: std::time::Instant) {
+    PHASES.with(|p| {
+        let mut a = p.get();
+        a[i] += since.elapsed().as_micros() as u64;
+        p.set(a);
+    });
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all): whether it did.
     pub(crate) fn refresh(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        PHASES.with(|p| p.set([0; 5]));
         let (read, changed) = self.refresh_now();
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        if started.elapsed().as_millis() >= 100 {
+            tracing::info!(
+                memory = ?self.memory,
+                size = self.layout.size,
+                tracked = self.tracked.is_some(),
+                read,
+                changed,
+                total_ms = started.elapsed().as_millis() as u64,
+                phases_us = ?PHASES.with(|p| p.get()),
+                "slow texture refresh (phases: take, read, detile, committed, hash)"
+            );
+        }
         preparing[3].fetch_add(read as u64, Relaxed);
         changed
     }
@@ -303,19 +333,37 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
-            if t.take(start, start + size).is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let at = std::time::Instant::now();
+            let taken = t.take(start, start + size);
+            #[cfg(feature = "diagnostics")]
+            phase(0, at);
+            if taken.is_empty() {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
+            #[cfg(feature = "diagnostics")]
+            let at = std::time::Instant::now();
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+            #[cfg(feature = "diagnostics")]
+            phase(1, at);
+            #[cfg(feature = "diagnostics")]
+            let at = std::time::Instant::now();
             self.detile(&last.read);
+            #[cfg(feature = "diagnostics")]
+            phase(2, at);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
         }
-        if !committed(self.memory, size) {
+        #[cfg(feature = "diagnostics")]
+        let at = std::time::Instant::now();
+        let mapped = committed(self.memory, size);
+        #[cfg(feature = "diagnostics")]
+        phase(3, at);
+        if !mapped {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -327,14 +375,22 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        #[cfg(feature = "diagnostics")]
+        let at = std::time::Instant::now();
         let hash = blake3::hash(tiled);
+        #[cfg(feature = "diagnostics")]
+        phase(4, at);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return (size, false);
         }
         last.hash = Some(hash);
+        #[cfg(feature = "diagnostics")]
+        let at = std::time::Instant::now();
         self.detile(tiled);
+        #[cfg(feature = "diagnostics")]
+        phase(2, at);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
