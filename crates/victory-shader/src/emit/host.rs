@@ -119,7 +119,7 @@ fn err(e: windows::core::Error) -> String {
 
 impl Host {
     /// Whether compute shaders may require waves of `lanes`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testbed"))]
     pub fn has_waves_of(&self, lanes: u32) -> bool {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
         // SAFETY: the structure the feature names, and its size.
@@ -880,7 +880,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
 }
 
 /// A root argument for [`Host::draw`].
-#[cfg(test)]
+#[cfg(any(test, feature = "testbed"))]
 pub enum Root {
     Constants(Vec<u32>),
     /// A table starting at this heap index.
@@ -900,7 +900,7 @@ pub enum Root {
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
-#[cfg(test)]
+#[cfg(any(test, feature = "testbed"))]
 pub struct Draw<'a> {
     pub roots: Vec<(u32, Root)>,
     /// RGBA32F textures (width, height, texels) at view-heap indices 0..
@@ -915,7 +915,7 @@ pub struct Draw<'a> {
     pub mesh_groups: u32,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testbed"))]
 impl Host {
     /// Draws one triangle into an RGBA32F target and returns its texels.
     pub fn draw(
@@ -1251,7 +1251,7 @@ impl Host {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testbed"))]
 fn transition(
     r: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -1273,7 +1273,7 @@ fn transition(
 }
 
 /// A view in the heap for [`Host::dispatch`].
-#[cfg(test)]
+#[cfg(any(test, feature = "testbed"))]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -1320,7 +1320,7 @@ pub enum View<'a> {
 }
 
 /// How [`View::Buffer`] is viewed.
-#[cfg(test)]
+#[cfg(any(test, feature = "testbed"))]
 #[derive(Clone, Copy)]
 pub enum Stride {
     /// By byte; the host views of structured buffers are too.
@@ -1336,7 +1336,7 @@ pub enum Stride {
 
 /// Bindings for [`Host::dispatch`]: root arguments, the view heap in order,
 /// the sampler heap, and the group counts.
-#[cfg(test)]
+#[cfg(any(test, feature = "testbed"))]
 pub struct Dispatch<'a> {
     pub roots: Vec<(u32, Root)>,
     pub views: &'a [View<'a>],
@@ -1344,7 +1344,7 @@ pub struct Dispatch<'a> {
     pub groups: [u32; 3],
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testbed"))]
 impl Host {
     /// Runs a compute pipeline and returns each UAV's contents in heap
     /// order (texels as float bits, row by row).

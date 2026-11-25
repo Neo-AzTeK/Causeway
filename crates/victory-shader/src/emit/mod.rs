@@ -193,6 +193,8 @@ mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;
 mod shader;
+#[cfg(all(windows, feature = "testbed"))]
+pub mod testbed;
 mod unread;
 #[cfg(all(test, windows))]
 mod stride_tests;
