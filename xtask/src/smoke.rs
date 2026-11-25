@@ -208,6 +208,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     // owner's `--env` (which win); the digest checks the log against these.
     let mut set: Vec<(String, OsString)> = vec![
         ("VICTORY_LOG".into(), "info".into()),
+        // Device-removed data costs little; without it a removal in an
+        // unwatched run is "no breadcrumbs" (`clean` drops the caller's).
+        ("VICTORY_D3D12_DRED".into(), "1".into()),
         ("VICTORY_KEYS".into(), keys.clone().into()),
         ("VICTORY_CAPTURE".into(), frames.clone().into_os_string()),
         ("VICTORY_CAPTURE_FRAMES".into(), capture_frames(args.seconds).into()),
