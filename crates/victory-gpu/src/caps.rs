@@ -1,5 +1,12 @@
 //! What the host GPU can do, asked once, decided by pure functions.
 //!
+//! **The rule:** only this module asks the host GPU what it can do. Code
+//! elsewhere reads a [`Caps`] field or a planner; the one question a snapshot
+//! cannot answer, about a single resource, is in `per_resource`.
+//! `cargo xtask policy` rejects a query made anywhere else, except one counted
+//! call in descriptor code (another owner) and marked calls in the shader
+//! crate's test host, which the title also uses to build root signatures.
+//!
 //! [`Caps`] is a snapshot of one device, filled when the device is created
 //! (`Caps::probe`, Windows only) and never changed after. Every field that a
 //! query can fail to fill is an `Option`: `None` means "unknown" and every
@@ -19,6 +26,8 @@
 //! budget policy samples it itself) and descriptor or heap code, which only
 //! reads [`binding_plan`].
 
+#[cfg(windows)]
+pub(crate) mod per_resource;
 mod planner;
 #[cfg(windows)]
 mod probe;
@@ -27,8 +36,8 @@ pub mod reference;
 mod tests;
 
 pub use planner::{
-    BindingClass, BindingPlan, BudgetSource, FALLBACK_BUDGET, MemoryPlan, WaveNeed, WavePlan, atomics64_heap,
-    binding_plan, format_choice, memory_plan, mesh_shaders, min_lod_clamp, wave_plan,
+    BindingClass, BindingPlan, BudgetSource, FALLBACK_BUDGET, MemoryPlan, WaveNeed, WavePlan, aniso_point_mip,
+    atomics64_heap, binding_plan, format_choice, memory_plan, mesh_shaders, min_lod_clamp, wave_plan,
 };
 
 use std::collections::BTreeMap;
@@ -141,6 +150,20 @@ impl Caps {
             }
         }
         applied
+    }
+
+    /// The device's figures as the run digest shows them (`cargo xtask`
+    /// reads the line they are logged in): `n/a` where the device did not
+    /// say.
+    pub fn digest(&self) -> String {
+        let n = |v: Option<u8>| v.map_or_else(|| "n/a".to_owned(), |v| v.to_string());
+        format!(
+            "wave {}, binding tier {}, mesh tier {}, shader model {}",
+            self.wave.map_or_else(|| "n/a".to_owned(), |w| format!("{}-{}", w.min, w.max)),
+            n(self.binding_tier),
+            n(self.mesh_tier),
+            self.shader_model.map_or_else(|| "n/a".to_owned(), |m| format!("{:#x}", m.0)),
+        )
     }
 
     /// One line for the log: what was found, what is unknown, who the

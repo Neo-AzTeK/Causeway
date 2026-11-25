@@ -5,7 +5,7 @@ update "Last run" after each smoke run. No game data.
 
 | Adapter | Wave | Mesh tier | Binding tier | View heap | Last run |
 |---------|------|-----------|--------------|-----------|--------------------|
-| NVIDIA RTX 2060 SUPER (Turing, 8 GB) | 32 | native (reported 10) | 3 | large | smoke, 2026-11-25 |
+| NVIDIA RTX 2060 SUPER (Turing, 8 GB) | 32 | native (tier 1) | 3 | large | smoke, 2026-11-25 |
 | NVIDIA GTX 1070 (Pascal) | 32 | none (emulated as compute, being built) | unknown | 1,000,000 slots | smoke 12, 2026-11-25 |
 
 ## Not yet verified (assume nothing)
