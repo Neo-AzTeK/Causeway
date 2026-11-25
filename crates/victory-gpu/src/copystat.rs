@@ -119,8 +119,21 @@ pub(crate) enum C {
     /// writes, and under ranges shaders write.
     UpdateFreeUs,
     UpdateBusyUs,
+    /// Refresh batches done, and title writes that made the submission's
+    /// copies due again.
+    BatchFlushes,
+    BatchInvalidations,
+    /// Of the refreshes done, those of bytes all brought up to date earlier
+    /// since the last title write: count, bytes asked, time.
+    Repeats,
+    RepeatBytes,
+    RepeatUs,
+    /// Ranges shaders write that updates looked through, and the time
+    /// finding those over the range.
+    PendingScanned,
+    PendingUs,
 }
-const COUNTERS: usize = 73;
+const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -372,6 +385,16 @@ pub(crate) fn log(frames: f64) {
         .map(|((start, len), bytes)| format!("{start:#x}+{len:#x} {:.1} MB", *bytes as f64 / 1e6 / frames))
         .collect();
     tracing::info!("  snapshots per frame by copy: {}", snapshots.join(", "));
+    tracing::info!(
+        "refresh batches per frame: {:.0} flushes, {:.0} invalidations; {:.0} repeats of refreshed bytes          ({:.0} MB, {:.1} ms); {:.0} shader-write ranges scanned in {:.1} ms",
+        c[C::BatchFlushes as usize],
+        c[C::BatchInvalidations as usize],
+        c[C::Repeats as usize],
+        mb(c[C::RepeatBytes as usize]),
+        ms(c[C::RepeatUs as usize]),
+        c[C::PendingScanned as usize],
+        ms(c[C::PendingUs as usize]),
+    );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));

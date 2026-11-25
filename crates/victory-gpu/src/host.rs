@@ -2198,6 +2198,32 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// All bytes of each copy refreshed since the last title write (counts
+    /// repeats).
+    #[cfg(feature = "diagnostics")]
+    seen: std::collections::HashMap<usize, Covered>,
+}
+
+/// Disjoint, non-touching ranges `[from, to)` in order.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Covered(std::collections::BTreeMap<usize, usize>);
+
+#[cfg(feature = "diagnostics")]
+impl Covered {
+    fn holds(&self, from: usize, to: usize) -> bool {
+        self.0.range(..=from).next_back().is_some_and(|(_, &b)| to <= b)
+    }
+
+    fn add(&mut self, mut from: usize, mut to: usize) {
+        while let Some((&a, &b)) = self.0.range(..=to).next_back()
+            && b >= from
+        {
+            (from, to) = (from.min(a), to.max(b));
+            self.0.remove(&a);
+        }
+        self.0.insert(from, to);
+    }
 }
 
 impl Batch {
@@ -2230,6 +2256,11 @@ impl Batch {
         self.flush();
         self.textures.clear();
         self.current.clear();
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::BatchInvalidations, 1);
+            self.seen.clear();
+        }
     }
 
     /// Does the refreshes; returns the bytes copied.
@@ -2237,13 +2268,27 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        #[cfg(feature = "diagnostics")]
+        if !self.refreshes.is_empty() {
+            crate::copystat::add(crate::copystat::C::BatchFlushes, 1);
+        }
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            {
+                use crate::copystat::{C, add, range};
+                range(from, to - from, us, 0);
+                let seen = self.seen.entry(std::sync::Arc::as_ptr(&shadow) as usize).or_default();
+                if seen.holds(from, to) {
+                    add(C::Repeats, 1);
+                    add(C::RepeatBytes, (to - from) as u64);
+                    add(C::RepeatUs, us);
+                }
+                seen.add(from, to);
+            }
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;

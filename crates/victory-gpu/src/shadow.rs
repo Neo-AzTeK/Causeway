@@ -507,14 +507,19 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        #[cfg(feature = "diagnostics")]
+        let scanning = std::time::Instant::now();
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PendingScanned, pending.len() as u64);
+        let mut busy: Vec<(usize, usize)> = pending
             .iter()
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        drop(pending);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PendingUs, scanning.elapsed().as_micros() as u64);
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
