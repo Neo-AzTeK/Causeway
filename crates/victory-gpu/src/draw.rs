@@ -23,6 +23,19 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+/// Where the root view's address lies in the copy its raw view shows, else
+/// why a draw or dispatch reading it must be dropped.
+fn root_view_offset(root: Option<&Root>) -> Result<u32, &'static str> {
+    let address = match root {
+        Some(&Root::View(0)) => return Err("root view offset: a null root view"),
+        Some(&Root::View(address)) => address,
+        None | Some(Root::None) => return Err("root view offset: the title set no root argument"),
+        Some(_) => return Err("root view offset: the root argument is not a view"),
+    };
+    let shadow = crate::shadow::find(address, 1).ok_or("root view offset: outside title buffers")?;
+    u32::try_from(shadow.offset(address)).map_err(|_| "root view offset: 4 GiB or more into its copy")
+}
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -673,15 +686,11 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
-                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
-                            };
-                            match offset {
-                                Some(offset) => offset,
-                                None => {
-                                    not_run("root view offset: no root view set, or it is outside title buffers");
+                            match root_view_offset(self.roots_ref(compute).get(usize::from(u.slot))) {
+                                Ok(offset) => offset,
+                                Err(why) => {
+                                    once!(slot = u.slot, root = ?self.roots_ref(compute).get(usize::from(u.slot)), pipeline = p.name, "{why}: dropped");
+                                    not_run(why);
                                     return false;
                                 }
                             }
@@ -2140,6 +2149,16 @@ void main(uint3 id : SV_DispatchThreadID) {
         );
         assert_eq!(made, S_OK);
         out
+    }
+
+    /// The causes of a missing root view offset are told apart.
+    #[test]
+    fn a_missing_root_view_offset_names_which_cause() {
+        let of = |root: Option<Root>| root_view_offset(root.as_ref()).unwrap_err();
+        assert_eq!(of(None), of(Some(Root::None)));
+        assert_eq!(of(Some(Root::View(0))), "root view offset: a null root view");
+        assert_eq!(of(None), "root view offset: the title set no root argument");
+        assert_eq!(of(Some(Root::Table(64))), "root view offset: the root argument is not a view");
     }
 
     /// A root view that cannot be made says why, so the draw it drops is not
