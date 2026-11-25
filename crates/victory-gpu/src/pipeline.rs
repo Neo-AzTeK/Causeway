@@ -218,7 +218,10 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
+    let (host, cached) = crate::shader_cache::host_shader(
+        container,
+        crate::host::host().is_some_and(|h| h.min_lod_clamp()),
+    );
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 

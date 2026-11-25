@@ -267,6 +267,9 @@ struct Lower<'a> {
     half_outputs: HashMap<u8, bool>,
     /// How lane masks become data.
     mask_data: MaskData,
+    /// SCC values some instruction or phi reads: a mask operation sets one
+    /// (a ballot) only if it is.
+    scc_read: HashSet<Value>,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
@@ -713,6 +716,15 @@ impl<'a> Lower<'a> {
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
             },
+            scc_read: p
+                .blocks
+                .iter()
+                .flat_map(|b| {
+                    let reads = b.insts.iter().filter_map(|i| i.read(Reg::Scc));
+                    let args = b.phis.iter().filter(|f| f.reg == Reg::Scc).flat_map(|f| f.args.iter().copied());
+                    reads.chain(args)
+                })
+                .collect(),
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
@@ -3606,6 +3618,37 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        if inst.write(Reg::S(EXEC)).is_none()
+            && self.is_mask(lo)
+            && self.mask_data == MaskData::Console
+            && let Some(scc) = scc.filter(|s| self.scc_read.contains(s))
+            && matches!(
+                name.get(2..name.len().saturating_sub(4)).unwrap_or(""),
+                "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor" | "not"
+            )
+        {
+            // The mask is read as a number only through SCC: "some lane is
+            // set", the ballot of its bits against zero. The mask itself
+            // stays a lane mask (read lazily where it is used as data).
+            let mut set = None;
+            for k in 0..if name.ends_with("64") { 2 } else { 1 } {
+                let Some(w) = dst_code.and_then(|c| inst.write(Reg::S(c + k))) else {
+                    return Err(LANE_MASK);
+                };
+                let x = self.mask_dword(w)?;
+                let zero = self.s.m.i32(0);
+                let bit = self.s.m.cmp(self.cur, pred::NE, x, zero);
+                set = Some(match set {
+                    Some(s) => self.s.m.bin(self.cur, Bin::Or, s, bit),
+                    None => bit,
+                });
+            }
+            self.vals.insert(scc, Val::Bit(set.ok_or(LANE_MASK)?));
+            for &(_, w) in &inst.writes {
+                self.vals.entry(w).or_insert(Val::Missing(LANE_MASK));
+            }
+            return Ok(());
+        }
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
@@ -10987,6 +11030,25 @@ mod tests {
         };
         let direct = [&words[..2], &words[9..]].concat();
         assert_eq!(refusal(&words), refusal(&direct));
+    }
+
+    #[test]
+    fn a_uniform_select_of_a_lane_mask_joins_a_mask_branch() {
+        // Some lane's compare holds (SCC of the AND with EXEC), made a
+        // uniform all-ones or zero mask by s_cselect, joined with another
+        // uniform mask, and branched on through the join's SCC.
+        let code = [
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0x8709_7E6A, // s_and_b32 s9, vcc_lo, exec_lo
+            0x850B_80C1, // s_cselect_b32 s11, -1, 0
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0x850D_80C1, // s_cselect_b32 s13, -1, 0
+            0x8B0D_0B0D, // s_orn2_b32 s13, s13, s11
+            0xBF84_0001, // s_cbranch_scc0 over the next
+            0xBE82_0381, // s_mov_b32 s2, 1
+            S_ENDPGM,
+        ];
+        lowers(&code, 0).unwrap();
     }
 
     #[test]
