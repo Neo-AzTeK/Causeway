@@ -10,6 +10,9 @@ pub struct Process {
     pub id: u32,
     pub parent: u32,
     pub name: String,
+    /// A `victory.exe` whose command line shows an offline scan
+    /// ([`offline_scan`]): it takes CPU but never opens the GPU.
+    pub offline: bool,
 }
 
 /// Compilers and linkers. Not `cargo` itself: alone it takes next to nothing,
@@ -29,6 +32,26 @@ const BUILDERS: &[&str] = &[
 fn uses_gpu(name: &str) -> bool {
     ["victory.exe", "victory-testbed.exe", "testbed.exe"].contains(&name)
         || test_binary(name).is_some()
+}
+
+/// A `victory` command line that never makes a GPU device: `census`, or
+/// `translate` without `--pipelines`. Anything else, a line that cannot be
+/// read among them, may use the GPU.
+// shortcut: by the words of the line, so `--pipelines` inside a quoted path
+// counts too (waits when it need not).
+fn offline_scan(command: &str) -> bool {
+    let command = command.trim_start();
+    // The program: quoted, or up to the first space.
+    let rest = match command.strip_prefix('"') {
+        Some(quoted) => quoted.split_once('"').map(|(_, rest)| rest),
+        None => command.split_once(char::is_whitespace).map(|(_, rest)| rest),
+    };
+    let mut words = rest.unwrap_or("").split_whitespace();
+    match words.next() {
+        Some("census") => true,
+        Some("translate") => !words.any(|word| word.contains("--pipelines")),
+        _ => false,
+    }
 }
 
 /// The name of a test binary as cargo makes it: `<name>-<16 hex>.exe`.
@@ -77,7 +100,7 @@ pub fn others(me: u32, title: &[u32], processes: &[Process]) -> Others {
             continue;
         }
         let name = p.name.to_ascii_lowercase();
-        if uses_gpu(&name) {
+        if uses_gpu(&name) && !p.offline {
             found.gpu.insert(name.clone());
         }
         if uses_gpu(&name) || BUILDERS.contains(&name.as_str()) {
@@ -114,10 +137,16 @@ pub fn processes() -> anyhow::Result<Vec<Process>> {
             .iter()
             .position(|&c| c == 0)
             .unwrap_or(entry.szExeFile.len());
+        let id = entry.th32ProcessID;
+        let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+        // Only the title's binary has offline commands.
+        let offline = name.eq_ignore_ascii_case("victory.exe")
+            && command_line(id).is_some_and(|line| offline_scan(&line));
         all.push(Process {
-            id: entry.th32ProcessID,
+            id,
             parent: entry.th32ParentProcessID,
-            name: String::from_utf16_lossy(&entry.szExeFile[..length]),
+            name,
+            offline,
         });
         // SAFETY: as above.
         more = unsafe { Process32NextW(snapshot, &raw mut entry) };
@@ -126,6 +155,47 @@ pub fn processes() -> anyhow::Result<Vec<Process>> {
     unsafe { CloseHandle(snapshot) };
     anyhow::ensure!(!all.is_empty(), "the process list is empty");
     Ok(all)
+}
+
+/// The command line of process `id`; `None` if it cannot be read.
+#[cfg(windows)]
+fn command_line(id: u32) -> Option<String> {
+    use windows_sys::Wdk::System::Threading::NtQueryInformationProcess;
+    use windows_sys::Win32::Foundation::{CloseHandle, UNICODE_STRING};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    /// `ProcessCommandLineInformation`: a `UNICODE_STRING`, then its text.
+    const COMMAND_LINE: i32 = 60;
+    // SAFETY: plain call; the result is checked.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id) };
+    if process.is_null() {
+        return None;
+    }
+    // Room for the longest command line (32767 UTF-16 units), aligned.
+    let mut buffer = vec![0u64; 8448];
+    let size = size_of_val(&buffer[..]) as u32;
+    // SAFETY: a live handle and a writable buffer of the size passed.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            COMMAND_LINE,
+            buffer.as_mut_ptr().cast(),
+            size,
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: the handle is ours.
+    unsafe { CloseHandle(process) };
+    if status < 0 {
+        return None;
+    }
+    // SAFETY: on success the buffer starts with the string's header.
+    let header = unsafe { &*buffer.as_ptr().cast::<UNICODE_STRING>() };
+    if header.Buffer.is_null() {
+        return None;
+    }
+    // SAFETY: the text is `Length` bytes inside the buffer, which lives.
+    let text = unsafe { std::slice::from_raw_parts(header.Buffer, usize::from(header.Length) / 2) };
+    Some(String::from_utf16_lossy(text))
 }
 
 // shortcut: titles run on Windows only.
@@ -145,6 +215,7 @@ mod tests {
                 id,
                 parent,
                 name: name.into(),
+                offline: false,
             })
             .collect()
     }
@@ -193,6 +264,53 @@ mod tests {
             (22, 20, "rustc.exe"),
         ]);
         assert_eq!(names(&others(10, &[21], &all).busy), ["rustc.exe"]);
+    }
+
+    #[test]
+    fn only_a_scan_that_makes_no_gpu_device_is_offline() {
+        for line in [
+            r#""C:\a b\victory.exe" translate C:\files --list"#,
+            r"victory.exe translate --jobs 4",
+            r"C:\w\victory.exe census",
+            r#""victory.exe" translate"#,
+        ] {
+            assert!(offline_scan(line), "{line}");
+        }
+        for line in [
+            r"victory.exe translate C:\files --pipelines --list",
+            r"victory.exe translate --cache --pipelines",
+            r#"victory.exe translate "--pipelines""#,
+            r"victory.exe run C:\title.exe --execute",
+            r#"victory.exe run "C:\a translate census\title.exe""#,
+            r#""C:\my census dir\victory.exe" run title.exe"#,
+            r"victory.exe translated",
+            r"victory.exe",
+            r#""unclosed translate"#,
+            "",
+        ] {
+            assert!(!offline_scan(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn an_offline_scan_leaves_the_gpu_free_and_the_machine_busy() {
+        let mut all = list(&[(10, 1, "xtask.exe"), (40, 3, "victory.exe")]);
+        all[1].offline = true;
+        let found = others(10, &[], &all);
+        assert!(found.gpu.is_empty(), "{found:?}");
+        assert_eq!(names(&found.busy), ["victory.exe"]);
+        // A title beside it still holds the GPU.
+        all.extend(list(&[(41, 3, "victory.exe")]));
+        assert_eq!(names(&others(10, &[], &all).gpu), ["victory.exe"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_command_line_is_read() {
+        let line = command_line(std::process::id()).expect("our own command line");
+        let me = std::env::current_exe().unwrap();
+        let name = me.file_stem().unwrap().to_string_lossy();
+        assert!(line.contains(&*name), "{line}");
     }
 
     #[cfg(windows)]
