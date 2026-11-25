@@ -1,12 +1,12 @@
 # Adapters seen so far
 
-What has run the title or the GPU tests. Add a row when a new adapter runs;
-update "last run" in the same change as the worklog line. No game data.
+What has run the title or the GPU tests. Add a row when a new adapter runs and
+update "Last run" after each smoke run. No game data.
 
-| Adapter | Wave | Mesh tier | Binding tier | View heap | Last run (worklog) |
+| Adapter | Wave | Mesh tier | Binding tier | View heap | Last run |
 |---------|------|-----------|--------------|-----------|--------------------|
 | NVIDIA RTX 2060 SUPER (Turing, 8 GB) | 32 | native (reported 10) | 3 | large | smoke, 2026-11-25 |
-| NVIDIA GTX 1070 (Pascal) | 32 | none (emulated as compute, being built) | see worklog | 1,000,000 slots | smoke 12, 2026-11-25 |
+| NVIDIA GTX 1070 (Pascal) | 32 | none (emulated as compute, being built) | unknown | 1,000,000 slots | smoke 12, 2026-11-25 |
 
 ## Not yet verified (assume nothing)
 - wave64 hardware (AMD), or a driver reporting a 32-to-64 range

@@ -1,73 +1,46 @@
 # Causeway: agent rules
 
-Runs an Xbox Series title's x86-64 code natively on Windows: Rust, D3D12. The
-project is `Neo-AzteK/Causeway`; crates, binary and variables keep the name
-`victory` from the project it was forked from. Crates `victory-shader`,
-`victory-gpu` and `victory-hle` have their own `CLAUDE.md`: Read it before
-working there. Before choosing work, read the "State" and "Next" sections of
-`docs/worklog.md`. Humans: `CONTRIBUTING.md`.
+Rust, D3D12: runs an Xbox Series title natively on Windows. Project
+`Neo-AzteK/Causeway` (a fork; crates and variables keep the name `victory`).
+Everything a contributor must follow (rule #1 no game data, KISS flow, checks,
+hardware range, GPU runs) is in `CONTRIBUTING.md`: Read it. This file adds only
+what agents need.
 
-## Rules
+## Where things are
 
-- **Rule #1:** nothing from the game, or derived from it, enters the repo
-  (files, dumps, disassembly, screenshots, snapshots). No new policy exceptions
-  without the owner's decision. Details: `docs/asset-policy.md`.
+| Need | File |
+|------|------|
+| rules, flow, checks, hardware range | `CONTRIBUTING.md` |
+| current state, next work, owner decisions (local, ignored) | `.local/handoff.md` |
+| run log, recipes (local, ignored) | `.local/log.md`, `.local/recipes.md` |
+| cost, delegation, reading, handoff workflow | `docs/agent-workflow.md` |
+| cross-crate flow, import resolution | `docs/architecture.md` |
+| debug variables, smoke runs | `docs/debugging.md` |
+| capabilities, planners, fakes | `docs/hardware-range.md`, `docs/gpu-review-checklist.md` |
+| adapters verified / not verified | `docs/adapters.md` |
+| asset policy | `docs/asset-policy.md` |
+| crate notes | `crates/victory-{shader,gpu,hle}/CLAUDE.md`: Read before working there |
+| briefing a session or agent | skill `task-brief`; agents `scout`, `reviewer` |
+
+Start of a session: read `.local/handoff.md` before choosing work. In a
+worktree, the local files are in the main checkout (`git rev-parse
+--git-common-dir`, its parent folder), not in the worktree.
+
+## Agent rules
+
 - This is a fork: always pass `-R Neo-AzteK/Causeway` to `gh` (its default can
   be the parent repo).
-- KISS flow (owner, 2026-11-24): no stacks, no PRs. A task is a short branch
-  (or worktree) off `main`; once its checks pass, merge it into `main` and push
-  `main` after each merge or milestone. Never force-push or rewrite `main`.
-  Push other branches or open PRs only when the owner asks.
-- One task per branch, small diff, no drive-by refactors or formatting
-  (`cargo fmt --check` already fails on `main`).
-- Mark a deliberate simplification `// shortcut:` with its limit.
-- New dependency: only for a measured gain or correctness, GPL-3.0-compatible.
-- `decision NNNN` and `TODO.md` in comments are not in this repo; do not guess.
-- Goal: the title (the owner's local copy, path given by the owner) works
-  fully; milestone: the world's 3D scene is visible.
-- Real-GPU runs can reset the display driver. Standing approval (owner,
-  2026-11-25): one run at a time, any time limit, diagnostics on, full log kept,
-  `cargo xtask smoke` defaults. A script accepts the game's legal terms only
-  with the owner's OK for that launch.
+- Standing approval for real-GPU runs (owner, 2026-11-25): one at a time, any
+  time limit, diagnostics on, full log kept, `cargo xtask smoke` defaults.
+  Never accept the game's legal terms by script without the owner's OK for that
+  launch.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
-- **Hardware range** (owner, 2026-11-25): a fix must hold on other GPUs,
-  vendors and drivers, not only the primary dev GPU (wave32 only, `docs/adapters.md`). Query
-  capabilities through `Caps`; keep a clean refusal where a feature is missing;
-  test both paths; say which adapters were and were not verified. Every brief
-  states it. Every review of a GPU-facing diff answers: which capability does
-  this assume, and where is the fallback tested? How: `docs/hardware-range.md`,
-  `docs/gpu-review-checklist.md`, `docs/adapters.md`.
-
-## Work log
-
-`docs/worklog.md` is the shared record: state, ranked next work, open
-decisions, one log line per merge or finding (no game data). Whoever merges,
-finishes a task or runs the game updates it in the same change. Old log lines
-move to `docs/worklog-archive.md` when the log passes ~60 lines.
-
-## Working cheaply
-
-Cost, delegation, reading and output rules: `docs/agent-workflow.md`. Short
-form: the main session coordinates and does not debug; a hunt goes to its own
-session with a `task-brief`; one error, one session; no agents by default;
-Grep then read at most 150 lines, never a file over 800 lines whole
-(`lower.rs`); at most 60 lines of output per command; end the session early,
-update the worklog and tell the owner to wipe context.
-
-## Checks
-
-While iterating, only the crate you changed:
-
-    cargo clippy -q -p <crate> --all-targets --locked -- -D warnings
-    cargo test -q -p <crate> --locked <filter>
-
-Before calling it done, what CI runs, plus the policy check:
-
-    cargo clippy -q --workspace --all-targets --locked -- -D warnings
-    cargo clippy -q --workspace --all-targets --all-features --locked -- -D warnings
-    cargo test -q --workspace --locked
-    cargo xtask policy
-
-Test a bug fix with a test that fails without it. Back performance claims with
-before and after numbers. Report what was not verified, and which GPU adapter
-ran: passing tests do not show the title renders.
+- The main session coordinates and does not debug: a hunt goes to its own
+  session with a `task-brief` (one error, one session). No agents by default.
+- Grep, then read at most 150 lines; never a source file over 800 lines whole
+  (`lower.rs`); at most 60 lines of output per command; do not re-read a file
+  after editing it. Details: `docs/agent-workflow.md`.
+- End early, before context fills: commit what is verified, update
+  `.local/handoff.md`, say what is unverified, tell the owner to wipe context.
+- Correctness beats saving tokens: before changing a function, read all of it,
+  its callers and its tests.
