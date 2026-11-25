@@ -48,6 +48,13 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: finding (smoke 10 log, no launch): indirect kind 2 "no host
+  pipeline" = compute programs refused for wave size (needs 64, host has 32;
+  e.g. one program 6x/frame): same as Next #4, not a compile race. Kind 10
+  "prepare failed (mesh)" has an empty reason: `root_view` returned None
+  silently; trace shows its root view's bound heap as "null" (no host heap),
+  likely `heap.host()?`: descriptor side (other AI). `root_view` now names
+  its reasons (diagnostics); confirm on next run.
 - 2026-11-25: smoke 10 reached the world (0.4 fps, one removal survived).
 - 2026-11-25: merged check-health, run-digest, device-removal, wave64-refusals,
   caps wave plan, caps memory plan; added `VICTORY_SURVIVE_REMOVAL`.

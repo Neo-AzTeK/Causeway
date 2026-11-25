@@ -801,7 +801,10 @@ impl State {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             return None;
         };
-        let shadow = crate::shadow::find(address, 1)?;
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            not_run("root view outside title buffers");
+            return None;
+        };
         let offset = u32::try_from(shadow.offset(address)).ok()?;
         shadow.refresh(list, address, shadow.left(address));
         if uav {
@@ -811,10 +814,22 @@ impl State {
             shadow.gpu_writes(list, address, len, true);
         }
         let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()?),
+            0 => match crate::memory::heap() {
+                Some(host) => (MEMORY_HEAP, host),
+                None => {
+                    not_run("root views: no title-memory heap");
+                    return None;
+                }
+            },
             h => (
                 std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host()?,
+                match crate::descriptor::heap(h as This).host() {
+                    Some(host) => host,
+                    None => {
+                        not_run("root views: the bound view heap has no host heap");
+                        return None;
+                    }
+                },
             ),
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
