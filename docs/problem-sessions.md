@@ -141,8 +141,8 @@ Get-CimInstance Win32_Process -Filter "Name='victory.exe'" | Where-Object Comman
 
 It lists every `victory.exe` except the offline scans (`translate`, `census`),
 so a title, or one whose command line cannot be read, still makes you wait. An
-offline scan alone does not hold up a build; it does take CPU, and a build in
-its own worktree cannot replace the `victory.exe` it runs. The lock is
+offline scan alone does not hold up a build. It does take CPU, and a build in
+the scan's own worktree cannot replace the `victory.exe` it runs. The lock is
 unchanged: `smoke` and `alone` still refuse beside any `victory.exe`, so GPU
 tests wait for a scan too, and a scan that uses the GPU (`translate
 --pipelines`) runs through `alone`.
