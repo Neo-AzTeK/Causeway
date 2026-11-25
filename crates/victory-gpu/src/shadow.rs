@@ -218,13 +218,36 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &mut before[at - *taken..at - *taken + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                #[cfg(feature = "diagnostics")]
+                let t0 = std::time::Instant::now();
+                let differs = host != old;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackCompareUs, t0.elapsed().as_micros() as u64);
+                #[cfg(feature = "diagnostics")]
+                let t1 = std::time::Instant::now();
+                let readable = differs && crate::host::read_into((start + at) as *const u8, title);
+                #[cfg(feature = "diagnostics")]
+                if differs {
+                    use crate::copystat::{C, add};
+                    add(C::BackReadUs, t1.elapsed().as_micros() as u64);
+                    add(C::BackDiffBytes, n as u64);
+                }
+                if readable {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn, and so does the
                     // snapshot: a later look finds nothing new.
-                    if merge_gpu(title, host, old) {
+                    #[cfg(feature = "diagnostics")]
+                    let t2 = std::time::Instant::now();
+                    let changed = merge_gpu(title, host, old);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::BackMergeUs, t2.elapsed().as_micros() as u64);
+                    if changed {
+                        #[cfg(feature = "diagnostics")]
+                        let t3 = std::time::Instant::now();
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
                         written += n;
                     }
                     synced.push((start + at) / PAGE);
@@ -235,6 +258,8 @@ impl Shadow {
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+            #[cfg(feature = "diagnostics")]
+            let t4 = std::time::Instant::now();
             if first < last
                 && !synced.is_empty()
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
@@ -246,6 +271,8 @@ impl Shadow {
                     copied[page - base] = now;
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackWatchUs, t4.elapsed().as_micros() as u64);
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
@@ -562,6 +589,28 @@ fn join(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// (`host != old`) into `title` where the title has not changed them too,
 /// and makes `host` and `old` equal to `title`. Whether `title` changed.
 fn merge_gpu(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
+    // By 8 bytes: most of a piece the GPU did not write is equal in `host`
+    // and `old`, and takes `title` whole; the branchy per-byte loop below
+    // runs only in words that differ.
+    let mut changed = false;
+    let words = title.len() / 8 * 8;
+    let (tw, tr) = title.split_at_mut(words);
+    let (hw, hr) = host.split_at_mut(words);
+    let (ow, or) = old.split_at_mut(words);
+    let (tw, hw, ow) = (tw.as_chunks_mut::<8>().0, hw.as_chunks_mut::<8>().0, ow.as_chunks_mut::<8>().0);
+    for ((t, h), o) in tw.iter_mut().zip(hw.iter_mut()).zip(ow.iter_mut()) {
+        if h == o {
+            *h = *t;
+            *o = *t;
+        } else {
+            changed |= merge_bytes(t, h, o);
+        }
+    }
+    changed |= merge_bytes(tr, hr, or);
+    changed
+}
+
+fn merge_bytes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
     let mut changed = false;
     for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()) {
         if *h != *o && *t != *h {
@@ -574,6 +623,12 @@ fn merge_gpu(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
     changed
 }
 
+/// The per-byte version, for comparison in tests.
+#[cfg(test)]
+fn merge_gpu_bytes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
+    merge_bytes(title, host, old)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +637,47 @@ mod tests {
     #[test]
     fn ranges_are_joined() {
         assert_eq!(join(vec![(10, 20), (0, 5), (5, 8), (15, 30), (40, 40)]), [(0, 8), (10, 30)]);
+    }
+
+    fn sample(n: usize, seed: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut s = seed;
+        let mut next = move || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 24) as u8
+        };
+        let old: Vec<u8> = (0..n).map(|_| next()).collect();
+        // The GPU wrote ~1% of the bytes, the title ~1% (of other ones, mostly).
+        let host = old.iter().map(|&b| if next() < 3 { b ^ 0x55 } else { b }).collect();
+        let title = old.iter().map(|&b| if next() < 3 { b ^ 0xaa } else { b }).collect();
+        (title, host, old)
+    }
+
+    /// The word-wise merge gives what the per-byte one does, for lengths
+    /// that are not multiples of 8 too.
+    #[test]
+    fn word_merge_matches_bytes() {
+        for n in [0, 1, 7, 8, 9, 100, 4099] {
+            let (t, h, o) = sample(n, n as u32 + 1);
+            let (mut t1, mut h1, mut o1) = (t.clone(), h.clone(), o.clone());
+            let (mut t2, mut h2, mut o2) = (t, h, o);
+            assert_eq!(merge_gpu(&mut t1, &mut h1, &mut o1), merge_gpu_bytes(&mut t2, &mut h2, &mut o2));
+            assert_eq!((t1, h1, o1), (t2, h2, o2));
+        }
+    }
+
+    /// `cargo test -p victory-gpu --release --lib -- --ignored --nocapture merge_speed`
+    #[test]
+    #[ignore]
+    fn merge_speed() {
+        let n = 64 << 20;
+        let (t, h, o) = sample(n, 7);
+        let time = |f: fn(&mut [u8], &mut [u8], &mut [u8]) -> bool| {
+            let (mut t, mut h, mut o) = (t.clone(), h.clone(), o.clone());
+            let at = std::time::Instant::now();
+            f(&mut t, &mut h, &mut o);
+            at.elapsed()
+        };
+        println!("per byte {:?}, per word {:?} for 64 MiB", time(merge_gpu_bytes), time(merge_gpu));
     }
 
     /// The GPU's bytes reach title memory unless the title changed them
