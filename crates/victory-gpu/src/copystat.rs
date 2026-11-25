@@ -138,6 +138,22 @@ pub(crate) fn made(kind: usize, us: u64) {
     }
 }
 
+/// Parts of making placed buffer views (kind 4) and buffer views at
+/// large, nanoseconds: making the descriptor, the heap's bindless record,
+/// the slot's held resource; `shadow::for_view` (all buffer views), and
+/// copies of single views made (count, time).
+pub(crate) const PART_MAKE: usize = 0;
+pub(crate) const PART_VIEWED: usize = 1;
+pub(crate) const PART_KEEP: usize = 2;
+pub(crate) const PART_FOR_VIEW: usize = 3;
+pub(crate) const PART_EXACT_N: usize = 4;
+pub(crate) const PART_EXACT: usize = 5;
+static PARTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub(crate) fn part(i: usize, n: u64) {
+    PARTS[i].fetch_add(n, Relaxed);
+}
+
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -358,6 +374,15 @@ pub(crate) fn log(frames: f64) {
         })
         .collect();
     tracing::info!("  heap slots made per frame by kind: {}", made.join(", "));
+    let [mk, viewed, keep, for_view, exact_n, exact] = [0, 1, 2, 3, 4, 5].map(|i| PARTS[i].swap(0, Relaxed) as f64 / frames);
+    tracing::info!(
+        "  placed buffer parts per frame: make {:.1} ms, bindless {:.1} ms, keep {:.1} ms; for_view (all) {:.1} ms, view copies made {exact_n:.0} in {:.1} ms",
+        mk / 1e6,
+        viewed / 1e6,
+        keep / 1e6,
+        for_view / 1e6,
+        exact / 1e6
+    );
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
@@ -388,5 +413,14 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+/// Runs its closure when dropped (timing a function with several returns).
+pub(crate) struct OnDrop<F: FnMut()>(pub(crate) F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
     }
 }

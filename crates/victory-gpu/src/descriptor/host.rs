@@ -792,6 +792,15 @@ impl HostHeap {
             let later = !for_draw && is_placed_texture(&view);
             made.keys[index as usize] = key;
             made.postponed[index as usize] = later;
+            #[cfg(feature = "diagnostics")]
+            let (placed, mut at) = (making.1 == 4, std::time::Instant::now());
+            #[cfg(feature = "diagnostics")]
+            let mut lap = |part: usize| {
+                if placed {
+                    crate::copystat::part(part, at.elapsed().as_nanos() as u64);
+                    at = std::time::Instant::now();
+                }
+            };
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -801,10 +810,16 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(slot));
             }
+            #[cfg(feature = "diagnostics")]
+            lap(crate::copystat::PART_MAKE);
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
+            #[cfg(feature = "diagnostics")]
+            lap(crate::copystat::PART_VIEWED);
             self.keep(slot, kept.flatten());
+            #[cfg(feature = "diagnostics")]
+            lap(crate::copystat::PART_KEEP);
             #[cfg(feature = "diagnostics")]
             crate::copystat::made(making.1, making.0.elapsed().as_micros() as u64);
         }
