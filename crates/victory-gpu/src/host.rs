@@ -879,6 +879,29 @@ impl Host {
         })
     }
 
+    /// Whether the host samples with a least-level clamp (D3D12
+    /// TiledResources tier 2 or better); logged once. A failed query counts
+    /// as no.
+    pub(crate) fn min_lod_clamp(&self) -> bool {
+        static CLAMP: OnceLock<bool> = OnceLock::new();
+        *CLAMP.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let clamp = ok && options.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0;
+            tracing::info!(clamp, "host least-level clamp support");
+            clamp
+        })
+    }
+
     /// Whether the host runs 64-bit atomics on typed resources in the
     /// descriptor heap (translated 64-bit image atomics); logged once.
     pub(crate) fn heap_atomics64(&self) -> bool {
