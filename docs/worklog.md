@@ -51,8 +51,9 @@ error kinds, branches and commits only.
 8. Unimplemented device methods (two slots seen in smoke 9).
 
 ## Open decisions (owner)
-- Whether to emulate mesh shaders as compute for GPUs without them (GTX 1070
-  class); design written, nothing built.
+- Decided 2026-11-25 (owner: yes): emulate mesh shaders as compute for GPUs
+  without them (GTX 1070 class), native path kept where Caps has mesh tier >= 1;
+  being built by the design session.
 - Pass the other AI the review of 2863ff3, 32f83df, 433ecf7.
 - Whether a device removal should recreate the device (device lifetime).
 
