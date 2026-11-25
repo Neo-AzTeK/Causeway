@@ -26,12 +26,20 @@ before working there.
 - New dependency: only for a measured gain or correctness, GPL-3.0-compatible.
 - `decision NNNN` and `TODO.md` in comments are not in this repo. Do not guess
   what they say.
-- Running the title on a real GPU can reset the display driver. Ask first.
+- Goal: the title (the owner's local copy, path given by the owner) works
+  fully; current milestone: the world's 3D scene is visible.
+- Running the title on a real GPU can reset the display driver. Ask first; the
+  owner allows several launches per task, one at a time. A script may accept
+  the game's legal terms only with the owner's OK for that launch.
+- `target/**` reads are denied by `.claude/settings.json` on purpose.
 - Hardware range (owner's rule, 2026-11-25): a fix must hold on other GPUs,
   vendors and drivers, not only the owner's RTX 2060 SUPER (wave32 only). Query
   capabilities (wave size, binding tier, heap and format limits) instead of
   hardcoding; keep a clean refusal where a device lacks a feature; test both
   paths; say which adapters were and were not verified. Every brief states it.
+  Every review of a GPU-facing diff answers one fixed question: which
+  capability does this assume, and where is the fallback tested? Prefer the
+  conservative portable path unless a capability is proven.
 
 ## Spending tokens
 
@@ -51,6 +59,11 @@ Delegating (owner's rule, 2026-11-25)
   a few runs or reads (a hang, a refusal origin, a speed problem) goes to a
   session with one clear question and an end, via `start_session`; the main
   session keeps merging, pushing and the handoff.
+- One error, one session (owner's strategy, 2026-11-25): do a run, group the
+  errors by type (count, do not print), then start a fresh session per
+  distinct error via `start_session` with a `task-brief`: the error text, the
+  evidence and a "done when" test. The main session only runs, triages, merges
+  and pushes. Never two real-GPU launches at once.
 - End the session early, before context fills: finish what is verified,
   commit it, update `HANDOFF.md`, say what is unverified, and tell the owner
   to wipe context. Do not push through a long investigation to its end.
