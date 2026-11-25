@@ -45,8 +45,11 @@ pub(crate) enum C {
     BackMergeUs,
     BackWriteUs,
     BackWatchUs,
+    /// Of the title writes: time clearing guards, and the write calls.
+    BackGuardUs,
+    BackWrites,
 }
-const COUNTERS: usize = 28;
+const COUNTERS: usize = 30;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -137,12 +140,14 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "copy-back per frame: {:.1} MB in pieces the GPU changed; compare {:.1} ms, title reads \
-         {:.1} ms, merges {:.1} ms, title writes {:.1} ms, watch {:.1} ms",
+         {:.1} ms, merges {:.1} ms, title writes {:.1} ms (guards {:.1} ms, {:.0} calls), watch {:.1} ms",
         mb(c[C::BackDiffBytes as usize]),
         ms(c[C::BackCompareUs as usize]),
         ms(c[C::BackReadUs as usize]),
         ms(c[C::BackMergeUs as usize]),
         ms(c[C::BackWriteUs as usize]),
+        ms(c[C::BackGuardUs as usize]),
+        c[C::BackWrites as usize],
         ms(c[C::BackWatchUs as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();

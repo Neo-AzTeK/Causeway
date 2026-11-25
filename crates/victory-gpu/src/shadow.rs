@@ -210,6 +210,7 @@ impl Shadow {
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
+            let mut dirty: Vec<(usize, usize)> = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -238,22 +239,35 @@ impl Shadow {
                     // snapshot: a later look finds nothing new.
                     #[cfg(feature = "diagnostics")]
                     let t2 = std::time::Instant::now();
-                    let changed = merge_gpu(title, host, old);
+                    let phase = (start + at) % 4096;
+                    let pages = merge_pages(title, host, old, phase);
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::BackMergeUs, t2.elapsed().as_micros() as u64);
-                    if changed {
-                        #[cfg(feature = "diagnostics")]
-                        let t3 = std::time::Instant::now();
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        #[cfg(feature = "diagnostics")]
-                        crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
-                        written += n;
-                    }
+                    // Only the 4 KiB pages the GPU changed: the rest of the
+                    // piece is title memory as it is. The copy now equals
+                    // title memory there, so the writes below come from it,
+                    // joined across pieces into few calls.
+                    dirty.extend(page_runs(pages, phase, n).into_iter().map(|(o, l)| (start + at + o, start + at + o + l)));
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
+            #[cfg(feature = "diagnostics")]
+            let t3 = std::time::Instant::now();
+            for (a, b) in join(std::mem::take(&mut dirty)) {
+                #[cfg(feature = "diagnostics")]
+                let t5 = std::time::Instant::now();
+                crate::watch::writing(a, b - a);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackGuardUs, t5.elapsed().as_micros() as u64);
+                // SAFETY: inside the mapping.
+                crate::host::write_mapped(a as *mut u8, unsafe { self.data.add(a - start) }, b - a);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackWrites, 1);
+                written += b - a;
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
@@ -587,46 +601,74 @@ fn join(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// One piece after a submission: `host` is the copy now, `old` what it held
 /// before, `title` title memory now. Puts the bytes the GPU changed
 /// (`host != old`) into `title` where the title has not changed them too,
-/// and makes `host` and `old` equal to `title`. Whether `title` changed.
-fn merge_gpu(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
+/// and makes `host` and `old` equal to `title`. Returns a mask of the 4 KiB
+/// pages (numbered from the one holding the piece's first byte, which sits
+/// `phase` bytes into its page) where `title` changed: only those need
+/// writing back.
+fn merge_pages(title: &mut [u8], host: &mut [u8], old: &mut [u8], phase: usize) -> u32 {
     // By 8 bytes: most of a piece the GPU did not write is equal in `host`
     // and `old`, and takes `title` whole; the branchy per-byte loop below
     // runs only in words that differ.
-    let mut changed = false;
+    let mut pages = 0;
     let words = title.len() / 8 * 8;
     let (tw, tr) = title.split_at_mut(words);
     let (hw, hr) = host.split_at_mut(words);
     let (ow, or) = old.split_at_mut(words);
     let (tw, hw, ow) = (tw.as_chunks_mut::<8>().0, hw.as_chunks_mut::<8>().0, ow.as_chunks_mut::<8>().0);
-    for ((t, h), o) in tw.iter_mut().zip(hw.iter_mut()).zip(ow.iter_mut()) {
+    for (i, ((t, h), o)) in tw.iter_mut().zip(hw.iter_mut()).zip(ow.iter_mut()).enumerate() {
         if h == o {
             *h = *t;
             *o = *t;
         } else {
-            changed |= merge_bytes(t, h, o);
+            merge_bytes(t, h, o, phase + i * 8, &mut pages);
         }
     }
-    changed |= merge_bytes(tr, hr, or);
-    changed
+    merge_bytes(tr, hr, or, phase + words, &mut pages);
+    pages
 }
 
-fn merge_bytes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
-    let mut changed = false;
-    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()) {
+/// [`merge_pages`] by byte; `at` is the offset of the first byte from its page.
+fn merge_bytes(title: &mut [u8], host: &mut [u8], old: &mut [u8], at: usize, pages: &mut u32) {
+    for (i, ((t, h), o)) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()).enumerate() {
         if *h != *o && *t != *h {
             *t = *h;
-            changed = true;
+            *pages |= 1 << ((at + i) / 4096);
         }
         *h = *t;
         *o = *t;
     }
-    changed
+}
+
+/// The runs of consecutive set pages of `pages` (see [`merge_pages`]) as
+/// `(offset, length)` inside a piece of `len` bytes.
+fn page_runs(pages: u32, phase: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for p in 0..32usize {
+        if pages >> p & 1 == 0 {
+            continue;
+        }
+        let from = (p * 4096).saturating_sub(phase);
+        let to = ((p + 1) * 4096 - phase).min(len);
+        match runs.last_mut() {
+            Some(last) if last.0 + last.1 == from => last.1 = to - last.0,
+            _ => runs.push((from, to - from)),
+        }
+    }
+    runs
+}
+
+/// [`merge_pages`] as a flag, for tests.
+#[cfg(test)]
+fn merge_gpu(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
+    merge_pages(title, host, old, 0) != 0
 }
 
 /// The per-byte version, for comparison in tests.
 #[cfg(test)]
 fn merge_gpu_bytes(title: &mut [u8], host: &mut [u8], old: &mut [u8]) -> bool {
-    merge_bytes(title, host, old)
+    let mut pages = 0;
+    merge_bytes(title, host, old, 0, &mut pages);
+    pages != 0
 }
 
 #[cfg(test)]
@@ -678,6 +720,31 @@ mod tests {
             at.elapsed()
         };
         println!("per byte {:?}, per word {:?} for 64 MiB", time(merge_gpu_bytes), time(merge_gpu));
+    }
+
+    /// Of a 64 KiB piece only the pages the GPU wrote are written back, as
+    /// runs; also for a piece that starts inside a page.
+    #[test]
+    fn only_written_pages_go_back() {
+        for phase in [0usize, 1024] {
+            let n = 65536 - phase;
+            let mut old = vec![0u8; n];
+            let mut host = old.clone();
+            let mut title = old.clone();
+            // The GPU writes in pages 2, 3 and 9 (of the page numbering).
+            let at = |page: usize, k: usize| page * 4096 - phase + k;
+            host[at(2, 5)] = 1;
+            host[at(3, 4095 - phase.min(1))] = 2;
+            host[at(9, 100)] = 3;
+            let pages = merge_pages(&mut title, &mut host, &mut old, phase);
+            assert_eq!(pages, 1 << 2 | 1 << 3 | 1 << 9);
+            let runs = page_runs(pages, phase, n);
+            assert_eq!(runs.len(), 2);
+            let sent: usize = runs.iter().map(|r| r.1).sum();
+            assert_eq!(sent, 3 * 4096);
+            assert!(sent < n / 4);
+            assert_eq!((title[at(2, 5)], title[at(9, 100)]), (1, 3));
+        }
     }
 
     /// The GPU's bytes reach title memory unless the title changed them
