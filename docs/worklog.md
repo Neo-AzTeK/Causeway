@@ -54,6 +54,18 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: finding (offline, local decoded dump, no launch, no code change):
+  `a1f6cdf8874960a9` has two do-while loops (`s_add` counter, `s_cmp_eq` against
+  a count, exit on `scc0`), each guarded by a count-is-zero skip. Count 1 is
+  one dword of a constant buffer (`s_buffer_load` at user-SGPR base + 4); the
+  loop body reads one 16-byte vector per step from the same buffer, count 2
+  likewise (6 vectors per group of 5). A constant buffer holds at most 4096
+  such vectors, so a legitimate count cannot run for seconds; a count that
+  hits the 2^20 limit is garbage (stale or unwritten data, or a view larger
+  than the guest's buffer), not a large real loop. Not shown: which buffer, and
+  which word. One run needed: log, at the first slow submission of this program,
+  the constant-buffer descriptor (base, size) and the dword at base + s7 + 4,
+  with `VICTORY_SHADER_LOOP_LIMIT=64` for safety. No adapter verified.
 - 2026-11-25: smoke 12 (69b004e, RTX 2060 SUPER wave32, 300 s, no skip,
   `VICTORY_SHADER_LOOP_LIMIT=64`, owner-approved single run): no hang, no
   removal; 7 slow submissions of 251-271 ms, none naming `a1f6cdf8874960a9`
