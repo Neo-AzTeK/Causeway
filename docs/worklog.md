@@ -58,6 +58,13 @@ the guest `s_barrier` in a loop is lane-uniform.
   draws/frame: the host records without a GPU, cause not named (log spam of
   ~1000 lines/s is a suspect). The digest now leaves post-removal lines out of
   world lines. Pipeline wait cannot be it: capped at 500 ms/frame.
+- 2026-11-25: finding (offline, smoke 10 log): the removal's breadcrumb list
+  stopped at command 14 of 129, a 141x1x1 dispatch of compute `a1f6cdf8874960a9`
+  (commands 2..22 are all that program, 2..569 groups). 24 of 26 "slow host
+  submission" lines (4.5 s each) and smoke 9's only one name it: a hang by a
+  long/looping kernel, not a one-off. Journal text spans several log lines
+  (grep the next lines, not `-m1` alone). Single run: `VICTORY_SKIP_PIPELINES=a1f6cdf8874960a9`
+  must give no slow submission and no removal; `VICTORY_DUMP_HASHES` for its loop.
 - 2026-11-25: smoke 10 reached the world (0.4 fps, one removal survived).
 - 2026-11-25: merged check-health, run-digest, device-removal, wave64-refusals,
   caps wave plan, caps memory plan; added `VICTORY_SURVIVE_REMOVAL`.
