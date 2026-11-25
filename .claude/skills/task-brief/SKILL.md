@@ -16,6 +16,8 @@ symbol instead of pasting it. Do not repeat `CLAUDE.md`; name it to read.
     Constraints: <owner decisions, ordering, compatibility; always: must hold
       on other GPUs/vendors/drivers (query capabilities, test wave32 and
       wave64 or both paths, report adapters verified), see CLAUDE.md>
+    Capabilities: <Caps fields this assumes; test that covers the path without
+      them; adapters to verify; "none" only for work with no GPU-facing code>
     Done when: <commands and expected result; tests to add>
     Budget: <when to stop and report what is left>
     Return: <format and length; include what was not verified>

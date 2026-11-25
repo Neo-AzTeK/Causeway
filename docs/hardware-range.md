@@ -1,7 +1,7 @@
 # Hardware range: how a fix holds on other GPUs
 
 Rule (CLAUDE.md): a fix must hold on other GPUs, vendors and drivers, not only
-the owner's RTX 2060 SUPER (NVIDIA, wave32 only). This page is how. The code
+the primary dev GPU (NVIDIA, wave32 only; `docs/adapters.md`). This page is how. The code
 is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
 
 ## The mechanism in four lines
