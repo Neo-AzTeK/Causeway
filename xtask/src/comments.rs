@@ -1,5 +1,5 @@
 //! The comment rules a machine can hold (CONTRIBUTING.md, "Comments"), run
-//! as part of `cargo xtask policy` and so by the tests CI runs:
+//! as part of `cargo xtask policy` and so by the workspace tests:
 //!
 //! - a comment line `// invariant(<test>): why` must name a test that exists,
 //!   so the proof of a must-hold rule cannot be deleted or renamed unnoticed;
