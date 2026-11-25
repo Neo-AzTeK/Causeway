@@ -133,6 +133,7 @@ pub(super) fn translate_caps(
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        wave64_why: None,
     })
 }
 

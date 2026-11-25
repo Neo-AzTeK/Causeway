@@ -33,6 +33,8 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// Why a compute program of waves of 64 asks the host for them.
+    pub wave64_why: Option<Why>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -98,16 +100,25 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     // A program of waves of 64 that waves of 32 can stand in for goes to the
     // host that way; if that fails, it asks for waves of 64 as before.
     let mut virt = true;
+    let mut failed = None;
     loop {
         let l = Lower::new(parts, &bad, virt);
         let tried = l.virt;
         match l.run() {
-            Ok(l) => return Ok(l),
-            Err(Stop::Fail(_)) if tried => {
+            Ok(mut l) => {
+                l.wave64_why = failed.or(l.wave64_why);
+                return Ok(l);
+            }
+            Err(Stop::Fail(e)) if tried => {
+                failed = Some(match e {
+                    ShaderError::Unsupported { what, .. } => what,
+                    _ => "two halves that do not lower",
+                });
                 virt = false;
                 bad.clear();
             }
-            Err(Stop::Retry(v, _)) if tried && bad.contains_key(&v) => {
+            Err(Stop::Retry(v, why)) if tried && bad.contains_key(&v) => {
+                failed = Some(why);
                 virt = false;
                 bad.clear();
             }
@@ -242,6 +253,7 @@ struct Lower<'a> {
     /// The console's waves of 64 run as two host waves of 32 (see
     /// [Self::exchange]).
     virt: bool,
+    wave64_why: Option<Why>,
     /// IR blocks every lane runs exactly once.
     common: Vec<bool>,
     /// With `virt`, made in the entry block: whether this host wave is the
@@ -537,6 +549,7 @@ impl<'a> Lower<'a> {
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         let mut virt = false;
+        let mut wave64_why = None;
         let mut xbase = 0;
         let mut lockstep = HashSet::new();
         if let StageIo::Cs(cs) = x.native.io {
@@ -594,14 +607,17 @@ impl<'a> Lower<'a> {
                 if !enough && try_virt && wave == 64 && threads <= 1024 {
                     // Two waves of 32 stand in for one of 64 (where its LDS
                     // exchanges can be put in step).
-                    let steps = if super::halves::check(p).is_err() {
-                        None
-                    } else if one_wave && s.lds_dwords > 0 {
-                        super::lockstep::barriers(&p.blocks)
-                    } else {
-                        Some(Vec::new())
-                    };
-                    if let Some(at) = steps {
+                    let steps = super::halves::check(p).and_then(|()| {
+                        if one_wave && s.lds_dwords > 0 {
+                            super::lockstep::barriers(&p.blocks).ok_or(
+                                "lanes read each other and share LDS no barriers can order",
+                            )
+                        } else {
+                            Ok(Vec::new())
+                        }
+                    });
+                    wave64_why = steps.as_ref().err().copied();
+                    if let Ok(at) = steps {
                         lockstep.extend(at);
                         virt = true;
                         s.wave_size = Some(32);
@@ -609,12 +625,18 @@ impl<'a> Lower<'a> {
                         // Per console wave: 2 pair slots, then 64 lane slots.
                         s.lds_extra = threads.div_ceil(64) * 66;
                     }
+                } else if !enough && wave == 64 && threads > 1024 {
+                    wave64_why = Some("a group of more than 1024 threads");
                 }
             } else if one_wave && s.lds_dwords > 0 {
                 // Hosts may lack waves of 64; barriers do as well.
                 match super::lockstep::barriers(&p.blocks).filter(|_| wave == 64) {
                     Some(at) => lockstep.extend(at),
-                    None => s.wave_size = Some(wave),
+                    None => {
+                        s.wave_size = Some(wave);
+                        wave64_why = (wave == 64)
+                            .then_some("LDS of one wave that no barriers can order");
+                    }
                 }
             }
         }
@@ -705,6 +727,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             virt,
+            wave64_why,
             common: super::lockstep::common(&p.blocks),
             halves: None,
             xbase,
@@ -1190,11 +1213,6 @@ impl<'a> Lower<'a> {
                 if self.mask_data != MaskData::Console {
                     return Err("a 16-bit wave reduction outside compute");
                 }
-                // shortcut: the sum of the two host waves of a console wave of
-                // 64 is not taken.
-                if self.virt {
-                    return Err("a 16-bit wave reduction in a wave of 64");
-                }
                 let c = self.cur;
                 let &m = self
                     .x
@@ -1223,6 +1241,15 @@ impl<'a> Lower<'a> {
                     119,
                     &[f, sum, signed],
                 );
+                // With `virt`, the console wave's sum is the two halves'.
+                let r = if self.virt {
+                    let mine = self.as_int(r);
+                    let (a, b) = self.exchange(c, self.cur_ir, mine)?;
+                    let (a, b) = (self.as_float(a), self.as_float(b));
+                    self.combine(Op::AddF, a, b)
+                } else {
+                    r
+                };
                 let r = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
@@ -1234,14 +1261,21 @@ impl<'a> Lower<'a> {
                 let b = self
                     .s
                     .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
-                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+                // With `virt`, the lane's place in its half's host wave.
+                let local = if self.virt { hi % 32 } else { hi };
+                let word = self.s.m.extract(c, b, local / 32);
+                let (sh, one, z) = (self.s.m.i32(local % 32), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
-                let lane = self.s.m.i32(hi);
+                let lane = self.s.m.i32(local);
                 let at = self.read_lane(x, lane);
-                let top = self.s.m.select(c, there, at, id);
+                let mut top = self.s.m.select(c, there, at, id);
+                if self.virt {
+                    // Both halves take it from the half that holds the lane.
+                    let (lower, upper) = self.exchange(c, self.cur_ir, top)?;
+                    top = if hi < 32 { lower } else { upper };
+                }
                 let high = self.s.m.i32(0xFFFF_0000);
                 let top = self.s.m.bin(c, Bin::And, top, high);
                 return Ok(self.s.m.bin(c, Bin::Or, top, r));
@@ -1508,6 +1542,7 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
+            wave64_why: self.wave64_why,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3125,8 +3160,11 @@ impl<'a> Lower<'a> {
     /// refused where some skip it.
     fn exchange(&mut self, at: usize, ir: usize, x: V) -> Result<(V, V), Why> {
         let (half, slot0) = self.halves.ok_or("an exchange between host waves")?;
-        if !self.common[ir] || at == self.cur && self.guarded > 0 {
-            return Err("an exchange between host waves where some lanes skip it");
+        if !self.common[ir] {
+            return Err("an exchange between host waves in a block some lanes skip or repeat");
+        }
+        if at == self.cur && self.guarded > 0 {
+            return Err("an exchange between host waves under a lane's guard");
         }
         let lds = self.s.lds();
         let mine = self.s.m.bin(at, Bin::Add, slot0, half);

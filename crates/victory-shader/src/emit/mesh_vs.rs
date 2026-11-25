@@ -123,6 +123,7 @@ pub fn mesh_vertex_shader(container: &[u8]) -> Result<MeshVertexShader, ShaderEr
             heap: false,
             heap_writes: false,
             view_marks: false,
+            wave64_why: None,
         },
         stride,
     })

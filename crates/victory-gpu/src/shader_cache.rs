@@ -220,6 +220,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
+        wave64_why,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -271,6 +272,9 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    let why = wave64_why.as_deref().unwrap_or_default().as_bytes();
+    word(&mut out, why.len() as u32);
+    out.extend(why);
     out
 }
 
@@ -332,6 +336,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let why = String::from_utf8(r.list()?).ok()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -347,6 +352,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
         view_marks: memory & 32 != 0,
+        wave64_why: (!why.is_empty()).then_some(why),
     }))
 }
 
@@ -380,7 +386,17 @@ mod tests {
             heap: true,
             heap_writes: true,
             view_marks: true,
+            wave64_why: Some("why it needs waves of 64".into()),
         }
+    }
+
+    #[test]
+    fn a_translation_without_a_wave64_reason_comes_back() {
+        let plain = Ok(HostShader {
+            wave64_why: None,
+            ..shader()
+        });
+        assert_eq!(decode(&encode(&plain)), Some(plain));
     }
 
     /// A translation made with mesh programs as compute is its own entry:

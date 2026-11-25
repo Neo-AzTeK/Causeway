@@ -102,6 +102,7 @@ fn build(body: &[u32]) -> Result<HostShader, String> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        wave64_why: None,
     };
     // shortcut: validated only when `dxil.dll` is found; otherwise the
     // device's own checks are all there is.
