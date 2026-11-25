@@ -1,4 +1,5 @@
-This marker file identifies the root of the VIctory source tree.
+This marker file identifies the root of the Causeway source tree (it keeps the
+`victory` name because the tools look for this file).
 
 Tools refuse to write game-derived output (caches, converted assets, prepared
 images, logs containing game data) anywhere below a directory that contains
