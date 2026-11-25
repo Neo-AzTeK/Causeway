@@ -651,6 +651,32 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
+/// The last submissions (number, lists, programs bound), kept to name what
+/// ran before a device removal: counts and pipeline hashes only.
+static JOURNAL: Mutex<std::collections::VecDeque<(u64, usize, std::collections::BTreeSet<String>)>> =
+    Mutex::new(std::collections::VecDeque::new());
+const JOURNAL_LEN: usize = 6;
+
+fn journal_push(number: u64, runs: &[&HostList]) {
+    let mut programs = std::collections::BTreeSet::new();
+    for l in runs {
+        programs.extend(l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+    }
+    let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if journal.len() == JOURNAL_LEN {
+        journal.pop_front();
+    }
+    journal.push_back((number, runs.len(), programs));
+}
+
+fn journal_text() -> String {
+    let journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    journal
+        .iter()
+        .map(|(n, lists, programs)| format!("; submission {n}: {lists} lists, {} programs {programs:?}", programs.len()))
+        .collect()
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -986,6 +1012,7 @@ impl Host {
                 }
             }
         }
+        journal_push(*submitted + 1, runs);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -1073,8 +1100,9 @@ impl Host {
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
+                "host GPU device removed after a submission of {} lists{}{}{}{}",
                 runs.len(),
+                journal_text(),
                 self.removal_data(runs),
                 last_notes(runs),
                 removed_during(runs, removed_in)
