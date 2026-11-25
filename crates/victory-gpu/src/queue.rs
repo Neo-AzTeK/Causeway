@@ -270,6 +270,8 @@ extern "system" fn present(
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::descriptor::host::census::log();
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {

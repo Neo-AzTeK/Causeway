@@ -281,8 +281,9 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
                             1,
                             Root::View {
                                 srv: true,
-                                // The header (last slot 1, null SRV 1), then the strides.
-                                data: vec![1, 1, 4, 12],
+                                // The header (last slot 1, null SRV 1, nothing remapped:
+                                // one entry from 2), the strides, the entry.
+                                data: vec![1, 1, 2, 1, 4, 12, 1],
                             },
                         ),
                     ],
@@ -336,8 +337,9 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         }
         let dispatch = Dispatch {
             // Heap index 1 holds no buffer view: stride 0. The heap has 4 slots, the
-            // null UAV and SRV the last two: the header names 3 twice.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![3, 3, 4, 0, 0, 0] })],
+            // null UAV and SRV the last two: the header names 3 twice (and one
+            // remap entry from 4, the null SRV).
+            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![3, 3, 4, 1, 4, 0, 0, 0, 3] })],
             views: &views,
             samplers: &[],
             groups: [1, 1, 1],
@@ -403,7 +405,71 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                 &Dispatch {
                     // User data, then the stride table: heap index 1 holds a
                     // buffer view.
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![1, 1, 4, 4] })],
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![1, 1, 2, 1, 4, 4, 1] })],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], vec![9; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A resource heap index at or past the host's first remapped title slot
+/// (a host heap smaller than the title's, NVIDIA) reads the host slot its
+/// remap entry names, not the clamped last slot.
+#[test]
+fn a_heap_index_past_the_host_title_slots_reads_its_remapped_slot() {
+    let shader = build(
+        HEAP_CONSTANT_WAVE32,
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        32,
+    );
+    let (data, last) = (vec![7u32, 8, 9, 10], vec![70u32, 80, 90, 100]);
+    let views = [
+        View::RawUav(32),
+        View::Buffer { data: &data, stride: Stride::Raw },
+        View::Buffer { data: &last, stride: Stride::Raw },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                // The constants are at title heap index 5, the UAV's table
+                // at 0.
+                RootType::Constants => 5,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        // Three host slots (the last 2); title slots 3 to 5 remapped, 5 to
+        // host slot 1.
+        let table = vec![2, 2, 3, 3, 4, 4, 4, 2, 2, 1];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: table })],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],

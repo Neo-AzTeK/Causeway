@@ -5555,6 +5555,7 @@ impl<'a> Lower<'a> {
             return Err("a descriptor load");
         };
         let c = self.cur;
+        let resource_heap = self.x.native.layout.get(a.param).map(|p| p.root) == Some(RootType::ResourceHeap);
         let base = li.read(Reg::S(code)).ok_or("a descriptor load")?;
         let mut addr = self.i32_of(base)?;
         let k = self
@@ -5567,7 +5568,14 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        // Table indices are the host's already (tables past the host's
+        // title slots are made afresh in its own).
+        Ok(if resource_heap && !sampler {
+            self.s.remap_view(c, index)
+        } else {
+            index
+        })
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
