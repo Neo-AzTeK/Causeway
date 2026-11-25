@@ -54,6 +54,16 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: smoke 12 (69b004e, RTX 2060 SUPER wave32, 300 s, no skip,
+  `VICTORY_SHADER_LOOP_LIMIT=64`, owner-approved single run): no hang, no
+  removal; 7 slow submissions of 251-271 ms, none naming `a1f6cdf8874960a9`
+  (23 log lines mention it, so it ran). 0.6 fps, 1088 drawn/frame, lost
+  per frame: refused 346, compiling 760, other 2494; 0.0% non-flat. So the
+  hang is a loop trip count, as suspected; not shown whether the count is
+  garbage on the host (a wrong constant-buffer read) or legitimately large.
+  Next: run it at the default limit with the count of its loops logged, or
+  find the count's source. The limit also changes every other loop: this run
+  proves the cause, not a fix.
 - 2026-11-25: halves gate (`emit/halves.rs`, branch claude/kind-chebyshev-d936c6,
   offline, no launch): two-halves only if no `s_barrier` can be skipped or
   repeated by a branch on a lane-derived scalar (compare masks, EXEC, scalar
