@@ -13,7 +13,9 @@ symbol instead of pasting it. Do not repeat `CLAUDE.md`; name it to read.
     Tried / ruled out: <what failed and why>
     Base: <Causeway branch and commit; related PRs, if any>
     Scope: <files it may change; files it must not>
-    Constraints: <owner decisions, ordering, compatibility>
+    Constraints: <owner decisions, ordering, compatibility; always: must hold
+      on other GPUs/vendors/drivers (query capabilities, test wave32 and
+      wave64 or both paths, report adapters verified), see CLAUDE.md>
     Done when: <commands and expected result; tests to add>
     Budget: <when to stop and report what is left>
     Return: <format and length; include what was not verified>

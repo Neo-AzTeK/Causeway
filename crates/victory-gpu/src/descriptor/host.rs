@@ -30,9 +30,91 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// The dynamic slots and who holds them.
+    next: Mutex<Slots>,
+}
+
+/// The dynamic slots of a view heap: who holds each (the id of the take; 0:
+/// free) and where the search for free ones starts. Lists not yet reset hold
+/// theirs; takes whose lists have run are `retired`, and their slots are
+/// taken back when none is free.
+#[derive(Default)]
+pub(crate) struct Slots {
+    next: usize,
+    owner: Vec<u64>,
+    last_id: u64,
+    retired: std::collections::HashSet<u64>,
+}
+
+impl Slots {
+    pub(crate) fn new(n: u32) -> Self {
+        Slots { owner: vec![0; n as usize], ..Default::default() }
+    }
+
+    /// `n` consecutive free slots, searched from where the last take ended
+    /// and then from the start: the first's index and the take's id. When
+    /// there are none, slots of retired takes are freed first.
+    pub(crate) fn take(&mut self, n: u32) -> Option<(u32, u64)> {
+        let n = n as usize;
+        if n == 0 || n > self.owner.len() {
+            return None;
+        }
+        let first = self.find(n).or_else(|| {
+            self.reclaim();
+            self.find(n)
+        })?;
+        self.last_id += 1;
+        self.owner[first..first + n].fill(self.last_id);
+        self.next = (first + n) % self.owner.len();
+        Some((first as u32, self.last_id))
+    }
+
+    fn find(&self, n: usize) -> Option<usize> {
+        let starts = (self.next..self.owner.len()).chain(0..self.next);
+        let (mut run, mut last) = (0, usize::MAX);
+        for at in starts {
+            // A run cannot wrap past the end.
+            if at != last.wrapping_add(1) {
+                run = 0;
+            }
+            last = at;
+            run = if self.owner[at] != 0 { 0 } else { run + 1 };
+            if run == n {
+                return Some(at + 1 - n);
+            }
+        }
+        None
+    }
+
+    /// Frees the slots of retired takes.
+    fn reclaim(&mut self) {
+        if self.retired.is_empty() {
+            return;
+        }
+        let retired = std::mem::take(&mut self.retired);
+        for owner in self.owner.iter_mut().filter(|o| retired.contains(o)) {
+            *owner = 0;
+        }
+    }
+
+    /// Gives back the slots `first..first + n` of take `id`, if it still
+    /// holds them (a retired take's may have been taken back and given on).
+    pub(crate) fn release(&mut self, first: u32, n: u32, id: u64) {
+        let end = (first as usize + n as usize).min(self.owner.len());
+        if let Some(slots) = self.owner.get_mut(first as usize..end) {
+            slots.iter_mut().filter(|o| **o == id).for_each(|o| *o = 0);
+        }
+        self.retired.remove(&id);
+    }
+
+    /// Marks take `id` as run: its slots may be taken back.
+    pub(crate) fn retire(&mut self, id: u64) {
+        self.retired.insert(id);
+    }
+
+    fn used(&self) -> usize {
+        self.owner.iter().filter(|&&o| o != 0).count()
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -59,12 +141,14 @@ pub(crate) fn near_heaps(va: u64) -> String {
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
+/// tiers 1 and 2; tier 3 hardware may take more (some refuses all the same,
+/// so a tier 3 heap is tried and falls back).
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released.
+/// took until it is reset or released; once its submissions have run they
+/// are taken back when a draw finds none free (see [`HostHeap::dynamic`]).
 /// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
@@ -72,6 +156,48 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// One way to size a view heap: slots mirroring the title's, then dynamic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Plan {
+    pub(crate) title: u32,
+    pub(crate) dynamic: u32,
+}
+
+impl Plan {
+    fn total(self) -> u32 {
+        self.title + self.dynamic
+    }
+}
+
+/// The sizes to try for a view heap, best first, for a title heap of
+/// `wanted` slots on a host whose heaps hold `limit` slots (`None`: no
+/// known limit, so the larger ones are tried and may be refused). The last
+/// always fits `limit`: the title's slots cut to what leaves room for
+/// [`MIN_DYNAMIC`] (less in a tiny limit, which splits in half).
+pub(crate) fn plan_view_heap(wanted: u32, limit: Option<u32>) -> Vec<Plan> {
+    let limit = limit.unwrap_or(u32::MAX);
+    let mut plans: Vec<Plan> = Vec::new();
+    for dynamic in [DYNAMIC, MIN_DYNAMIC] {
+        if wanted.checked_add(dynamic).is_some_and(|t| t <= limit) {
+            plans.push(Plan { title: wanted, dynamic });
+        }
+    }
+    // An unknown limit still ends at what every host takes.
+    let cap = limit.min(PORTABLE_VIEWS);
+    let dynamic = MIN_DYNAMIC.min(cap / 2);
+    let capped = Plan { title: wanted.min(cap - dynamic), dynamic };
+    if !plans.contains(&capped) {
+        plans.push(capped);
+    }
+    plans
+}
+
+/// The most view descriptors a shader-visible heap may hold on a resource
+/// binding tier; `None` where the tier sets none (tier 3).
+fn view_limit(tier: D3D12_RESOURCE_BINDING_TIER) -> Option<u32> {
+    (tier != D3D12_RESOURCE_BINDING_TIER_3).then_some(PORTABLE_VIEWS)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -103,22 +229,47 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
-            (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: a plain query into a struct of the size given.
+            let known = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    std::ptr::from_mut(&mut options).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS>() as u32,
+                )
+            }
+            .is_ok();
+            // An unanswered query: the portable limit.
+            let limit =
+                if known { view_limit(options.ResourceBindingTier) } else { Some(PORTABLE_VIEWS) };
+            let mut made = None;
+            let mut last = None;
+            for plan in plan_view_heap(count, limit) {
+                match make(plan.total()) {
+                    Ok(heap) => {
+                        made = Some((heap, plan));
+                        break;
+                    }
+                    Err(e) => last = Some(e),
                 }
             }
+            let Some((heap, plan)) = made else {
+                tracing::warn!(error = ?last, count, "no host descriptor heap");
+                return None;
+            };
+            if plan.title < count {
+                // shortcut: descriptors past the host's limit are left
+                // out; a title that reaches them needs remapping.
+                tracing::warn!(
+                    wanted = count,
+                    title_slots = plan.title,
+                    dynamic = plan.dynamic,
+                    ?limit,
+                    "host view heap capped"
+                );
+            }
+            (heap, plan.title, plan.dynamic)
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -145,7 +296,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(Slots::new(extra)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -222,38 +373,21 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
-    pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+    /// [`HostHeap::release`]: the first's index and the take's id. With
+    /// none free, the slots of takes whose lists have run are taken back
+    /// first (shortcut: a list run again after that reads slots made for
+    /// another; the title runs a list once per recording).
+    pub(crate) fn dynamic(&self, n: u32) -> Option<(u32, u64)> {
+        if self.sampler {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let mut slots = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((first, id)) = slots.take(n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                let used = taken.iter().filter(|&&t| t).count();
                 tracing::warn!(
                     n,
-                    used,
+                    used = slots.used(),
                     of = self.dynamic,
                     title_slots = self.count,
                     "no free dynamic descriptor slots: a table is not made"
@@ -261,9 +395,7 @@ impl HostHeap {
             });
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
-        Some(self.count + first as u32)
+        Some((self.count + first, id))
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -273,18 +405,19 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned) of take `id`.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, first: u32, n: u32, id: u64) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.next.lock().unwrap_or_else(|e| e.into_inner()).release(at, n, id);
+    }
+
+    /// Take `id`'s list has run: its slots may be taken back.
+    pub(crate) fn retire(&self, id: u64) {
+        self.next.lock().unwrap_or_else(|e| e.into_inner()).retire(id);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1090,16 +1223,76 @@ mod tests {
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
-        let Some(heap) = HostHeap::new(false, 4) else {
-            return; // no host GPU
-        };
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
-        let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
+        let mut slots = Slots::new(200);
+        let (a, ia) = slots.take(100).unwrap();
+        let (b, ib) = slots.take(60).unwrap();
+        assert_eq!((a, b), (0, 100));
         // 40 left at the end: 50 do not fit until something is given back.
-        assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        assert_eq!(slots.take(50), None);
+        slots.release(a, 50, ia);
+        assert_eq!(slots.take(50).map(|t| t.0), Some(0));
+        assert_eq!(slots.take(40).map(|t| t.0), Some(160));
+        slots.release(b, 60, ib);
+    }
+
+    /// With none free, slots of takes whose lists have run are taken back;
+    /// those of lists not yet run are not, and a stale release frees nothing
+    /// of the new holder's.
+    #[test]
+    fn exhausted_slots_are_taken_back_from_lists_that_ran() {
+        let mut slots = Slots::new(100);
+        let (_, run) = slots.take(60).unwrap();
+        let (_, waiting) = slots.take(40).unwrap();
+        assert_eq!(slots.take(10), None);
+        slots.retire(run);
+        let (first, new) = slots.take(50).unwrap();
+        assert_eq!(first, 0);
+        // The list that ran is reset late: its release must not free `new`.
+        slots.release(0, 60, run);
+        assert_eq!(slots.used(), 90);
+        assert_eq!(slots.take(20), None);
+        // Nothing retired, nothing taken back.
+        slots.release(first, 50, new);
+        slots.release(60, 40, waiting);
+        assert_eq!(slots.used(), 0);
+    }
+
+    /// 1.2M slots wanted: where the host takes any, with room for the
+    /// larger dynamic range; on a 1M limit, capped with the smaller one.
+    #[test]
+    fn view_heaps_are_sized_by_the_hosts_limit() {
+        let wanted = 1_245_184;
+        let unlimited = plan_view_heap(wanted, None);
+        assert_eq!(unlimited[0], Plan { title: wanted, dynamic: DYNAMIC });
+        assert_eq!(unlimited[1], Plan { title: wanted, dynamic: MIN_DYNAMIC });
+        // An unlimited host that refuses both still ends at the portable cap.
+        assert_eq!(
+            unlimited.last(),
+            Some(&Plan { title: PORTABLE_VIEWS - MIN_DYNAMIC, dynamic: MIN_DYNAMIC })
+        );
+        let capped = plan_view_heap(wanted, Some(PORTABLE_VIEWS));
+        assert_eq!(capped, [Plan { title: 934_464, dynamic: MIN_DYNAMIC }]);
+        assert_eq!(capped[0].total(), PORTABLE_VIEWS);
+        // A title that fits keeps all its slots, with the larger range if
+        // it fits too.
+        let small = plan_view_heap(500_000, Some(PORTABLE_VIEWS));
+        assert_eq!(small[0], Plan { title: 500_000, dynamic: DYNAMIC });
+        let tight = plan_view_heap(900_000, Some(PORTABLE_VIEWS));
+        assert_eq!(tight, [Plan { title: 900_000, dynamic: MIN_DYNAMIC }]);
+    }
+
+    /// Tiny heaps and limits never ask for more than the limit.
+    #[test]
+    fn tiny_view_heaps_fit_their_limit() {
+        for (wanted, limit) in [(4, 1000), (0, 10), (5000, 1000), (1, 1), (4, 1 << 20)] {
+            for plan in plan_view_heap(wanted, Some(limit)) {
+                assert!(plan.total() <= limit, "{plan:?} over {limit}");
+                assert!(plan.title <= wanted);
+            }
+        }
+        assert_eq!(plan_view_heap(4, Some(1000)), [Plan { title: 4, dynamic: 500 }]);
+        assert_eq!(plan_view_heap(5000, Some(1000)), [Plan { title: 500, dynamic: 500 }]);
+        assert_eq!(view_limit(D3D12_RESOURCE_BINDING_TIER_2), Some(PORTABLE_VIEWS));
+        assert_eq!(view_limit(D3D12_RESOURCE_BINDING_TIER_3), None);
     }
 }

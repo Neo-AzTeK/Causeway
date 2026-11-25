@@ -27,6 +27,11 @@ before working there.
 - `decision NNNN` and `TODO.md` in comments are not in this repo. Do not guess
   what they say.
 - Running the title on a real GPU can reset the display driver. Ask first.
+- Hardware range (owner's rule, 2026-11-25): a fix must hold on other GPUs,
+  vendors and drivers, not only the owner's RTX 2060 SUPER (wave32 only). Query
+  capabilities (wave size, binding tier, heap and format limits) instead of
+  hardcoding; keep a clean refusal where a device lacks a feature; test both
+  paths; say which adapters were and were not verified. Every brief states it.
 
 ## Spending tokens
 
