@@ -382,7 +382,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 }
                                 let one = std::time::Instant::now();
                                 let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP);
+                                    victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP, false);
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {

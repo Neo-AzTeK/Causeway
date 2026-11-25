@@ -4,11 +4,20 @@
 //! (`victory_shader::emit`): per stage one block of root constants for the
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
+//!
+//! Emulated mesh pipelines (added 2026-11-25): where the host has no mesh
+//! shaders (`Host::mesh_shaders`, from the caps), a title mesh pipeline is
+//! two host pipelines ([`EmulatedMesh`]): the mesh program made as compute,
+//! which writes its vertices and triangles to scratch buffers, and a
+//! graphics pipeline of the vertex shader made for it with the title's
+//! pixel shader and state, which draws them as an indexed triangle list
+//! (`victory_shader::emit`, "Mesh shaders as compute"; the draw path is
+//! `draw::State::dispatch_mesh`).
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{MEMORY_SPACE, required_waves,ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{MEMORY_SPACE, MESH_SPACE, required_waves,ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -300,6 +309,39 @@ pub(crate) struct HostPipeline {
     /// A refused pixel program replaced by the flat substitute (see
     /// [`fallback`]).
     pub(crate) fallback: bool,
+    /// Our root parameters of the mesh scratch (module notes): in a mesh
+    /// program made as compute the vertices' and triangles' UAVs and the
+    /// first group's SRV; in the vertex shader drawing them the vertices'
+    /// SRV. Empty otherwise.
+    pub(crate) scratch: Vec<u32>,
+    /// A mesh pipeline on a host without mesh shaders: this is its draw
+    /// pass, and here is its compute pass.
+    pub(crate) emulated: Option<Box<EmulatedMesh>>,
+}
+
+/// The compute pass of an emulated mesh pipeline and its scratch layout.
+pub(crate) struct EmulatedMesh {
+    pub(crate) compute: HostPipeline,
+    /// Bytes per vertex in the scratch vertices.
+    pub(crate) stride: u32,
+    /// Vertex and primitive slots per group.
+    pub(crate) max_vertices: u32,
+    pub(crate) max_primitives: u32,
+    /// The command signatures of its indirect dispatches (compute pass,
+    /// draw pass; `crate::mesh::signatures`); without them those are
+    /// dropped.
+    pub(crate) signatures: Option<(ID3D12CommandSignature, ID3D12CommandSignature)>,
+}
+
+/// Which host pipeline [`HostPipeline::build`] makes of a title pipeline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass<'a> {
+    /// The title's stages as they are.
+    Title,
+    /// An emulated mesh pipeline's compute pass.
+    MeshCompute,
+    /// Its draw pass, with this vertex shader.
+    MeshDraw(&'a [u8]),
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -317,21 +359,57 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
-        let made = Self::build(shaders, g, false);
+        let made = Self::build(shaders, g, false, Pass::Title);
         if made.is_some() || !fallback::enabled() {
             return made;
         }
         let g = g?;
         let ps = shaders.iter().find(|s| s.stage == "pixel")?;
-        let mut flat = Self::build(shaders, Some(g), true)?;
+        let mut flat = Self::build(shaders, Some(g), true, Pass::Title)?;
         flat.fallback = true;
         fallback::made(ps);
         Some(flat)
     }
 
+    /// An emulated mesh pipeline (module notes), its pixel stage the flat
+    /// substitute if `flat`.
+    fn emulated(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, flat: bool) -> Option<HostPipeline> {
+        let ms = shaders.iter().find(|s| s.stage == "mesh")?;
+        let made = victory_shader::emit::mesh_vertex_shader(&ms.container)
+            .and_then(|vs| Ok((vs, victory_shader::emit::mesh_limits(&ms.container)?)));
+        let (vs, (max_vertices, max_primitives)) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                tracing::warn!(error = %e, ?shaders, "no vertex shader for an emulated mesh pipeline");
+                return refuse("a mesh program the emulation cannot draw", shaders);
+            }
+        };
+        let compute = Self::build(shaders, g, flat, Pass::MeshCompute)?;
+        let mut draw = Self::build(shaders, g, flat, Pass::MeshDraw(&vs.shader.dxil))?;
+        tracing::info!(?shaders, stride = vs.stride, max_vertices, max_primitives, "host mesh pipeline, emulated");
+        let signatures = match (&compute.scratch[..], &draw.scratch[..]) {
+            (&[vertices, triangles, first], &[drawn]) => crate::mesh::signatures(
+                &host()?.device,
+                (&compute.root, [vertices, triangles, first]),
+                (&draw.root, drawn),
+            )
+            .inspect_err(|e| tracing::warn!(error = %e, ?shaders, "no indirect signatures for an emulated mesh pipeline"))
+            .ok(),
+            _ => None,
+        };
+        draw.emulated = Some(Box::new(EmulatedMesh {
+            compute,
+            stride: vs.stride,
+            max_vertices,
+            max_primitives,
+            signatures,
+        }));
+        Some(draw)
+    }
+
     /// `new`, with the pixel stage replaced by the flat substitute if
-    /// `flat`.
-    fn build(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, flat: bool) -> Option<HostPipeline> {
+    /// `flat`; `pass` says which host pipeline of the title's.
+    fn build(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, flat: bool, pass: Pass) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -348,23 +426,29 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
+        // Keep native mesh shaders where the caps say the host has them.
+        if mesh.is_some() && pass == Pass::Title && !host()?.mesh_shaders() {
+            return Self::emulated(shaders, g, flat);
+        }
+        let mesh_draw = matches!(pass, Pass::MeshDraw(_));
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
+        } else if pass == Pass::MeshCompute {
+            vec![(mesh?, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
             let first = match (mesh, find("vertex")) {
                 (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
-            let mut stages = vec![first];
+            // The draw pass's vertex shader is ours: no title stage.
+            let mut stages = if mesh_draw { Vec::new() } else { vec![first] };
             if !flat {
                 stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             }
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
-        }
+        let as_compute = compute.is_some() || pass == Pass::MeshCompute;
         for (s, _) in &stages {
             s.translated()?;
         }
@@ -531,7 +615,32 @@ impl HostPipeline {
                 }
                 (first, first + 1)
             });
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        // The mesh scratch (module notes; `victory_shader::emit::MESH_SPACE`).
+        let views: &[(D3D12_ROOT_PARAMETER_TYPE, u32, D3D12_SHADER_VISIBILITY)] = match pass {
+            Pass::Title => &[],
+            Pass::MeshCompute => &[
+                (D3D12_ROOT_PARAMETER_TYPE_UAV, 0, D3D12_SHADER_VISIBILITY_ALL),
+                (D3D12_ROOT_PARAMETER_TYPE_UAV, 1, D3D12_SHADER_VISIBILITY_ALL),
+                (D3D12_ROOT_PARAMETER_TYPE_SRV, 1, D3D12_SHADER_VISIBILITY_ALL),
+            ],
+            Pass::MeshDraw(_) => &[(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, D3D12_SHADER_VISIBILITY_VERTEX)],
+        };
+        let mut scratch = Vec::new();
+        for &(kind, register, visibility) in views {
+            scratch.push(params.len() as u32);
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: kind,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: register,
+                        RegisterSpace: MESH_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
+        }
+        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, as_compute) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -547,6 +656,17 @@ impl HostPipeline {
                     BytecodeLength: flat_ps.len(),
                 };
             }
+            // The draw pass: our vertex shader, then the title's stages.
+            let i = match pass {
+                Pass::MeshDraw(vs) if i == 0 => {
+                    return D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: vs.as_ptr().cast(),
+                        BytecodeLength: vs.len(),
+                    };
+                }
+                Pass::MeshDraw(_) => i - 1,
+                _ => i,
+            };
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -555,7 +675,7 @@ impl HostPipeline {
                 },
             )
         };
-        if compute.is_some() {
+        if as_compute {
             // Refuse before creating: the host answers a wave size it lacks
             // with E_INVALIDARG, which says nothing.
             if let Some(wave) = wave_refusal(&host.caps, &code_bytes(&code(0))) {
@@ -599,13 +719,15 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 marks,
                 fallback: false,
+                scratch,
+                emulated: None,
             });
         }
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if mesh.is_some() && !mesh_draw {
             let name = super::library::name(
                 "mesh",
                 &root_blob,
@@ -634,6 +756,8 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 marks,
                 fallback: false,
+                scratch,
+                emulated: None,
             });
         }
 
@@ -641,6 +765,7 @@ impl HostPipeline {
         // each rectangle's fourth corner (else rectangles are expanded on
         // the CPU from vertex inputs, see `draw`).
         let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
+            _ if mesh_draw => Vec::new(),
             (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
                 Ok(gs) => gs,
                 Err(e) => {
@@ -663,12 +788,13 @@ impl HostPipeline {
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
+            // The draw pass reads no vertex input; it draws a triangle list.
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
-                NumElements: g.inputs.len() as u32,
+                NumElements: if mesh_draw { 0 } else { g.inputs.len() as u32 },
             },
-            IBStripCutValue: g.strip_cut,
-            PrimitiveTopologyType: host_topology(g),
+            IBStripCutValue: if mesh_draw { D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED } else { g.strip_cut },
+            PrimitiveTopologyType: if mesh_draw { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { host_topology(g) },
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
             DSVFormat: g.depth_format,
@@ -710,16 +836,18 @@ impl HostPipeline {
         );
         Some(HostPipeline {
             compute: false,
-            mesh: false,
+            mesh: mesh_draw,
             pso,
             root,
             stages: bound,
             name: format!("{shaders:?}"),
             rectangles: !gs.is_empty(),
-            slots: g.slots(),
+            slots: if mesh_draw { 0 } else { g.slots() },
             fallback: false,
-            inputs: g.elements(),
+            inputs: if mesh_draw { Vec::new() } else { g.elements() },
             marks,
+            scratch,
+            emulated: None,
         })
     }
 }
