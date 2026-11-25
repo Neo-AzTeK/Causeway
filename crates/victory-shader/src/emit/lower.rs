@@ -6463,11 +6463,31 @@ impl<'a> Lower<'a> {
                 int(self, a)
             }
             "v_readfirstlane_b32" => {
-                if self.virt && guard.is_some() {
-                    return Err("the first of some lanes across host waves");
-                }
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
+                if let (true, Some(on)) = (self.virt, guard) {
+                    // The first lane where the guard holds: this host wave's,
+                    // or else its partner's. Every lane runs this (skips are
+                    // left out), so the halves can exchange.
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let ballot = self
+                        .s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                    let lo = self.s.m.extract(c, ballot, 0);
+                    let first = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+                    let mine = self.read_lane(a, first);
+                    let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+                    let any = self.s.m.cmp(c, pred::NE, lo, zero);
+                    let any = self.s.m.select(c, any, one, zero);
+                    let (m0, m1) = self.exchange(c, self.cur_ir, mine)?;
+                    let (any, _) = self.exchange(c, self.cur_ir, any)?;
+                    let lower = self.s.m.cmp(c, pred::NE, any, zero);
+                    let r = self.s.m.select(c, lower, m0, m1);
+                    return int(self, r);
+                }
                 let mut r = self.s.op(
                     c,
                     "waveReadLaneFirst.i32",

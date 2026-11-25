@@ -624,6 +624,81 @@ fn wave64_lane_reads_run_on_two_waves_of_32() {
     }
 }
 
+/// `body` of a wave64 compute program with the skips `skips::find` names
+/// left out (as `translate` does where the program still asks for waves of 64).
+fn skips_left_out(body: &[u32]) -> Vec<u32> {
+    use super::image_tests::{S_ENDPGM, TABLES};
+    let head = TABLES.len() + STORE_SETUP.len();
+    let words = [&TABLES[..], &STORE_SETUP, body, &STORE, &[S_ENDPGM]].concat();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = crate::ir::build(&code, true, 32).unwrap();
+    let skips = super::skips::find(&p);
+    let patched = super::skips::leave_out(&code, &skips);
+    patched
+        .chunks(4)
+        .skip(head)
+        .take(body.len())
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect()
+}
+
+/// The wave sizes a one-wave64 group's program requires, and what each lane stored.
+fn waves_required(body: &[u32]) -> Option<(u32, u32)> {
+    let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
+    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 64, 0).unwrap();
+    check(&shader);
+    crate::emit::required_waves(&shader.dxil)
+}
+
+#[test]
+fn a_wave64_skip_over_a_lane_read_is_left_out_for_two_waves_of_32() {
+    let lane = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0008,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v8, -1, v1
+    ];
+    let skip = |body: &[u32]| {
+        [
+            &lane[..],
+            &[
+                0x7D88_0088, // v_cmp_gt_u32 vcc, 8, v0
+                0xBE96_246A, // s_and_saveexec_b64 s[22:23], vcc
+                0xBF88_0000 | body.len() as u32, // s_cbranch_execz over the body
+            ],
+            body,
+            &[0xBEFE_0416], // s_mov_b64 exec, s[22:23]
+        ]
+        .concat()
+    };
+    let read = [
+        0x7E14_0508, // v_readfirstlane_b32 s10, v8
+        0x7E10_020A, // v_mov_b32 v8, s10
+    ];
+    let body = skip(&read);
+    // Lanes decide alone whether to skip: a host wave may leave its partner
+    // waiting in the exchange.
+    assert_eq!(waves_required(&body), Some((64, 64)));
+    let left_out = skips_left_out(&body);
+    assert_ne!(left_out, body);
+    let least = waves_required(&left_out).map(|r| r.0);
+    assert!(least.is_none_or(|n| n <= 32), "{least:?}");
+    if let Some(got) = on_waves_of_32(&left_out, 64) {
+        // Lanes 0 to 7 read the first of the lanes that ran: lane 0's.
+        let want: Vec<u32> = (0..64).map(|l| if l < 8 { 0 } else { l }).collect();
+        assert_eq!(got, want);
+    }
+    // A scalar the body writes and the code after it reads: a skipped body
+    // would differ from one that ran, so the skip stays.
+    let used = skip(&[
+        0x7E14_0508, // v_readfirstlane_b32 s10, v8
+        0x7E10_020A, // v_mov_b32 v8, s10
+        0xBE8B_0380, // s_mov_b32 s11, 0
+    ]);
+    let after = [&used[..], &[0x7E12_020B]].concat(); // v_mov_b32 v9, s11
+    assert_eq!(skips_left_out(&after), after);
+}
+
 #[test]
 fn a_mask_set_to_a_constant_then_a_compare_joins() {
     let body = [

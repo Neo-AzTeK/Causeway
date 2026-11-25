@@ -12,13 +12,13 @@ use crate::native::{
 use crate::{ShaderError, io, ir, resource, structure};
 
 /// `s[4:5]` and `s[6:7]`: the tables of views and of samplers.
-const TABLES: [u32; 4] = [
+pub(super) const TABLES: [u32; 4] = [
     0xBE84_0300, // s_mov_b32 s4, s0
     0xBE85_0380, // s_mov_b32 s5, 0
     0xBE86_0301, // s_mov_b32 s6, s1
     0xBE87_0380, // s_mov_b32 s7, 0
 ];
-const S_ENDPGM: u32 = 0xBF81_0000;
+pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// Lowers a wave32 compute program of 32 threads with the table of views at
 /// s0 (a texture of kind `image` at dword 0, a raw UAV at dword 8) and the
