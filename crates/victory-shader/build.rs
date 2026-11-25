@@ -59,6 +59,11 @@ fn main() {
         "cargo:rustc-env=VICTORY_SHADER_BUILD_HASH={}",
         h.finalize().to_hex()
     );
+    // The name VIctory's caches use for the same hash.
+    println!(
+        "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={}",
+        h.finalize().to_hex()
+    );
 }
 
 /// The files under `dir`, relative to `root`, with `/` between folders.

@@ -45,6 +45,19 @@ target\release\victory.exe run <game dir>\<the title's exe> --execute
 Saves, settings and `crashes.log` are in `%LOCALAPPDATA%\victory\data` by
 default. `victory --help` lists the other commands.
 
+`victory translate --cache [--pipelines]` translates every shader the title
+can ask for ahead of time (minutes, about 1.3 GB; again after a change of the
+translator), and with `--pipelines` also makes the 27,000 pipelines of its
+shader pack into a host pipeline library (some 20 minutes, belongs to the GPU
+and driver it was made on). Without it they are made at first use and draws
+wait.
+
+Upscaling (Series S mode): to run AMD FidelityFX's PC upscaler instead of the
+console build the title ships, point `VICTORY_FIDELITYFX_DIR` (or
+`[paths].fidelityfx_dir`) at the
+[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)'s
+`Kits/FidelityFX/signedbin` folder (`amd_fidelityfx_upscaler_dx12.dll`).
+
 ## Controls
 
 XInput pads. With none connected the keyboard is a pad while the window has
