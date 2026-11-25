@@ -213,7 +213,13 @@
 //!   sees is its group id plus dword 0 of the raw root SRV `t1` in
 //!   [`MESH_SPACE`]; the scratch addresses count from the dispatch's
 //!   first group. Per-primitive outputs are refused (the title's programs
-//!   have none).
+//!   have none). The compute shader asks for no wave size and needs none:
+//!   mesh code reads no other lane (cross-lane operations are refused but
+//!   quad-local ones, and a 1D group's quads are threads 4n..4n+3 at any
+//!   wave size), and the console lane is the flat thread id modulo the
+//!   console's wave, not the host's lane. Every primitive slot is culled
+//!   first and indices past the group's vertices are clamped, so the draw
+//!   never reads a vertex outside the dispatch's scratch.
 
 mod bitcode;
 #[cfg(all(test, windows))]
@@ -1054,15 +1060,17 @@ mod tests {
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
     fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
-        triangle_mesh_with(prim, false, false, Options::default()).map(|m| m.1)
+        triangle_mesh_with(prim, false, false, 1, Options::default()).map(|m| m.1)
     }
 
     /// [`triangle_mesh`] of one wave of 32 or 64 lanes, made as `options`
-    /// say, with the console container it came from.
+    /// say, with the console container it came from; `slots_per_lane`
+    /// primitive slots per lane (the lanes export the first only).
     fn triangle_mesh_with(
         prim: u32,
         wave64: bool,
         group_z: bool,
+        slots_per_lane: u32,
         options: Options,
     ) -> Result<(Vec<u8>, HostShader), ShaderError> {
         let lanes = if wave64 { 64 } else { 32 };
@@ -1107,7 +1115,7 @@ mod tests {
                 clip_cntl: 0,
                 threads: lanes,
                 max_vertices: lanes,
-                max_primitives: lanes,
+                max_primitives: lanes * slots_per_lane,
                 topology: 2,
                 lds_bytes: 0,
             }),
@@ -1164,12 +1172,20 @@ mod tests {
             };
             for wave64 in [false, true] {
                 let lanes = if wave64 { 64u32 } else { 32 };
-                for (prim, culled) in [(TRIANGLE, false), (TRIANGLE | EDGE_FLAGS | CULL, true)] {
-                    let what = format!("{label}, wave64 {wave64}, {prim:#x}");
-                    let (console, cs) = triangle_mesh_with(prim, wave64, false, options)
+                // Last: twice as many primitive slots as lanes, the ones no
+                // lane exports culled.
+                for (prim, culled, per_lane) in
+                    [(TRIANGLE, false, 1), (TRIANGLE | EDGE_FLAGS | CULL, true, 1), (TRIANGLE, false, 2)]
+                {
+                    let what = format!("{label}, wave64 {wave64}, {prim:#x}, {per_lane} slots a lane");
+                    let prims = lanes * per_lane;
+                    // The group number arrives times the group's lanes (no
+                    // PSV0 here: the translator's fallback).
+                    let stride = lanes;
+                    let (console, cs) = triangle_mesh_with(prim, wave64, false, per_lane, options)
                         .unwrap_or_else(|e| panic!("{what}: {e}"));
                     // The same with the group number as z, for the readback.
-                    let (_, cs_z) = triangle_mesh_with(prim, wave64, true, options)
+                    let (_, cs_z) = triangle_mesh_with(prim, wave64, true, per_lane, options)
                         .unwrap_or_else(|e| panic!("{what}: group z: {e}"));
                     let vs = mesh_vertex_shader(&console).unwrap();
                     assert_eq!(vs.stride, MESH_ELEMENT_BYTES, "{what}");
@@ -1183,6 +1199,8 @@ mod tests {
                     let c = Container::parse(&cs.dxil).unwrap();
                     let dxil = c.part(FourCC::DXIL).unwrap().data;
                     assert_eq!(crate::dxbc::u32_at(dxil, 0).unwrap() >> 16, 5, "{what}");
+                    // Any host wave size (module notes): none is asked for.
+                    assert_eq!(required_waves(&cs.dxil), None, "{what}");
                     let root = host
                         .root_signature_with(
                             &[(&cs_z, D3D12_SHADER_VISIBILITY_ALL)],
@@ -1202,7 +1220,7 @@ mod tests {
                                 roots: vec![
                                     (0, Root::Constants(vec![0])),
                                     (1, Root::Uav(groups * lanes * 4)),
-                                    (2, Root::Uav(groups * lanes * 3)),
+                                    (2, Root::Uav(groups * prims * 3)),
                                     (3, Root::View { srv: true, data: vec![base] }),
                                 ],
                                 views: &[],
@@ -1220,16 +1238,17 @@ mod tests {
                         let want = [
                             4.0 * (lane & 1) as f32 - 1.0,
                             2.0 * (lane & 2) as f32 - 1.0,
-                            ((base + v / lanes) * lanes) as f32,
+                            ((base + v / lanes) * stride) as f32,
                             1.0,
                         ];
                         let at = v as usize * 4;
                         let got: Vec<f32> = vertices[at..at + 4].iter().map(|&b| f32::from_bits(b)).collect();
                         assert_eq!(got, want, "{what}: vertex {v}");
                     }
-                    for t in 0..groups * lanes {
-                        let first = t / lanes * lanes;
-                        let want = if culled { [first; 3] } else { [first, first + 1, first + 2] };
+                    for t in 0..groups * prims {
+                        let first = t / prims * lanes;
+                        let exported = t % prims < lanes && !culled;
+                        let want = if exported { [first, first + 1, first + 2] } else { [first; 3] };
                         let at = t as usize * 3;
                         assert_eq!(triangles[at..at + 3], want, "{what}: triangle {t}");
                     }
@@ -1257,7 +1276,7 @@ mod tests {
                                 roots: vec![
                                     (0, Root::Constants(vec![0])),
                                     (1, Root::Uav(lanes * 4)),
-                                    (2, Root::Uav(lanes * 3)),
+                                    (2, Root::Uav(prims * 3)),
                                     (3, Root::View { srv: true, data: vec![0] }),
                                 ],
                                 views: &[],

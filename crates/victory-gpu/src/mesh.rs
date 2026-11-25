@@ -9,9 +9,20 @@
 //! common state. So every chunk starts at the scratch's start, and a list
 //! leaves the scratch as it found it.
 //!
+//! The scratch, the table and the commands buffer are one for the whole
+//! process: lists recorded on several threads all use them from their
+//! start. That holds while `host.rs` waits for each submission before the
+//! next runs (lists never run at once); a change to that needs one per
+//! list in flight.
+//!
 //! shortcut: one compute-to-graphics drain per chunk (about one per mesh
 //! draw); batch the compute passes of consecutive mesh draws if frames show
 //! the drains. 64 MiB of video memory, made on the first emulated draw.
+//! shortcut: an indirect call's records run in one scratch, not in chunks:
+//! groups past what it holds (4,228 for 128 vertices of 7 elements and 128
+//! triangles) run empty; the GPU counts them ([`Scratch::lost`]) and the
+//! count is logged as it grows. Chunk them as direct dispatches are if the
+//! count shows.
 
 #[cfg(windows)]
 use windows::Win32::Graphics::Direct3D12::*;
@@ -33,6 +44,9 @@ pub(crate) struct Scratch {
     /// The dispatch and draw records of indirect mesh dispatches
     /// ([`convert`]; default heap, common state between uses).
     pub(crate) commands: ID3D12Resource,
+    /// Groups of indirect calls that ran empty, past the scratch: one
+    /// dword the converter adds to, in memory the CPU reads (its address).
+    pub(crate) lost: (ID3D12Resource, usize),
 }
 
 /// The scratch, made once; `None` if the host could not make it.
@@ -86,6 +100,10 @@ fn make() -> windows::core::Result<Scratch> {
         D3D12_RESOURCE_FLAG_NONE,
         D3D12_RESOURCE_STATE_GENERIC_READ,
     )?;
+    let lost = crate::host::host()
+        .and_then(|h| h.shared_buffer(4))
+        .map(|(b, p)| (b, p as usize))
+        .ok_or_else(windows::core::Error::empty)?;
     let commands = buffer(
         D3D12_HEAP_TYPE_DEFAULT,
         u64::from(DRAWS_AT + RECORDS * DRAW_RECORD),
@@ -104,7 +122,12 @@ fn make() -> windows::core::Result<Scratch> {
         bases.Unmap(0, None);
     }
     crate::host::name(&scratch, || "mesh scratch".to_owned());
-    Ok(Scratch { buffer: scratch, bases, commands })
+    Ok(Scratch {
+        buffer: scratch,
+        bases,
+        commands,
+        lost,
+    })
 }
 
 /// Records of one indirect mesh dispatch the emulation runs; more run
@@ -126,7 +149,7 @@ pub(crate) const DRAWS_AT: u32 = RECORDS * DISPATCH_RECORD;
 /// fit, or past the count, runs empty.
 #[cfg(windows)]
 const CONVERT: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), UAV(u0), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=12, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3)"
 cbuffer Call : register(b0) {
     uint stride; uint records; uint counted; uint vertex_bytes;
     uint index_bytes; uint capacity; uint primitives; uint scratch_lo;
@@ -135,6 +158,8 @@ cbuffer Call : register(b0) {
 RWByteAddressBuffer args : register(u0);
 RWByteAddressBuffer count : register(u1);
 RWByteAddressBuffer commands : register(u2);
+// Groups that ran empty, past the scratch, in all calls so far.
+RWByteAddressBuffer lost : register(u3);
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
@@ -143,10 +168,12 @@ void main() {
         n = min(count.Load(0), records);
     }
     uint used = 0;
+    uint past = 0;
     for (uint r = 0; r < records; r++) {
         uint3 g = args.Load3(r * stride);
         uint x = (r < n && g.y != 0 && g.z != 0) ? g.x : 0;
         if (x > capacity - used) {
+            past += x;
             x = 0;
         }
         uint vertices = scratch_lo + used * (vertex_bytes + index_bytes);
@@ -163,6 +190,10 @@ void main() {
         commands.Store4(at + 16, uint4(x * index_bytes, 42, x * primitives * 3, 1));
         commands.Store3(at + 32, uint3(0, 0, 0));
         used += x;
+    }
+    if (past != 0) {
+        uint before;
+        lost.InterlockedAdd(0, past, before);
     }
 }
 "#;
@@ -288,6 +319,7 @@ pub(crate) fn convert(
         l.SetComputeRootUnorderedAccessView(1, args);
         l.SetComputeRootUnorderedAccessView(2, count.unwrap_or(args));
         l.SetComputeRootUnorderedAccessView(3, scratch.commands.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, scratch.lost.0.GetGPUVirtualAddress());
         l.ResourceBarrier(&[crate::host::transition(
             &scratch.commands,
             D3D12_RESOURCE_STATE_COMMON,
@@ -462,6 +494,7 @@ pub(crate) fn run_indirect(
         PAST.call_once(|| tracing::warn!(max, "indirect mesh dispatches past 4,096 records run empty"));
     }
     let capacity = groups_per_chunk(layout.stride, layout.max_vertices, layout.max_primitives);
+    note_lost(scratch);
     let per_group = (layout.stride * layout.max_vertices, layout.max_primitives, capacity);
     if !convert(list, scratch, (args, count), (stride, records), per_group) {
         return false;
@@ -499,6 +532,21 @@ pub(crate) fn run_indirect(
         )]);
     }
     ran
+}
+
+/// Logs the groups indirect calls lost past the scratch, each time the
+/// count (as the GPU left it after the lists that ran) has doubled.
+#[cfg(windows)]
+fn note_lost(scratch: &Scratch) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    // SAFETY: a dword of mapped memory that lives for good; the GPU adds
+    // to it, so it is read as it is.
+    let lost = unsafe { (scratch.lost.1 as *const u32).read_volatile() };
+    let next = NEXT.load(Ordering::Relaxed);
+    if lost >= next && NEXT.compare_exchange(next, lost.saturating_mul(2), Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::warn!(groups = lost, "indirect mesh groups past the scratch ran empty (so far)");
+    }
 }
 
 /// Groups of a mesh program the scratch holds at once (vertex bytes and
@@ -936,6 +984,27 @@ mod gpu_tests {
             assert_eq!(address(at), base + first * group, "record {r}: drawn vertices");
             assert_eq!(commands[at + 6], groups * LANES * 3, "record {r}: indices");
         }
+        // A record of more groups than the scratch holds runs empty and is
+        // counted.
+        // SAFETY: our mapped dword and buffer; the list has run before they
+        // are read.
+        let before = unsafe { (scratch.lost.1 as *const u32).read_volatile() };
+        let past = groups_per_chunk(p.layout.stride, LANES, LANES) + 1;
+        unsafe { data.cast::<u32>().write_volatile(past) };
+        let (rt, heap, list) = target(host);
+        assert!(run_indirect(
+            &list,
+            scratch,
+            &p.layout,
+            (&signatures.0, &signatures.1),
+            (gpu, None),
+            (12, 1),
+            binder(&list, &p, &heap),
+        ));
+        let (lit, _) = finish(host, list, &rt, (&scratch.commands, 0, 4));
+        assert!(lit.iter().all(|&l| !l), "a record past the scratch drew");
+        let after = unsafe { (scratch.lost.1 as *const u32).read_volatile() };
+        assert_eq!(after - before, past, "groups counted as lost");
         eprintln!("indirect emulated mesh dispatches drew ({})", host.caps.adapter.name);
     }
 }

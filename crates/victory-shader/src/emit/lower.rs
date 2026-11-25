@@ -2988,11 +2988,23 @@ impl<'a> Lower<'a> {
                 .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
         }
         let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
-        self.store_indices(flat, [z, z, z]);
-        self.end_guarded(at, &[]);
+        // Every primitive slot, also where the group has fewer lanes than
+        // slots: lane i culls slots i, i + threads, ... below the maximum
+        // (made as compute, no slot the draw reads keeps another's data).
+        for k in 0..mesh.max_primitives.div_ceil(threads) {
+            let slot = match k {
+                0 => flat,
+                _ => {
+                    let past = self.s.m.i32(k * threads);
+                    self.s.m.bin(self.cur, Bin::Add, flat, past)
+                }
+            };
+            let guard = ((k + 1) * threads > mesh.max_primitives).then(|| self.s.m.cmp(self.cur, pred::IULT, slot, p));
+            let at = self.begin_guarded(guard);
+            self.store_indices(slot, [z, z, z]);
+            self.end_guarded(at, &[]);
+        }
         Ok(())
     }
 
@@ -3017,7 +3029,12 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let first = self.mesh_slot(mesh.max_vertices, zero);
         let mut args = vec![triangles, at, self.s.m.undef(self.s.t.i32)];
+        // An index past the group's vertices (9 bits may name 511) would
+        // reach past the scratch the draw reads: the group's last instead.
+        let last = self.s.m.i32(mesh.max_vertices.saturating_sub(1));
         for i in indices {
+            let inside = self.s.m.cmp(c, pred::IULT, i, last);
+            let i = self.s.m.select(c, inside, i, last);
             args.push(self.s.m.bin(c, Bin::Add, first, i));
         }
         args.push(self.s.m.undef(self.s.t.i32));

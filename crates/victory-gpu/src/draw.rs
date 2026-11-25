@@ -1110,11 +1110,19 @@ impl State {
         if !compute {
             return self.prepare_for(list, false, true);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            return false;
+        }
         // Something of ours may have bound its own compute pipeline.
         (self.host_pipeline, self.host_roots[1]) = (0, 0);
         self.mesh_pass = true;
         let bound = self.bind(list, &e.compute, true);
         self.mesh_pass = false;
+        #[cfg(feature = "diagnostics")]
+        if bound {
+            list.note_op(|| self.op_text("emulated mesh: compute pass".to_owned(), false));
+        }
         bound
     }
 

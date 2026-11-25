@@ -383,6 +383,28 @@ mod tests {
         }
     }
 
+    /// A translation made with mesh programs as compute is its own entry:
+    /// neither kind answers for the other.
+    #[test]
+    fn mesh_as_compute_is_part_of_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"a console container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert!(!cached(&cache, &build, (false, false), container, translate).1);
+        assert!(!cached(&cache, &build, (false, true), container, translate).1);
+        assert!(!cached(&cache, &build, (true, true), container, translate).1);
+        assert_eq!(runs.load(Ordering::Relaxed), 3, "three keys, three translations");
+        assert!(cached(&cache, &build, (false, true), container, translate).1);
+        assert!(cached(&cache, &build, (false, false), container, translate).1);
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
     #[test]
     fn translations_come_back_from_the_cache() {
         let dir = tempfile::tempdir().unwrap();
