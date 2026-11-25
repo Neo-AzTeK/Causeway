@@ -620,3 +620,36 @@ fn wave64_lane_reads_run_on_two_waves_of_32() {
         }
     }
 }
+
+#[test]
+fn a_mask_set_to_a_constant_then_a_compare_joins() {
+    let body = [
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBF06_8100, // s_cmp_eq_u32 s0, 1 (false)
+        0xBF85_0001, // s_cbranch_scc1 -> the read
+        0xBE86_036A, // s_mov_b32 s6, vcc_lo
+        0xD501_0008,
+        0x0019_0280, // v_cndmask_b32 v8, 0, 1, s6
+    ];
+    for (label, got) in stored(&body) {
+        let want: Vec<u32> = (0..32).map(|l| u32::from(l < 16)).collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn a_mask_set_to_a_constant_then_a_compare_joins_in_wave64() {
+    // Translation only: the hosts under test run waves of 32.
+    let body = [
+        0xBE86_0480, // s_mov_b64 s[6:7], 0
+        0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+        0xBF06_8100, // s_cmp_eq_u32 s0, 1
+        0xBF85_0001, // s_cbranch_scc1 -> the read
+        0xBE86_046A, // s_mov_b64 s[6:7], vcc
+        0xD501_0008,
+        0x0019_0280, // v_cndmask_b32 v8, 0, 1, s[6:7]
+    ];
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    translate_with(&words, ResourceType::Srv, 4, 0, true).unwrap();
+}
