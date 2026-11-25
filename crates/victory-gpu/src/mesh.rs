@@ -990,6 +990,7 @@ mod gpu_tests {
         // are read.
         let before = unsafe { (scratch.lost.1 as *const u32).read_volatile() };
         let past = groups_per_chunk(p.layout.stride, LANES, LANES) + 1;
+        // SAFETY: our mapped buffer, written before the list runs.
         unsafe { data.cast::<u32>().write_volatile(past) };
         let (rt, heap, list) = target(host);
         assert!(run_indirect(
@@ -1003,6 +1004,7 @@ mod gpu_tests {
         ));
         let (lit, _) = finish(host, list, &rt, (&scratch.commands, 0, 4));
         assert!(lit.iter().all(|&l| !l), "a record past the scratch drew");
+        // SAFETY: as above.
         let after = unsafe { (scratch.lost.1 as *const u32).read_volatile() };
         assert_eq!(after - before, past, "groups counted as lost");
         eprintln!("indirect emulated mesh dispatches drew ({})", host.caps.adapter.name);
