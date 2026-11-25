@@ -65,7 +65,8 @@ fn a_lane_mask_spilled_to_a_vgpr_lane_stays_a_mask() {
     }
 }
 
-/// s9 holds a descriptor's dword; lanes below 16 set it to 100 and v5 to -1
+/// s11 holds a descriptor's dword (word 3: words 0 and 1 are the host's view
+/// addresses, which read as real values); lanes below 16 set it to 100 and v5 to -1
 /// (0 in the others).
 const REUSED: [u32; 12] = [
     0xF408_0203,
@@ -75,13 +76,13 @@ const REUSED: [u32; 12] = [
     0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
     0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
     0xBF88_0003, // s_cbranch_execz -> the restore
-    0xBE89_03FF,
-    0x0000_0064, // s_mov_b32 s9, 100
+    0xBE8B_03FF,
+    0x0000_0064, // s_mov_b32 s11, 100
     0x7E0A_02C1, // v_mov_b32 v5, -1
     0xBEFE_0317, // s_mov_b32 exec_lo, s23
     0x7D84_0AC1, // v_cmp_eq_u32 vcc_lo, -1, v5
 ];
-const USE: u32 = 0x4A10_0009; // v_add_nc_u32 v8, s9, v0
+const USE: u32 = 0x4A10_000B; // v_add_nc_u32 v8, s11, v0
 
 #[test]
 fn a_register_reused_on_another_path_is_read_where_a_flag_allows() {
@@ -120,7 +121,7 @@ fn a_register_reused_on_another_path_is_refused_where_lanes_from_it_read() {
     );
     assert!(
         after(&[
-            0x7E0C_0209, // v_mov_b32 v6, s9
+            0x7E0C_020B, // v_mov_b32 v6, s11
             0x7E14_0506, // v_readfirstlane_b32 s10, v6
             0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
             0x4A10_000A, // v_add_nc_u32 v8, s10, v0
@@ -160,9 +161,11 @@ fn the_record_count_of_a_scalar_loaded_buffer_is_the_hosts() {
         };
         run(&shader, &[view, View::RawUav(32)])
     };
-    // Refused with a stride: the view the title makes may be raw.
-    let words = [&STORE_SETUP[..], &body(16), &STORE[..]].concat();
-    assert!(translate_with(&words, ResourceType::Srv, 4, 16, false).is_err());
+    // With a stride the code names (VIctory's rule: the view has it): 96
+    // bytes are 6 records of 16, the last at byte 80, dword 20.
+    for (label, out) in run_with(&body(16)[..], 16, Stride::Structured(16)) {
+        assert_eq!(out[0][0], 20_000 + 6, "{label}");
+    }
     // 96 raw bytes, the last dword's offset 92 (the load drops the low
     // bits of 95).
     for (label, out) in run_with(&body(1)[..], 0, Stride::Raw) {
@@ -213,8 +216,8 @@ fn a_second_use_of_a_reused_register_is_told_from_the_first_paths() {
             0x7D88_0088, // v_cmp_gt_u32 vcc_lo, 8, v0
             0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
             0xBF88_0003, // s_cbranch_execz -> the restore
-            0xBE89_03FF,
-            0x0000_00C8, // s_mov_b32 s9, 200
+            0xBE8B_03FF,
+            0x0000_00C8, // s_mov_b32 s11, 200
             0x7E0A_02C1, // v_mov_b32 v5, -1
             0xBEFE_0317, // s_mov_b32 exec_lo, s23
             0x7D84_0AC1, // v_cmp_eq_u32 vcc_lo, -1, v5
@@ -319,7 +322,7 @@ fn a_mask_counted_past_a_branch_on_a_reused_register_is_refused() {
             &REUSED[..],
             &[
                 0xD4C4_0018,
-                0x0002_0009, // v_cmp_gt_u32 s24, s9, v0
+                0x0002_000B, // v_cmp_gt_u32 s24, s11, v0
                 0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
                 0xBF88_0000 | skip, // s_cbranch_execz -> the restore
             ],
@@ -361,7 +364,7 @@ fn a_register_reused_on_another_path_is_told_by_its_flag_in_wave64() {
     assert!(after(&[USE]).is_err());
 }
 
-/// v8 = 0, then three passes of a loop that adds s9 to it where v5 is -1;
+/// v8 = 0, then three passes of a loop that adds s11 to it where v5 is -1;
 /// `first` sets the two before the loop, `next` after each pass.
 fn looped(first: &[u32], next: &[u32]) -> Vec<u32> {
     let pass = [
@@ -369,7 +372,7 @@ fn looped(first: &[u32], next: &[u32]) -> Vec<u32> {
             0x7D84_0AC1, // v_cmp_eq_u32 vcc_lo, -1, v5
             0xBE97_3C6A, // s_and_saveexec_b32 s23, vcc_lo
             0xBF88_0001, // s_cbranch_execz -> the restore
-            0x4A10_1009, // v_add_nc_u32 v8, s9, v8
+            0x4A10_100B, // v_add_nc_u32 v8, s11, v8
             0xBEFE_0317, // s_mov_b32 exec_lo, s23
         ][..],
         next,
@@ -398,7 +401,7 @@ fn a_register_reused_across_a_back_edge_is_read_where_a_flag_allows() {
     const LOAD: [u32; 2] = [0xF408_0203, 0xFA00_0000]; // s_load_dwordx4 s[8:11], s[6:7], 0x0
     const OFF: u32 = 0x7E0A_0280; // v_mov_b32 v5, 0
     const ON: u32 = 0x7E0A_02C1; // v_mov_b32 v5, -1
-    const TEN: u32 = 0xBE89_038A; // s_mov_b32 s9, 10
+    const TEN: u32 = 0xBE8B_038A; // s_mov_b32 s11, 10
     // The dword comes in, the number over the back edge.
     let body = looped(&[LOAD[0], LOAD[1], OFF], &[TEN, ON]);
     for (label, got) in stored(&body) {
