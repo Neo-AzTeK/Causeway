@@ -6,6 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+mod digest;
+pub use digest::{Baseline, Context, read_baseline};
+pub mod sheet;
+
 /// Draws and dispatches asked for per frame that mean the menus draw. The
 /// title's first screens ask for 3 to 7.
 const MENU_DRAWS: f64 = 20.0;
@@ -199,6 +203,22 @@ pub struct Log {
     /// The stand-in pad, and a real one, were connected.
     stand_in: bool,
     pad: bool,
+    /// For the digest: the adapter and its caps as logged, the switches the
+    /// process saw (`None`: no such line), draws lost per log interval,
+    /// and lines that name a removal journal.
+    adapter_text: Option<String>,
+    caps: Option<String>,
+    switches: Option<Vec<(String, String)>>,
+    blocks: Vec<DropBlock>,
+    journal: Vec<String>,
+}
+
+/// One log interval's dropped draws: when it was in the world, the counts
+/// by cause, and what the host named as lost (at most 40 reasons).
+#[derive(Default)]
+struct DropBlock {
+    world: bool,
+    why: Vec<(String, f64)>,
 }
 
 const UNHEARD: &str = "none, but nothing shows that the log would have them";
@@ -262,6 +282,9 @@ impl Log {
     }
 
     fn line(&mut self, line: &str) {
+        if self.journal.len() < 20 && (line.contains("DRED") || line.contains("removal journal")) {
+            self.journal.push(clip(line));
+        }
         if line.contains("VIctory: unhandled exception")
             || (line.contains("VIctory: unimplemented import") && line.contains(" called"))
             || (line.starts_with("thread '") && line.contains(" panicked at"))
@@ -326,6 +349,27 @@ impl Log {
         self.diagnostics |= line.contains("copies per frame: ");
         if let Some(causes) = Self::causes(line) {
             self.causes.push(causes);
+            let world = self.rates.last().is_some_and(|r| r.asked() >= WORLD_DRAWS);
+            self.blocks.push(DropBlock { world, why: Vec::new() });
+        }
+        if let Some((_, why)) = line.split_once("/frame without a host pipeline: ")
+            && let Some(n) = before(line, "/frame without a host pipeline: ")
+            && let Some(block) = self.blocks.last_mut()
+        {
+            block.why.push((why.trim().to_owned(), n));
+        }
+        if let Some((_, rest)) = line.split_once("host D3D12 adapter adapter=") {
+            let (name, rest) = rest.split_once(" vendor=").unwrap_or((rest, ""));
+            let vram = rest.split_once("vram_mb=").map_or("?", |(_, v)| v.split_whitespace().next().unwrap_or("?"));
+            self.adapter_text = Some(format!("{} ({vram} MB)", name.trim()));
+        }
+        if let Some((_, caps)) = line.split_once("host D3D12 caps: ") {
+            self.caps = Some(caps.trim().to_owned());
+        }
+        if let Some((_, rest)) = line.split_once("process switches (")
+            && let Some((_, list)) = rest.split_once("):")
+        {
+            self.switches = Some(parse_switches(list));
         }
         // Some refusals are logged once per reason; the drops name each.
         if let Some((_, shaders)) = line.split_once("without a host pipeline: refused ") {
@@ -374,6 +418,11 @@ impl Log {
     fn silence(&self) -> Option<f64> {
         let rate = unix_time(&self.rates.last()?.time)?;
         Some(self.ended.or(self.last)? - rate)
+    }
+
+    /// Saved frames from the world, in the order saved.
+    pub fn world_frames(&self) -> Vec<PathBuf> {
+        self.captures.iter().filter(|c| c.1).map(|c| c.0.clone()).collect()
     }
 
     fn world(&self) -> impl Iterator<Item = &Rate> {
@@ -641,7 +690,7 @@ impl Log {
         out
     }
 
-    pub fn json(&self, areas: &[Area]) -> String {
+    pub fn json(&self, areas: &[Area], metrics: &[(&str, Option<f64>)]) -> String {
         let objects = |rows: Vec<Vec<(&str, &str)>>| {
             let rows = rows.iter().map(|row| {
                 let fields: Vec<_> =
@@ -659,17 +708,53 @@ impl Log {
         let refused = self.refused.iter().map(|(shaders, error)| {
             vec![("shaders", shaders.as_str()), ("error", error)]
         });
+        // One per line, for the digest's baseline reader (`null`: unavailable).
+        let metrics: Vec<String> = metrics
+            .iter()
+            .map(|(k, v)| format!("\n    {}: {}", quote(k), v.map_or("null".into(), |v| v.to_string())))
+            .collect();
         format!(
-            "{{\n  \"frames\": {},\n  \"xinput_pad\": {},\n  \"adapter\": {},\n  \"areas\": \
+            "{{\n  \"frames\": {},\n  \"xinput_pad\": {},\n  \"adapter\": {},\n  \"metrics\": \
+             {{{}\n  }},\n  \"areas\": \
              [{}\n  ],\n  \"untranslated\": [{}\n  ],\n  \"refused\": [{}\n  ]\n}}\n",
             self.frames,
             quote(self.pad()),
             quote(self.adapter()),
+            metrics.join(","),
             objects(judged.collect()),
             objects(untranslated.collect()),
             objects(refused.collect())
         )
     }
+}
+
+/// `NAME="value" NAME="value"` as the host logs its switches (values in
+/// Rust debug quoting).
+fn parse_switches(list: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = list.trim();
+    while let Some((name, tail)) = rest.split_once("=\"") {
+        let mut value = String::new();
+        let mut chars = tail.char_indices();
+        let mut end = tail.len();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => {
+                    end = i + 1;
+                    break;
+                }
+                '\\' => {
+                    if let Some((_, e)) = chars.next() {
+                        value.push(if e == 'n' { '\n' } else { e });
+                    }
+                }
+                c => value.push(c),
+            }
+        }
+        out.push((name.trim().to_owned(), value));
+        rest = tail[end..].trim_start();
+    }
+    out
 }
 
 fn median<'a>(rates: &[&'a Rate], by: impl Fn(&Rate) -> f64) -> Option<&'a Rate> {
@@ -937,7 +1022,7 @@ mod tests {
             assert_eq!(a.status, wanted, "{name}");
             assert!(a.detail.starts_with(detail), "{name}: {}", a.detail);
         }
-        let json = log.json(&areas);
+        let json = log.json(&areas, &[]);
         assert!(json.contains(r#"{"shaders": "[compute 01]", "error": "The parameter"#), "{json}");
         assert!(json.contains(r#"object=\"device\""#), "{json}");
     }

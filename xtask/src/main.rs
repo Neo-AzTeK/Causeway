@@ -30,7 +30,7 @@ enum Cmd {
     InstallHooks,
     /// Run a title unattended with the diagnostics build, skip its menus and
     /// judge each graphics area. On a real GPU this can reset the driver.
-    Smoke(smoke::Smoke),
+    Smoke(Box<smoke::Smoke>),
 }
 
 fn main() -> Result<()> {

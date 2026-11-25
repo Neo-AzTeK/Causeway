@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 
-use crate::report::{End, Log, Status, flat_png};
+use crate::report::sheet;
+use crate::report::{Baseline, Context as Inputs, End, Log, Status, flat_png, read_baseline};
 
 #[derive(Args)]
 pub struct Smoke {
@@ -38,6 +39,23 @@ pub struct Smoke {
     /// Judge this log; nothing runs.
     #[arg(long, conflicts_with_all = ["exe", "keys", "exe_victory", "data_dir"])]
     log: Option<PathBuf>,
+    /// `NAME=VALUE`: a `VICTORY_*` switch the game process gets (the runner
+    /// otherwise removes them, see `INHERITED`). With `--log`: a switch the
+    /// run is said to have had, which the digest checks against the log.
+    #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env)]
+    envs: Vec<(String, String)>,
+    /// An earlier run's report.json: the digest shows each metric against it.
+    #[arg(long)]
+    baseline: Option<PathBuf>,
+}
+
+fn parse_env(text: &str) -> Result<(String, String), String> {
+    let (name, value) = text.split_once('=').ok_or("expected NAME=VALUE")?;
+    let name = name.trim().to_ascii_uppercase();
+    if !name.starts_with("VICTORY_") {
+        return Err(format!("{name}: only VICTORY_* switches pass through"));
+    }
+    Ok((name, value.to_owned()))
 }
 
 /// A frame is saved this often, at the rate the title presents at most.
@@ -63,18 +81,96 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
         }
     };
     let bytes = std::fs::read(&log).with_context(|| format!("reading {}", log.display()))?;
+    let log_path = log;
     let mut log = Log::parse(&String::from_utf8_lossy(&bytes));
     log.ended = end.map(|(_, at)| at);
     let areas = log.judge(end.map(|(end, _)| end), |png| flat_png(&std::fs::read(png).ok()?));
     let text = log.text(&areas);
     create(&args.out)?;
+
+    // The digest: pictures first, for the metrics hold their measure.
+    let frames: Vec<PathBuf> =
+        log.world_frames().into_iter().map(|f| beside(&log_path, f)).collect();
+    let visual = sheet::build(&frames, &args.out, |p| std::fs::read(p).ok());
+    let (build, mut requested) = run_info(root, &log_path);
+    requested.extend(args.envs.iter().cloned());
+    let baseline = match &args.baseline {
+        Some(json) => read_baseline(json),
+        None => Baseline::Off,
+    };
+    let metrics = log.metrics(visual.mean().map(|m| m * 100.0));
+    let digest = log.digest(&areas, &Inputs { build, requested, baseline, visual });
+
     std::fs::write(args.out.join("report.txt"), &text).context("writing report.txt")?;
-    std::fs::write(args.out.join("report.json"), log.json(&areas))
+    std::fs::write(args.out.join("report.json"), log.json(&areas, &metrics))
         .context("writing report.json")?;
+    std::fs::write(args.out.join("digest.md"), digest).context("writing digest.md")?;
     print!("{text}");
     let failed = areas.iter().filter(|a| a.status == Status::Fail).count();
     ensure!(failed == 0, "{failed} areas failed");
     Ok(())
+}
+
+/// A frame the log names, found where the log is if it moved.
+fn beside(log: &Path, frame: PathBuf) -> PathBuf {
+    if frame.exists() {
+        return frame;
+    }
+    let moved = frame.file_name().map(|n| log.with_file_name("frames").join(n));
+    moved.filter(|m| m.exists()).unwrap_or(frame)
+}
+
+/// What the run's `run.txt` says (commit, branch, switches it asked for), as
+/// the digest's build line and requested switches.
+fn run_info(root: &Path, log: &Path) -> (String, Vec<(String, String)>) {
+    let text = std::fs::read_to_string(log.with_file_name("run.txt")).unwrap_or_default();
+    let get = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)).map(str::to_owned);
+    let requested: Vec<_> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("env ")?.split_once('='))
+        .map(|(n, v)| (n.to_owned(), v.to_owned()))
+        .collect();
+    let build = match (get("commit "), get("branch ")) {
+        (Some(commit), branch) => format!(
+            "build commit: {commit} branch: {}{}",
+            branch.as_deref().unwrap_or("?"),
+            if get("dirty ").as_deref() == Some("yes") { " (uncommitted changes)" } else { "" }
+        ),
+        _ => {
+            let (commit, branch) = git_state(root);
+            format!(
+                "build commit: unknown (judged an existing log); judged by {commit} on {branch}"
+            )
+        }
+    };
+    (build, requested)
+}
+
+/// The checkout's commit, branch, and whether it has uncommitted changes.
+fn git_state(root: &Path) -> (String, String) {
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(root).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let commit = git(&["rev-parse", "--short=10", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let branch = git(&["branch", "--show-current"]).unwrap_or_else(|| "unknown".into());
+    (commit, branch)
+}
+
+/// Written beside the log: what the digest needs of the build and of what
+/// the runner set. Switch values are not secrets; they stay out of the repo.
+fn write_run_info(root: &Path, out: &Path, env: &[(String, OsString)]) -> Result<()> {
+    let (commit, branch) = git_state(root);
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|o| !o.stdout.is_empty());
+    let mut text = format!("commit {commit}\nbranch {branch}\ndirty {}\n", if dirty { "yes" } else { "no" });
+    for (name, value) in env {
+        text += &format!("env {name}={}\n", value.to_string_lossy().replace(['\r', '\n'], " "));
+    }
+    std::fs::write(out.join("run.txt"), text).context("writing run.txt")
 }
 
 fn create(dir: &Path) -> Result<()> {
@@ -108,15 +204,27 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     let file = File::create(&log).context("creating log.txt")?;
     let mut command = Command::new(&victory);
     clean(&mut command, std::env::vars_os().map(|(name, _)| name));
+    // What the game process is meant to see: the runner's own, then the
+    // owner's `--env` (which win); the digest checks the log against these.
+    let mut set: Vec<(String, OsString)> = vec![
+        ("VICTORY_LOG".into(), "info".into()),
+        ("VICTORY_KEYS".into(), keys.clone().into()),
+        ("VICTORY_CAPTURE".into(), frames.clone().into_os_string()),
+        ("VICTORY_CAPTURE_FRAMES".into(), capture_frames(args.seconds).into()),
+        ("VICTORY_DATA_DIR".into(), std::path::absolute(&data)?.into_os_string()),
+    ];
+    for (name, value) in &args.envs {
+        set.retain(|(n, _)| n != name);
+        set.push((name.clone(), value.into()));
+    }
+    write_run_info(root, &out, &set)?;
+    for (name, value) in &set {
+        command.env(name, value);
+    }
     command
         .arg("run")
         .arg(std::path::absolute(exe)?)
         .arg("--execute")
-        .env("VICTORY_LOG", "info")
-        .env("VICTORY_KEYS", &keys)
-        .env("VICTORY_CAPTURE", &frames)
-        .env("VICTORY_CAPTURE_FRAMES", capture_frames(args.seconds))
-        .env("VICTORY_DATA_DIR", std::path::absolute(&data)?)
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file);
@@ -421,6 +529,8 @@ mod tests {
             keys: None,
             exe_victory: None,
             log: Some(root.join("README.md")),
+            envs: vec![],
+            baseline: None,
         };
         let error = run(&root, &args).unwrap_err();
         assert!(error.is::<victory_core::PolicyError>(), "{error:#}");
