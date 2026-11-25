@@ -1127,7 +1127,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
+        #[cfg(feature = "diagnostics")]
+        let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
         crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1183,7 +1187,11 @@ impl Host {
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
+            #[cfg(feature = "diagnostics")]
+            let touching = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::TouchUs);
             list.touch_textures();
+            #[cfg(feature = "diagnostics")]
+            drop(touching);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1192,10 +1200,18 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        #[cfg(feature = "diagnostics")]
+        let flushing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::LastFlushUs);
         batch.flush();
+        #[cfg(feature = "diagnostics")]
+        drop(flushing);
         // Last before the lists run: every texture they reach is raised by
         // now (`resource::residency`).
+        #[cfg(feature = "diagnostics")]
+        let residing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::ResidentUs);
         crate::resource::make_resident(&self.device);
+        #[cfg(feature = "diagnostics")]
+        drop(residing);
         let prepared = std::time::Instant::now();
         // One ExecuteCommandLists per run (with its prelude): the scheduler
         // can preempt between calls, which one 8-list call gave it no chance
@@ -1208,6 +1224,8 @@ impl Host {
             .map(|(&a, &b)| &lists[a..b])
             .collect();
         // Last: the written-pages bitmaps the lists marked, read back.
+        #[cfg(feature = "diagnostics")]
+        let marking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarksUs);
         let mut marks: Vec<MarkBits> = Vec::new();
         for list in runs {
             for m in &list.deferred().marks {
@@ -1220,6 +1238,10 @@ impl Host {
         if tail[0].is_some() {
             groups.push(&tail);
         }
+        #[cfg(feature = "diagnostics")]
+        drop(marking);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PrepareUs, started.elapsed().as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         #[cfg(feature = "diagnostics")]
