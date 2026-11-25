@@ -1220,6 +1220,15 @@ impl Host {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
                     text.push_str(&format!("; no breadcrumbs ({e})"));
+                    if !dred_on() {
+                        text.push_str(" (device-removed data is off: VICTORY_D3D12_DRED=1 in a diagnostics build)");
+                    }
+                    // A reset after a long list names its programs even so.
+                    let pipelines: std::collections::BTreeSet<String> = runs
+                        .iter()
+                        .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                        .collect();
+                    text.push_str(&format!("; pipelines of the submission {pipelines:?}"));
                     return text;
                 }
             };
