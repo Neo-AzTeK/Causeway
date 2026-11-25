@@ -11,6 +11,9 @@ pub const MAX_LINES: usize = 60;
 const PIPELINES: usize = 10;
 const KINDS: usize = 5;
 const SWITCH_LINES: usize = 3;
+/// Characters of a reason a table shows: enough for what a GPU lacks, what it
+/// needs and what it has.
+const REASON: usize = 120;
 
 /// What a digest needs besides the log.
 pub struct Context {
@@ -384,7 +387,7 @@ impl Log {
             if world { "world lines" } else { "menus only, the world was not reached" }
         ));
         for l in lost.iter().take(PIPELINES) {
-            out.push(format!("{:>7.1}  {:<9} {:<16} {}", l.per_frame, l.kind, l.id, cut(&l.reason, 70)));
+            out.push(format!("{:>7.1}  {:<9} {:<16} {}", l.per_frame, l.kind, l.id, cut(&l.reason, REASON)));
         }
         out
     }
@@ -409,7 +412,7 @@ impl Log {
                 (false, true) => "draws",
                 _ => "draws+dispatches",
             };
-            out.push(format!("{per_frame:>7.1} {unit}/frame, {n} programs [{tag}]: {}", cut(reason, 80)));
+            out.push(format!("{per_frame:>7.1} {unit}/frame, {n} programs [{tag}]: {}", cut(reason, REASON)));
         }
         if groups.len() > KINDS {
             out.push(format!("... and {} more kinds", groups.len() - KINDS));
@@ -498,7 +501,7 @@ impl Log {
             let reason = key.split_once('|').map_or("", |(_, r)| r);
             let unit = if compute { "dispatches" } else { "draws" };
             items.push(Item {
-                text: format!("{n} programs, {per_frame:.0} {unit}/frame lost: {}", cut(reason, 60)),
+                text: format!("{n} programs, {per_frame:.0} {unit}/frame lost: {}", cut(reason, REASON)),
                 area: area.into(),
                 draws: per_frame,
                 frames: 0,
@@ -585,7 +588,7 @@ mod tests {
     fn refusal(hash: &str, reason: &str) -> String {
         format!(
             "{T}  WARN victory_gpu::pipeline::host: host pipeline refused: wave size \
-             shaders=[compute {hash}] wave=\"{reason}\"\n"
+             shaders=[compute {hash}] wave={reason}\n"
         )
     }
 
@@ -629,7 +632,7 @@ mod tests {
 
     #[test]
     fn losses_merge_by_reason_and_rank_by_draws() {
-        let two = "requires waves of 64 to 64 lanes, the host has 32 to 32";
+        let two = "the host GPU lacks wave size: needs waves of 8 to 8 lanes, has 16 to 128";
         let text = refusal("00000000000000a1", two)
             + &refusal("00000000000000a2", two)
             + &format!(
@@ -649,6 +652,8 @@ mod tests {
                 })
                 .collect::<String>();
         let d = digest(&text, &ctx(&[], Baseline::Off));
+        // Each table shows the reason to its end: both programs, the kind, the next item.
+        assert_eq!(d.lines().filter(|l| l.ends_with(two)).count(), 4, "{d}");
         // The two wave refusals are one item, with their dispatches added.
         assert!(d.contains("150.0 dispatches/frame, 2 programs [refused]"), "{d}");
         assert!(d.contains("30.0 draws/frame, 1 programs [untranslated]"), "{d}");
