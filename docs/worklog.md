@@ -5,6 +5,10 @@ Newest state first inside each section. No game data here (rule #1): counts,
 error kinds, branches and commits only.
 
 ## State (update at every merge)
+- 2026-11-25 (end of session): main = origin/main, chain passes. Wave64 gate (`emit/halves.rs`) merged: two halves only
+  where no lane-derived branch can skip or repeat an s_barrier; all 56 enabled programs pass it. `a1f6cdf8874960a9` has
+  no barrier: its two loops count to a constant-buffer word (garbage suspected, > 2^20); `VICTORY_SHADER_LOOP_LIMIT=64`
+  stops the hang (smoke 12). Launches still need that env or `VICTORY_SKIP_PIPELINES=a1f6cdf8874960a9`.
 - 2026-11-25 (GTX 1070, Pascal, wave32, no mesh shaders, 1,000,000-slot view
   heap): main has view slots past a capped host heap taken from the pool
   (2863ff3), host textures resident only once the GPU may reach them
