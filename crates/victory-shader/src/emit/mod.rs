@@ -233,6 +233,7 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+mod halves;
 mod skips;
 mod wave;
 

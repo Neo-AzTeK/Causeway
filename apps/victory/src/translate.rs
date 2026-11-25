@@ -72,6 +72,9 @@ struct Tally {
     /// Emitted compute programs requiring waves of more than 32 lanes
     /// (refused by hosts with waves of 32).
     cs_wave64: usize,
+    /// Emitted compute programs written for waves of 64 that ask for no more
+    /// than 32 lanes: run as two halves where `halves` allows.
+    cs_halves: usize,
     /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
@@ -135,6 +138,7 @@ impl Tally {
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
         self.cs_wave64 += other.cs_wave64;
+        self.cs_halves += other.cs_halves;
         self.ms_programs += other.ms_programs;
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
@@ -294,6 +298,10 @@ pub fn run(
     println!(
         "             {} compute programs require waves of 64 (refused by hosts with waves of 32)",
         t.cs_wave64
+    );
+    println!(
+        "             {} wave64 compute programs run on waves of 32 (two halves or fewer lanes)",
+        t.cs_halves
     );
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
@@ -585,6 +593,13 @@ fn translate(
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            if p.wave64
+                                && shader.stage == HwStage::Cs
+                                && emit::required_waves(&shader.dxil)
+                                    .is_none_or(|(least, _)| least <= 32)
+                            {
+                                t.cs_halves += 1;
+                            }
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t

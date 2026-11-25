@@ -30,8 +30,10 @@ error kinds, branches and commits only.
    without a view heap or page table" 168.
 3. Program `a1f6cdf8874960a9` (compute, loops; smoke 11 skipped it: no removal,
    slow submissions 4.5 s -> 250-285 ms): find why it runs so long on the host
-   (loop bound, s_barrier lane-uniformity, wave32 lowering) and fix it, then
-   stop skipping it. One error, one session.
+   and fix it, then stop skipping it. Not the barrier (it has none; loops are
+   uniform, see log). Next: one launch with `VICTORY_SHADER_LOOP_LIMIT=64` (loop
+   count), and its end-of-program aggregated atomic per half. One error, one
+   session.
 4. Refused pipelines: 63 need 64 lanes (the skips cannot be left out); lower
    them on wave32 or fall back.
 5. Untranslated: descriptor read only as data (pixel, compute), lane mask read
@@ -52,6 +54,22 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: halves gate (`emit/halves.rs`, branch claude/kind-chebyshev-d936c6,
+  offline, no launch): two-halves only if no `s_barrier` can be skipped or
+  repeated by a branch on a lane-derived scalar (compare masks, EXEC, scalar
+  ALU on them; lane reads are exchanged by the lowering), and no scalar load
+  address or non-bitwise EXEC write comes from one. Synthetic tests: lane exit
+  + barrier refused; uniform exit, no barrier, barrier after the loop accepted.
+  Census (local files): 223 compute programs still need 64 lanes, as before
+  the gate, so all 56 enabled programs survive it; 931 wave64 programs run on
+  waves of 32 (two halves or lanes that fit; the counter cannot tell them
+  apart). Finding: `a1f6cdf8874960a9` has no `s_barrier` and no LDS; its two
+  backward branches test `s_cmp` of scalars loaded from a constant buffer
+  (uniform), so the barrier hypothesis is refuted for it and the gate accepts
+  it. Not shown: why it runs long. Candidates: loop count read as 0 or garbage
+  (2^20 per-lane limit), and a wave-aggregated atomic at its end (`s_bcnt1`,
+  `s_ff1` on EXEC, `v_readfirstlane`, `v_cmpx` on a lane index) that picks a
+  leader per half. Keep skipping it. No adapter verified (no launch).
 - 2026-11-25: smoke 11 (main 4f4befe, skip a1f6cdf8874960a9, 300 s): no removal,
   0.7 fps (prep 609, GPU 239, copy-back 137, other 483 ms), 1376 drawn,
   dropped 299 refused + 130 compiling + 461 other; still no visible 3D (0.0%
