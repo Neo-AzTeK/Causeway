@@ -60,6 +60,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The device samples with a least-level clamp (TiledResources tier 2).
+    pub min_lod_clamp: bool,
 }
 
 enum Stop {
@@ -6277,7 +6279,7 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -6467,9 +6469,19 @@ impl<'a> Lower<'a> {
                         let y = addr_val(self, first + spatial + k)?;
                         g[3 + k] = to_float(self, y);
                     }
+                    // `_cl`: the least level, after the coordinates.
+                    let clamp = if name == "image_sample_d_cl" {
+                        if !self.x.min_lod_clamp {
+                            return Err("a sample with a least-level clamp the device lacks");
+                        }
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -7518,6 +7530,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            min_lod_clamp: false,
         })
         .map(|_| ())
     }
@@ -7568,6 +7581,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            min_lod_clamp: false,
         })
     }
 
@@ -7696,6 +7710,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            min_lod_clamp: false,
         }).unwrap();
 
         let container =

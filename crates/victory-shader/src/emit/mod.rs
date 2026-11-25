@@ -195,7 +195,21 @@ pub struct UserData {
 
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
+/// What the host device can do, as the translator needs to know.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Caps {
+    /// Sampling with a least-level clamp (D3D12 TiledResources tier 2 or
+    /// better). Without it `image_sample_d_cl` is refused.
+    pub min_lod_clamp: bool,
+}
+
+/// [`translate_with`] on a device with none of the optional [`Caps`].
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with(container, &Caps::default())
+}
+
+/// Translates for a device with these capabilities.
+pub fn translate_with(container: &[u8], caps: &Caps) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -219,7 +233,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, caps)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -231,7 +245,20 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+    emit_with(c, native, p, st, io, res, &Caps::default())
+}
+
+/// [`emit`] for a device with these capabilities.
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    caps: &Caps,
+) -> Result<HostShader, ShaderError> {
+    let sig =|fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
             None => Ok(Vec::new()),
@@ -296,6 +323,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        min_lod_clamp: caps.min_lod_clamp,
     })?;
     Ok(HostShader {
         stage: native.stage,
