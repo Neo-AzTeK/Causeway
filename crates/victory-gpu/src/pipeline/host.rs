@@ -865,8 +865,9 @@ impl HostPipeline {
 /// parse.
 fn unlinked(vs: &[u8], ps: &[u8]) -> Vec<String> {
     use victory_shader::{Container, FourCC};
-    // (name, index, system value, register, mask) of each element.
-    let elements = |c: &[u8], part: FourCC| -> Option<Vec<(String, u32, u32, u32, u8)>> {
+    /// Name, index, system value, register, mask.
+    type Element = (String, u32, u32, u32, u8);
+    let elements = |c: &[u8], part: FourCC| -> Option<Vec<Element>> {
         let c = Container::parse(c).ok()?;
         let d = c.part(part)?.data;
         let word = |at: usize| Some(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?));
