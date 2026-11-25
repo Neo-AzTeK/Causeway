@@ -31,7 +31,7 @@ before working there.
   vendors and drivers, not only the owner's RTX 2060 SUPER (wave32 only). Query
   capabilities (wave size, binding tier, heap and format limits) instead of
   hardcoding; keep a clean refusal where a device lacks a feature; test both
-  paths; say which adapters were and were not verified. Every brief states it.
+  paths; say which adapters were and were not verified. Every brief states it. How: `docs/hardware-range.md`.
 
 ## Spending tokens
 
