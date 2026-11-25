@@ -113,6 +113,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .arg(std::path::absolute(exe)?)
         .arg("--execute")
         .env("VICTORY_LOG", "info")
+        // Device-removed data costs little; without it a removal in an
+        // unwatched run is "no breadcrumbs" (`clean` drops the caller's).
+        .env("VICTORY_D3D12_DRED", "1")
         .env("VICTORY_KEYS", &keys)
         .env("VICTORY_CAPTURE", &frames)
         .env("VICTORY_CAPTURE_FRAMES", capture_frames(args.seconds))
