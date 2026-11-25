@@ -20,6 +20,7 @@
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+pub mod caps;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
