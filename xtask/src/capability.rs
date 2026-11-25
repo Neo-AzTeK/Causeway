@@ -14,9 +14,11 @@ const CHECKER_DIR: &str = "xtask/";
 /// Where those calls belong.
 const CAPS_DIR: &str = "crates/victory-gpu/src/caps/";
 
-/// The D3D12 test host. `victory-gpu` depends on its crate, so it cannot read
-/// `Caps`; only here may [`TEST_HOST_MARKER`] excuse a call.
-const TEST_HOST_DIR: &str = "crates/victory-shader/src/emit/";
+/// The files of the D3D12 test host. `victory-gpu` depends on their crate, so
+/// they cannot read `Caps`; only here may [`TEST_HOST_MARKER`] excuse a call.
+/// Not all of it is test code: the title builds root signatures through it.
+const TEST_HOST_FILES: [&str; 2] =
+    ["crates/victory-shader/src/emit/host.rs", "crates/victory-shader/src/emit/mod.rs"];
 
 /// Excuses the one query call within [`MARKER_REACH`] lines below it.
 const TEST_HOST_MARKER: &str = "// test-host-query:";
@@ -42,7 +44,7 @@ pub fn check(sources: &[(String, String)], other_owner: &[(&str, usize)]) -> Vec
         }
         let unmarked = unmarked(path, text, &mut problems);
         if other_owner.iter().all(|(p, _)| p != path) {
-            let fix = if path.starts_with(TEST_HOST_DIR) { TEST_HOST_FIX } else { FIX };
+            let fix = if TEST_HOST_FILES.contains(&path.as_str()) { TEST_HOST_FIX } else { FIX };
             problems.extend(unmarked.iter().map(|line| {
                 format!("{path}:{line}: the host GPU is asked outside `caps/`: {fix}")
             }));
@@ -83,9 +85,9 @@ fn unmarked(path: &str, text: &str, problems: &mut Vec<String>) -> Vec<usize> {
         }
         let line = line.trim_start();
         if let Some(why) = line.strip_prefix(TEST_HOST_MARKER) {
-            if !path.starts_with(TEST_HOST_DIR) {
+            if !TEST_HOST_FILES.contains(&path) {
                 problems.push(format!(
-                    "{path}:{number}: only the test host ({TEST_HOST_DIR}) may be excused: {FIX}"
+                    "{path}:{number}: only the test host ({TEST_HOST_FILES:?}) may be excused: {FIX}"
                 ));
                 continue;
             }
@@ -97,7 +99,7 @@ fn unmarked(path: &str, text: &str, problems: &mut Vec<String>) -> Vec<usize> {
             }
             continue;
         }
-        let code = line.split("//").next().unwrap_or_default();
+        let code = before_comment(line);
         let calls: usize = QUERY_CALLS.iter().map(|call| code.matches(call).count()).sum();
         for _ in 0..calls {
             if marker.take().is_none() {
@@ -109,9 +111,28 @@ fn unmarked(path: &str, text: &str, problems: &mut Vec<String>) -> Vec<usize> {
     unmarked
 }
 
+/// `line` up to its comment: a `//` inside a string literal is not one.
+// shortcut: reads one line; a `'"'` before a call on that line could hide it.
+// invariant(a_slash_pair_in_a_string_hides_no_query): a URL or path in a string
+// must not excuse the code after it.
+fn before_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let (mut at, mut quoted) = (0, false);
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' if quoted => at += 1,
+            b'"' => quoted = !quoted,
+            b'/' if !quoted && bytes.get(at + 1) == Some(&b'/') => return &line[..at],
+            _ => {}
+        }
+        at += 1;
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CAPS_DIR, MARKER_REACH, QUERY_CALLS, TEST_HOST_DIR, TEST_HOST_MARKER, check};
+    use super::{CAPS_DIR, MARKER_REACH, QUERY_CALLS, TEST_HOST_FILES, TEST_HOST_MARKER, check};
 
     const GPU: &str = "crates/victory-gpu/src/host.rs";
 
@@ -124,7 +145,7 @@ mod tests {
     }
 
     fn host_file() -> String {
-        format!("{TEST_HOST_DIR}host.rs")
+        TEST_HOST_FILES[0].to_owned()
     }
 
     #[test]
@@ -135,6 +156,12 @@ mod tests {
             assert!(found[0].starts_with(&format!("{GPU}:2: ")), "{}", found[0]);
         }
         assert_eq!(run("crates/victory-hle/src/x.rs", &call()).len(), 1);
+    }
+
+    #[test]
+    fn a_slash_pair_in_a_string_hides_no_query() {
+        let line = format!("let p = \"a//b\\\"\"; {}", call());
+        assert_eq!(run(GPU, &line).len(), 1);
     }
 
     #[test]

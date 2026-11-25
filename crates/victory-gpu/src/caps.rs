@@ -3,7 +3,9 @@
 //! **The rule:** only this module asks the host GPU what it can do. Code
 //! elsewhere reads a [`Caps`] field or a planner; the one question a snapshot
 //! cannot answer, about a single resource, is in `per_resource`.
-//! `cargo xtask policy` rejects a query made anywhere else.
+//! `cargo xtask policy` rejects a query made anywhere else, except one counted
+//! call in descriptor code (another owner) and marked calls in the shader
+//! crate's test host, which the title also uses to build root signatures.
 //!
 //! [`Caps`] is a snapshot of one device, filled when the device is created
 //! (`Caps::probe`, Windows only) and never changed after. Every field that a
