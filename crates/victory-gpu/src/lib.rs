@@ -62,6 +62,8 @@ mod tdr;
 mod texture;
 #[cfg(windows)]
 mod twin;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod vram;
 #[cfg(windows)]
 mod watch;
 
