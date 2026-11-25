@@ -27,6 +27,8 @@ error kinds, branches and commits only.
   pixels non-flat in the saved frame: no 3D scene yet.
 
 ## Next, ranked by effect on the picture
+00. Texture refresh at ~3 MB/s: menus at 0.4 fps after ~40 s (smoke 12), so
+   runs on the GTX 1070 do not reach the world unattended. Blocks every run.
 0. (frame-wait hunt, see log) Real cost is GPU time before the removal
    (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
 1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
@@ -60,6 +62,12 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: smoke 12 (main be98212, GTX 1070, 300 s): menus 30-36 fps for
+  ~40 s, then 0.3-0.4 fps to the end: 2.3-2.9 s/frame in texture preparation
+  (`Staging::refresh`, 7.6-9.5 MB/frame read, ~3 MB/s; 5-7 draws, GPU 4 ms).
+  At that rate scripted 0.2 s presses are missed: never reached the world (the
+  "A Player" select screen needs Enter by hand). 84 refused, 16 untranslated,
+  no removal. Proposed its own session (texture-refresh-speed).
 - 2026-11-25: merged from the GTX 1070 sessions: fits() checks the texture's
   format for an unordered view in no format (#1754 path; unit test); watch:
   plain committed pages inside a tracked 4 MiB window are not guarded
