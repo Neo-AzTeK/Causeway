@@ -37,8 +37,8 @@ fn uses_gpu(name: &str) -> bool {
 /// A `victory` command line that never makes a GPU device: `census`, or
 /// `translate` without `--pipelines`. Anything else, a line that cannot be
 /// read among them, may use the GPU.
-// shortcut: by the words of the line, so `--pipelines` inside a quoted path
-// counts too (waits when it need not).
+// shortcut: by the words of the line, so `--pipelines` inside a path counts
+// too (waits when it need not).
 fn offline_scan(command: &str) -> bool {
     let command = command.trim_start();
     // The program: quoted, or up to the first space.
@@ -49,7 +49,8 @@ fn offline_scan(command: &str) -> bool {
     let mut words = rest.unwrap_or("").split_whitespace();
     match words.next() {
         Some("census") => true,
-        Some("translate") => !words.any(|word| word.contains("--pipelines")),
+        // Windows drops quotes inside a word (`--pipe""lines`): so do we.
+        Some("translate") => !words.any(|word| word.replace('"', "").contains("--pipelines")),
         _ => false,
     }
 }
@@ -280,6 +281,8 @@ mod tests {
             r"victory.exe translate C:\files --pipelines --list",
             r"victory.exe translate --cache --pipelines",
             r#"victory.exe translate "--pipelines""#,
+            r#"victory.exe translate --pipe""lines"#,
+            r#"victory.exe translate "--"pipelines"#,
             r"victory.exe run C:\title.exe --execute",
             r#"victory.exe run "C:\a translate census\title.exe""#,
             r#""C:\my census dir\victory.exe" run title.exe"#,

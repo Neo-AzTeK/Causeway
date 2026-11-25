@@ -122,8 +122,8 @@ chain and the proof run.
 
 **The GPU.** One title or GPU test at a time on the machine. `cargo xtask smoke`
 and `cargo xtask alone -- <command>` take the same machine-wide lock, and both
-refuse to start while a `victory.exe` (an offline scan apart, below), the
-testbed or any cargo test binary runs. Run every test that may use the GPU
+refuse to start while a `victory.exe` (`census`, or `translate` without
+`--pipelines`, apart), the testbed or any cargo test binary runs. Run every test that may use the GPU
 through `alone` (`victory-gpu`,
 `victory-shader`, `victory-hle`, the whole workspace, testbed `--hardware`):
 
