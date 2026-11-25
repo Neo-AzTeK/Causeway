@@ -2,7 +2,9 @@
 //! synthetic GFX10 programs of 32 lanes, run as in `image_tests`.
 
 use super::host::{Host, Stride, View};
-use super::image_tests::{build, check, run, run_on, translate, translate_group, translate_with};
+use super::image_tests::{
+    build, check, run, run_on, run_with_info, translate, translate_group, translate_with,
+};
 use crate::native::ResourceType;
 
 /// Loads the raw UAV's descriptor to s[40:43] and v16 = 4 × lane.
@@ -160,9 +162,18 @@ fn the_record_count_of_a_scalar_loaded_buffer_is_the_hosts() {
         };
         run(&shader, &[view, View::RawUav(32)])
     };
-    // Refused with a stride: the view the title makes may be raw.
+    // With a stride the view the title makes may be raw: the host says it
+    // has 6 records of 16 bytes (the element at 80, the count 6).
     let words = [&STORE_SETUP[..], &body(16), &STORE[..]].concat();
-    assert!(translate_with(&words, ResourceType::Srv, 4, 16, false).is_err());
+    let shader = translate_with(&words, ResourceType::Srv, 4, 16, false).unwrap();
+    check(&shader);
+    let view = View::Buffer {
+        data: &data,
+        stride: Stride::Raw,
+    };
+    for (label, out) in run_with_info(&shader, &[view, View::RawUav(32)], &[[16, 6]]) {
+        assert_eq!(out[0][0], 20_000 + 6, "{label}");
+    }
     // 96 raw bytes, the last dword's offset 92 (the load drops the low
     // bits of 95).
     for (label, out) in run_with(&body(1)[..], 0, Stride::Raw) {
@@ -652,4 +663,48 @@ fn a_mask_set_to_a_constant_then_a_compare_joins_in_wave64() {
     ];
     let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
     translate_with(&words, ResourceType::Srv, 4, 0, true).unwrap();
+}
+
+/// The title's own stride and record count come from the host, whatever the
+/// container names (nothing, or the stride the code assumes).
+#[test]
+fn the_host_tells_the_stride_and_the_record_count_of_a_descriptor() {
+    let data: Vec<u32> = (0..24).map(|n| 1000 * n).collect();
+    let view = || View::Buffer {
+        data: &data,
+        stride: Stride::Raw,
+    };
+    // An element of a buffer the container gives no stride for.
+    let body = [
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2004,
+        0x8002_0800, // buffer_load_dword v8, v0, s[8:11], 0 idxen offset:4
+        0xBF8C_0000, // s_waitcnt 0
+    ];
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_with(&words, ResourceType::Srv, 4, 0, false).unwrap();
+    check(&shader);
+    for (label, out) in run_with_info(&shader, &[view(), View::RawUav(32)], &[[16, 6]]) {
+        for (lane, &x) in out[0].iter().take(6).enumerate() {
+            assert_eq!(x, data[4 * lane + 1], "{label} lane {lane}");
+        }
+    }
+    // The record count of a buffer the code names another stride for.
+    let body = [
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF420_0344,
+        0xFA00_0000, // s_buffer_load_dword s13, s[8:11], 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E10_020A, // v_mov_b32 v8, s10
+    ];
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_with(&words, ResourceType::Srv, 4, 64, false).unwrap();
+    check(&shader);
+    for (label, out) in run_with_info(&shader, &[view(), View::RawUav(32)], &[[16, 6]]) {
+        assert_eq!(out[0], vec![6; 32], "{label}");
+    }
 }

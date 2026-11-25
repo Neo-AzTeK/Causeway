@@ -12,6 +12,11 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The root parameter index of the root SRV (in [`ROOT_CBV_SPACE`], so
+/// `t255`) a shader reads the title's own stride and record count of each
+/// buffer descriptor from: two dwords per heap slot, in the heap's order,
+/// that the host keeps (hosts bind it from their heap, not from the title).
+pub const VIEW_INFO_SLOT: u8 = 255;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

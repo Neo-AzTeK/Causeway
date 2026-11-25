@@ -32,6 +32,18 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     /// The dynamic slots and who holds them.
     next: Mutex<Slots>,
+    /// The stride and record count of each view slot as the title described
+    /// it (view heaps): what translated shaders read where the host's raw
+    /// views dropped them (`VIEW_INFO_SLOT` in `victory-shader`).
+    info: Option<Info>,
+}
+
+/// Upload memory of two dwords per view slot, mapped for good.
+struct Info {
+    buffer: ID3D12Resource,
+    cpu: usize,
+    gpu: u64,
+    slots: u32,
 }
 
 /// The dynamic slots of a view heap: who holds each (the id of the take; 0:
@@ -156,6 +168,98 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+impl Info {
+    fn new(slots: u32) -> windows::core::Result<Info> {
+        let host = host().ok_or(windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: u64::from(slots) * 8,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain buffer creation; the mapping lasts as long as the
+        // buffer, which this struct holds.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_UPLOAD,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            )?;
+            let buffer = buffer.ok_or(windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+            let mut at = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut at))?;
+            // Slots start with nothing to say.
+            std::ptr::write_bytes(at.cast::<u8>(), 0, slots as usize * 8);
+            let gpu = buffer.GetGPUVirtualAddress();
+            Ok(Info { buffer, cpu: at as usize, gpu, slots })
+        }
+    }
+}
+
+/// What the title's description of a buffer view says translated shaders
+/// cannot learn from the host's raw view of it: the stride and the record
+/// count the console's descriptor has (a raw view's count is in bytes, as
+/// on the console); zeros for other views.
+fn view_info(view: &View) -> [u32; 2] {
+    let (words, unordered): (&[u32; 10], bool) = match view {
+        View::Shader(_, Some(words)) => (words, false),
+        View::Unordered(_, _, Some(words)) => (words, true),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => {
+            let Ok(words) = <&[u32; 10]>::try_from(&desc[..10]) else {
+                return [0; 2];
+            };
+            (words, *unordered)
+        }
+        _ => return [0; 2],
+    };
+    let (dimension, stride, count, raw, element) = if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: read only when the view is a buffer's.
+        let b = unsafe { desc.Anonymous.Buffer };
+        let element = crate::resource::element(desc.Format.0 as u32).map_or(0, |e| e.0);
+        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        (
+            desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER,
+            b.StructureByteStride,
+            b.NumElements,
+            raw,
+            element,
+        )
+    } else {
+        let desc = srv_desc(words);
+        // SAFETY: read only when the view is a buffer's.
+        let b = unsafe { desc.Anonymous.Buffer };
+        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        (
+            desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER,
+            b.StructureByteStride,
+            b.NumElements,
+            raw,
+            element_size(&desc),
+        )
+    };
+    if !dimension {
+        [0; 2]
+    } else if stride > 0 {
+        [stride, count]
+    } else if raw {
+        [0, count.saturating_mul(4)]
+    } else {
+        [u32::try_from(element).unwrap_or(0), count]
+    }
+}
 
 /// One way to size a view heap: slots mirroring the title's, then dynamic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,6 +391,17 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        let info = if sampler {
+            None
+        } else {
+            match Info::new(count + extra) {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host view info buffer");
+                    return None;
+                }
+            }
+        };
         let h = HostHeap {
             heap,
             cpu,
@@ -297,6 +412,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new(Slots::new(extra)),
+            info,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -424,6 +540,7 @@ impl HostHeap {
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make(view, self.cpu(index));
+        self.set_info(index, if kept.is_some() { view_info(view) } else { [0; 2] });
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -432,12 +549,31 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.set_info(index, [0; 2]);
         if self.sampler {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
+    }
+
+    /// Slot `index` says `info` (see [`view_info`]) to shaders.
+    fn set_info(&self, index: u32, info: [u32; 2]) {
+        let Some(i) = self.info.as_ref().filter(|i| index < i.slots) else {
+            return;
+        };
+        // SAFETY: inside the mapped buffer; slots are written one at a time.
+        unsafe {
+            let at = (i.cpu as *mut u32).add(index as usize * 2);
+            at.write_volatile(info[0]);
+            at.add(1).write_volatile(info[1]);
+        }
+    }
+
+    /// The GPU address of the per-slot view info (view heaps).
+    pub(crate) fn info_address(&self) -> Option<(u64, ID3D12Resource)> {
+        self.info.as_ref().map(|i| (i.gpu, i.buffer.clone()))
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -451,6 +587,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        self.set_info(index, [0; 2]);
         self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -515,6 +652,7 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            self.set_info(index, if kept.is_some() { view_info(&view) } else { [0; 2] });
             self.keep(index, kept.flatten());
         }
         Some(view)
@@ -1139,6 +1277,21 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shaders learn the console descriptor's stride and record count from
+    /// the title's description: raw views count bytes, as the console does.
+    #[test]
+    fn view_info_is_what_the_titles_description_says() {
+        let srv = |stride: u32, flags: u32| {
+            let b = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+            View::Shader(1, Some([0, b, 0x1688, 0, 0, 0, 6, stride, flags, 0]))
+        };
+        assert_eq!(view_info(&srv(16, 0)), [16, 6]);
+        assert_eq!(view_info(&srv(0, D3D12_BUFFER_SRV_FLAG_RAW.0 as u32)), [0, 24]);
+        let texture = [0, D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32, 0, 0, 0, 0, 6, 16, 0, 0];
+        assert_eq!(view_info(&View::Shader(1, Some(texture))), [0, 0]);
+        assert_eq!(view_info(&View::Constant(0, 64)), [0, 0]);
+    }
 
     /// A view of memory whose host copy does not put it on a multiple of its
     /// element is made all the same, on the copy draws bring up to date, and
