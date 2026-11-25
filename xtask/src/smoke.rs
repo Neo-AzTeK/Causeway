@@ -196,6 +196,8 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         victory_core::ensure_outside_repo(from)?;
         ensure!(from.is_dir(), "{} is not a folder", from.display());
     }
+    // invariant(scripted_keys_need_a_set_up_data_folder_or_the_terms_accepted): a
+    // script never accepts the title's terms unasked.
     let set_up = args.data_from.as_ref().or(args.data_dir.as_ref());
     check_terms(&keys, set_up.map(PathBuf::as_path), args.accept_terms)?;
     // Held until the title ends: two runs can reset the display driver.
@@ -264,7 +266,8 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
 fn one_run(path: &Path) -> Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
-    // No sharing: a second open fails while the first handle lives.
+    // invariant(one_smoke_run_at_a_time): no sharing, so a second open fails
+    // while the first handle lives.
     #[cfg(windows)]
     std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0);
     options
