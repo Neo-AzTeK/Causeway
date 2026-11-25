@@ -12,9 +12,8 @@ working there. Before choosing work, read the "State" and "Next" sections of
 - **Rule #1:** nothing from the game, or derived from it, enters the repo
   (files, dumps, disassembly, screenshots, snapshots). No new policy exceptions
   without the owner's decision. Details: `docs/asset-policy.md`.
-- **Work on Causeway.** Branches and searches target it: pass
-  `-R Neo-AzteK/Causeway` to `gh`. Use `Marvisak/VIctory` only when the owner
-  asks; code taken from it keeps its authorship and licence.
+- This is a fork: always pass `-R Neo-AzteK/Causeway` to `gh` (its default can
+  be the parent repo).
 - KISS flow (owner, 2026-11-24): no stacks, no PRs. A task is a short branch
   (or worktree) off `main`; once its checks pass, merge it into `main` and push
   `main` after each merge or milestone. Never force-push or rewrite `main`.
