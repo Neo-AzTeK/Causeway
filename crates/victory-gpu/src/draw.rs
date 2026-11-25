@@ -1083,84 +1083,59 @@ impl State {
     }
 
     /// A mesh dispatch of `x` groups through an emulated mesh pipeline
-    /// (`pipeline::host`, module notes; `crate::mesh`): per chunk of the
-    /// groups the scratch holds, the mesh program made as compute writes
-    /// the chunk's vertices and triangles, then the draw pass draws them.
-    /// False if a pass could not be bound (chunks before it were drawn).
+    /// (`pipeline::host`, module notes; [`crate::mesh::run_direct`]).
     fn dispatch_mesh_emulated(&mut self, list: &HostList, e: &crate::pipeline::host::EmulatedMesh, x: u32) -> bool {
-        let Some(scratch) = crate::mesh::scratch() else {
-            not_run("no mesh scratch");
+        let (Some(scratch), Some(layout)) = (crate::mesh::scratch(), self.mesh_layout(e)) else {
+            not_run("no mesh scratch or scratch parameters");
             return false;
         };
-        let per_chunk = crate::mesh::groups_per_chunk(e.stride, e.max_vertices, e.max_primitives);
         // The most groups a mesh dispatch takes (as the indirect clamp's).
         const MOST: u32 = 65_535;
         if x > MOST {
             once!("a mesh dispatch of more than 65,535 groups cut to 65,535");
         }
-        let Some(draw) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
-        };
-        let (&[vertices, triangles, first_group], &[drawn_vertices]) = (&e.compute.scratch[..], &draw.scratch[..]) else {
-            not_run("emulated mesh pipeline without its scratch parameters");
-            return false;
-        };
-        let l = &list.list;
-        // SAFETY: live buffers.
-        let (base, bases) = unsafe { (scratch.buffer.GetGPUVirtualAddress(), scratch.bases.GetGPUVirtualAddress()) };
-        let read = D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        for (first, n) in crate::mesh::chunks(x.min(MOST), per_chunk) {
-            self.mesh_pass = true;
-            let bound = self.bind(list, &e.compute, true);
-            self.mesh_pass = false;
-            if !bound {
-                return false;
-            }
-            let indices = base + u64::from(n) * u64::from(e.max_vertices) * u64::from(e.stride);
-            // SAFETY: an open list with the compute pass bound; the scratch
-            // and the table live for good.
-            unsafe {
-                l.SetComputeRootUnorderedAccessView(vertices, base);
-                l.SetComputeRootUnorderedAccessView(triangles, indices);
-                l.SetComputeRootShaderResourceView(first_group, bases + u64::from(first) * 4);
-                l.ResourceBarrier(&[crate::host::transition(
-                    &scratch.buffer,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
-                l.Dispatch(n, 1, 1);
-                l.ResourceBarrier(&[crate::host::transition(&scratch.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read)]);
-            }
-            let ready = self.prepare_for(list, false, true);
-            // SAFETY: as above, with the draw pass bound when `ready`.
-            unsafe {
-                if ready {
-                    l.SetGraphicsRootShaderResourceView(drawn_vertices, base);
-                    l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-                        BufferLocation: indices,
-                        SizeInBytes: n * e.max_primitives * 12,
-                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
-                    }));
-                    l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                    l.DrawIndexedInstanced(n * e.max_primitives * 3, 1, 0, 0, 0);
-                }
-                l.ResourceBarrier(&[crate::host::transition(&scratch.buffer, read, D3D12_RESOURCE_STATE_COMMON)]);
-            }
-            if !ready {
-                return false;
-            }
-        }
+        let per_chunk = crate::mesh::groups_per_chunk(e.stride, e.max_vertices, e.max_primitives);
+        let ran = crate::mesh::run_direct(list, scratch, &layout, (x.min(MOST), per_chunk), |compute| {
+            self.bind_mesh_pass(list, e, compute)
+        });
         // The title's topology again, and its index buffer at its next
         // indexed draw (`prepare` sets that every time).
         self.set_topology(list, self.topology);
-        true
+        ran
     }
 
-    /// Indirect mesh dispatches through an emulated mesh pipeline: `max`
-    /// clamped records `stride` bytes apart at host address `args` (in
-    /// unordered access), their count at `count` if given. They become
-    /// dispatch and draw records ([`crate::mesh::convert`]); the compute
-    /// pass runs the dispatches, the draw pass the draws.
+    /// An emulated mesh pipeline's compute pass (`compute`: its title root
+    /// arguments are the graphics ones) or draw pass, bound.
+    fn bind_mesh_pass(&mut self, list: &HostList, e: &crate::pipeline::host::EmulatedMesh, compute: bool) -> bool {
+        if !compute {
+            return self.prepare_for(list, false, true);
+        }
+        // Something of ours may have bound its own compute pipeline.
+        (self.host_pipeline, self.host_roots[1]) = (0, 0);
+        self.mesh_pass = true;
+        let bound = self.bind(list, &e.compute, true);
+        self.mesh_pass = false;
+        bound
+    }
+
+    /// The scratch layout of the bound emulated mesh pipeline `e`.
+    fn mesh_layout(&self, e: &crate::pipeline::host::EmulatedMesh) -> Option<crate::mesh::Layout> {
+        let draw = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let (&[vertices, triangles, first], &[drawn]) = (&e.compute.scratch[..], &draw.scratch[..]) else {
+            return None;
+        };
+        Some(crate::mesh::Layout {
+            stride: e.stride,
+            max_vertices: e.max_vertices,
+            max_primitives: e.max_primitives,
+            compute: [vertices, triangles, first],
+            draw: drawn,
+        })
+    }
+
+    /// Indirect mesh dispatches through an emulated mesh pipeline
+    /// ([`crate::mesh::run_indirect`]): `max` clamped records `stride`
+    /// bytes apart at host address `args`, their count at `count` if given.
     fn execute_mesh_emulated(
         &mut self,
         list: &HostList,
@@ -1168,56 +1143,23 @@ impl State {
         (args, count): (u64, Option<u64>),
         (stride, max): (u32, u32),
     ) -> bool {
-        let (Some(scratch), Some((dispatches, draws))) = (crate::mesh::scratch(), e.signatures.as_ref()) else {
-            not_run("no mesh scratch or indirect signatures");
+        let (Some(scratch), Some(layout), Some((dispatches, draws))) =
+            (crate::mesh::scratch(), self.mesh_layout(e), e.signatures.as_ref())
+        else {
+            not_run("no mesh scratch, scratch parameters or indirect signatures");
             return false;
         };
-        let records = max.min(crate::mesh::RECORDS);
-        if max > records {
-            once!("indirect mesh dispatches past 4,096 records run empty");
-        }
-        let capacity = crate::mesh::groups_per_chunk(e.stride, e.max_vertices, e.max_primitives);
-        let layout = (e.stride * e.max_vertices, e.max_primitives, capacity);
-        if !crate::mesh::convert(list, scratch, (args, count), (stride, records), layout) {
-            not_run("no mesh record converter");
-            return false;
-        }
-        (self.host_pipeline, self.host_roots[1]) = (0, 0);
-        self.mesh_pass = true;
-        let bound = self.bind(list, &e.compute, true);
-        self.mesh_pass = false;
-        let l = &list.list;
-        let read = D3D12_RESOURCE_STATE_INDEX_BUFFER | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        let ran = bound && {
-            // SAFETY: an open list with the compute pass bound; our buffers
-            // live for good.
-            unsafe {
-                l.ResourceBarrier(&[crate::host::transition(
-                    &scratch.buffer,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
-                l.ExecuteIndirect(dispatches, records, &scratch.commands, 0, None, 0);
-                l.ResourceBarrier(&[crate::host::transition(&scratch.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, read)]);
-            }
-            let ready = self.prepare_for(list, false, true);
-            // SAFETY: as above, with the draw pass bound when `ready`.
-            unsafe {
-                if ready {
-                    l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                    l.ExecuteIndirect(draws, records, &scratch.commands, u64::from(crate::mesh::DRAWS_AT), None, 0);
-                }
-                l.ResourceBarrier(&[crate::host::transition(&scratch.buffer, read, D3D12_RESOURCE_STATE_COMMON)]);
-            }
-            ready
-        };
-        // SAFETY: an open list and our live buffer.
-        unsafe {
-            l.ResourceBarrier(&[crate::host::transition(
-                &scratch.commands,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_COMMON,
-            )]);
+        let ran = crate::mesh::run_indirect(
+            list,
+            scratch,
+            &layout,
+            (dispatches, draws),
+            (args, count),
+            (stride, max),
+            |compute| self.bind_mesh_pass(list, e, compute),
+        );
+        if !ran {
+            not_run("emulated indirect mesh dispatch");
         }
         self.set_topology(list, self.topology);
         ran
