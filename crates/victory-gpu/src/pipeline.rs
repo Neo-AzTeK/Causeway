@@ -109,7 +109,8 @@ impl Shader {
             .get_or_init(|| {
                 #[cfg(feature = "diagnostics")]
                 self.dump();
-                let done = translate(&self.container);
+                let caps = crate::host::host().map(|h| h.shader_caps()).unwrap_or_default();
+                let done = translate(&self.container, caps);
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -179,9 +180,9 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], caps: victory_shader::emit::Caps) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = crate::shader_cache::host_shader(container, caps)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)

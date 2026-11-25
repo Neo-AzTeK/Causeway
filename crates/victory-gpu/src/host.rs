@@ -455,6 +455,29 @@ impl Host {
         })
     }
 
+    /// What the translator needs to know of this device; queried once.
+    pub(crate) fn shader_caps(&self) -> victory_shader::emit::Caps {
+        static CAPS: OnceLock<victory_shader::emit::Caps> = OnceLock::new();
+        *CAPS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            // SAFETY: a plain query into a struct of the size given.
+            let known = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok();
+            // An unanswered query: the feature is not assumed.
+            let caps = victory_shader::emit::Caps {
+                min_lod_clamp: known && has_min_lod_clamp(options.TiledResourcesTier),
+            };
+            tracing::info!(?caps, "host shader capabilities");
+            caps
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -2095,5 +2118,25 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+/// Whether sampling takes a least-level clamp: TiledResources tier 2 or
+/// better (the exact D3D12 requirement of the clamp operand).
+fn has_min_lod_clamp(tier: D3D12_TILED_RESOURCES_TIER) -> bool {
+    tier.0 >= D3D12_TILED_RESOURCES_TIER_2.0
+}
+
+#[cfg(test)]
+mod shader_caps_tests {
+    use super::*;
+
+    #[test]
+    fn the_clamp_needs_tiled_resources_tier_2() {
+        assert!(!has_min_lod_clamp(D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED));
+        assert!(!has_min_lod_clamp(D3D12_TILED_RESOURCES_TIER_1));
+        assert!(has_min_lod_clamp(D3D12_TILED_RESOURCES_TIER_2));
+        assert!(has_min_lod_clamp(D3D12_TILED_RESOURCES_TIER_3));
+        assert!(has_min_lod_clamp(D3D12_TILED_RESOURCES_TIER_4));
     }
 }

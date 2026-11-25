@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{Caps, HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -42,9 +42,9 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What a translation depends on beside the container.
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
+fn build(caps: Caps) -> &'static [u8; 32] {
+    static BUILD: [OnceLock<[u8; 32]>; 2] = [OnceLock::new(), OnceLock::new()];
+    BUILD[usize::from(caps.min_lod_clamp)].get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -52,27 +52,28 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        build_key(victory_shader::BUILD_HASH, limit)
+        build_key(victory_shader::BUILD_HASH, limit, caps)
     })
 }
 
 /// The BLAKE3 of the translator's build hash, the loop limit (which a
 /// diagnostics build can change at run time) and this file.
-fn build_key(translator: &str, loop_limit: u32) -> [u8; 32] {
+fn build_key(translator: &str, loop_limit: u32, caps: Caps) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(&(translator.len() as u64).to_le_bytes());
     h.update(translator.as_bytes());
     h.update(&loop_limit.to_le_bytes());
+    h.update(&[u8::from(caps.min_lod_clamp)]);
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+pub(crate) fn host_shader(container: &[u8], caps: Caps) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, &caps).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build(caps), container, translate),
         None => translate(container),
     }
 }
@@ -418,11 +419,31 @@ mod tests {
 
     #[test]
     fn the_build_key_follows_the_loop_limit_and_the_translator() {
-        let key = build_key("a", 1 << 20);
-        assert_eq!(build_key("a", 1 << 20), key, "same source, same key");
-        assert_ne!(build_key("a", 1 << 19), key);
-        assert_ne!(build_key("b", 1 << 20), key);
+        let key = build_key("a", 1 << 20, Caps::default());
+        assert_eq!(build_key("a", 1 << 20, Caps::default()), key, "same source, same key");
+        assert_ne!(build_key("a", 1 << 19, Caps::default()), key);
+        let clamp = Caps { min_lod_clamp: true };
+        assert_ne!(build_key("a", 1 << 20, clamp), key, "the device caps are keyed");
+        assert_ne!(build_key("b", 1 << 20, Caps::default()), key);
         assert_eq!(victory_shader::BUILD_HASH.len(), 64);
+    }
+
+    #[test]
+    fn another_device_capability_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let get = |min_lod_clamp| {
+            let key = build_key(victory_shader::BUILD_HASH, 64, Caps { min_lod_clamp });
+            cached(&cache, &key, b"container", |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                Ok(shader())
+            })
+        };
+        for (clamp, expected) in [(false, 1), (false, 1), (true, 2), (true, 2), (false, 2)] {
+            get(clamp).unwrap();
+            assert_eq!(runs.load(Ordering::Relaxed), expected, "clamp {clamp}");
+        }
     }
 
     #[test]
@@ -431,7 +452,7 @@ mod tests {
         let cache = Cache::open(dir.path()).unwrap();
         let runs = AtomicU64::new(0);
         let get = |limit| {
-            let key = build_key(victory_shader::BUILD_HASH, limit);
+            let key = build_key(victory_shader::BUILD_HASH, limit, Caps::default());
             cached(&cache, &key, b"container", |_| {
                 runs.fetch_add(1, Ordering::Relaxed);
                 Ok(shader())
