@@ -55,8 +55,9 @@ early and stays long costs most. Agents were the largest cost measured
 (64% of one evening, one agent 32%).
 
 Sessions
-- One milestone per session; at its end update `HANDOFF.md` (local, ignored by
-  git; at most 40 lines, current state only) and tell the owner to wipe context.
+- One milestone per session; at its end update `docs/worklog.md` (see Work
+  log) and tell the owner to wipe context. Machine-local notes (paths, tools)
+  stay outside the repo.
 - Goals need an end, and a stop where the owner must decide. Waiting on the
   owner, answer a hook in one line; do not redo or restate work.
 - Ask for launch approvals as a batch ("up to 3 runs, 5 minutes each").
@@ -72,7 +73,7 @@ Delegating (owner's rule, 2026-11-25)
   evidence and a "done when" test. The main session only runs, triages, merges
   and pushes. Never two real-GPU launches at once.
 - End the session early, before context fills: finish what is verified,
-  commit it, update `HANDOFF.md`, say what is unverified, and tell the owner
+  commit it, update `docs/worklog.md`, say what is unverified, and tell the owner
   to wipe context. Do not push through a long investigation to its end.
 
 Agents
