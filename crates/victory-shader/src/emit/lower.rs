@@ -53,6 +53,8 @@ pub(crate) struct Lowered {
     /// Marks the pages it writes through buffer views (`emit`, "Write
     /// marks").
     pub view_marks: bool,
+    /// Computes in double precision, which not every host has.
+    pub doubles: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -1536,6 +1538,7 @@ impl<'a> Lower<'a> {
             heap: self.heap[0],
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
+            doubles: self.s.flags & flags::DOUBLES != 0,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -5918,6 +5921,7 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_cvt_f32_f64" | "v_add_f64" => self.double(inst, name, guard),
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -6717,6 +6721,84 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// A double-precision operation.
+    fn double(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.clamp || v.omod != 0 {
+            return Err("a double-precision output modifier");
+        }
+        self.s.flags |= flags::DOUBLES;
+        let c = self.cur;
+        let a = self.fsrc64(inst, 0)?;
+        if name == "v_cvt_f32_f64" {
+            let f32t = self.s.t.f32;
+            let r = self.s.m.cast(c, Cast::FpTrunc, a, f32t);
+            return self.write_f(inst, r, guard);
+        }
+        let b = self.fsrc64(inst, 1)?;
+        let r = self.s.m.bin(c, Bin::Add, a, b);
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a 64-bit result");
+        };
+        let pair = vec![self.s.t.i32; 2];
+        let split = self.s.m.named_struct("dx.types.splitdouble", pair);
+        let r = self.s.op(c, "splitDouble.f64", Attr::ReadNone, split, 102, &[r]);
+        for k in 0..2 {
+            let dword = self.s.m.extract(c, r, u32::from(k));
+            self.write(inst, Reg::V(reg + k), dword, guard);
+        }
+        Ok(())
+    }
+
+    /// Source `k` as a double: a register pair; an inline constant of its
+    /// value; or a literal, which is the high dword.
+    fn fsrc64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let (abs, neg) = (v.abs >> k & 1 != 0, v.neg >> k & 1 != 0);
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let constant = |l: &mut Self, bits: u64| (l.s.m.i32(bits as u32), l.s.m.i32((bits >> 32) as u32));
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code: NULL, .. } => constant(self, 0),
+            Operand::Scalar { code, .. } => pair(self, Reg::S(code), Reg::S(code + 1))?,
+            Operand::Const(n @ 128..=208) => {
+                let x = crate::resource::inline(n).ok_or("a special operand")?;
+                constant(self, i64::from(x as i32) as u64)
+            }
+            Operand::Const(n @ 240..=247) => {
+                let x = [0.5f64, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0][usize::from(n - 240)];
+                constant(self, x.to_bits())
+            }
+            // 1 / (2 pi).
+            Operand::Const(248) => constant(self, 0x3FC4_5F30_6DC9_C882),
+            Operand::Literal(x) => constant(self, u64::from(x) << 32),
+            _ => return Err("a double-precision operand"),
+        };
+        let c = self.cur;
+        if abs {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, mask);
+        }
+        if neg {
+            let sign = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
+        }
+        let double = self.s.m.double();
+        Ok(self.s.op(c, "makeDouble.f64", Attr::ReadNone, double, 101, &[lo, hi]))
     }
 
     /// The low and high dwords of an i64.

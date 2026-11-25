@@ -37,7 +37,7 @@ mod tests;
 
 pub use planner::{
     BindingClass, BindingPlan, BudgetSource, FALLBACK_BUDGET, MemoryPlan, WaveNeed, WavePlan, aniso_point_mip,
-    atomics64_heap, binding_plan, format_choice, memory_plan, mesh_shaders, min_lod_clamp, wave_plan,
+    atomics64_heap, binding_plan, doubles, format_choice, memory_plan, mesh_shaders, min_lod_clamp, wave_plan,
 };
 
 use std::collections::BTreeMap;
@@ -107,6 +107,8 @@ pub struct Caps {
     pub heap_atomics64: Option<bool>,
     /// `AnisoFilterWithPointMipSupported` (OPTIONS19).
     pub aniso_point_mip: Option<bool>,
+    /// `DoublePrecisionFloatShaderOps` (OPTIONS).
+    pub doubles: Option<bool>,
     /// The adapter shares memory with the CPU (`CacheCoherentUMA` is not
     /// required).
     pub uma: Option<bool>,

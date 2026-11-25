@@ -65,6 +65,7 @@ impl Caps {
             typed_atomics64: o9.map(|o| o.AtomicInt64OnTypedResourceSupported.as_bool()),
             heap_atomics64: o11.map(|o| o.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()),
             aniso_point_mip: o19.map(|o| o.AnisoFilterWithPointMipSupported.as_bool()),
+            doubles: options.map(|o| o.DoublePrecisionFloatShaderOps.as_bool()),
             uma: arch.map(|a| a.UMA.as_bool()),
             memory,
             formats: formats

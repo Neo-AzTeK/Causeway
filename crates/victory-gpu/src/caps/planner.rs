@@ -78,6 +78,12 @@ pub fn wave_plan(caps: &Caps, need: WaveNeed) -> WavePlan {
     }
 }
 
+/// Whether shaders may compute in double precision: a translated program
+/// that does is refused where they may not.
+pub fn doubles(caps: &Caps) -> bool {
+    caps.doubles == Some(true)
+}
+
 /// Whether sampling with a least-level clamp is native (tiled resources
 /// tier 2 or better).
 pub fn min_lod_clamp(caps: &Caps) -> bool {

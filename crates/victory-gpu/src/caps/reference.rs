@@ -24,6 +24,7 @@ fn base(name: &str, vendor_id: u32, wave: (u32, u32), tiers: (u8, u8, u8)) -> Ca
         typed_atomics64: Some(false),
         heap_atomics64: Some(false),
         aniso_point_mip: Some(false),
+        doubles: Some(true),
         uma: Some(false),
         memory: MemoryCaps { budget: Some(7 * GIB), dedicated: 8 * GIB, shared: 16 * GIB },
         formats: BTreeMap::new(),

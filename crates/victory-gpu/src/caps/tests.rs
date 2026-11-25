@@ -292,3 +292,11 @@ fn generations_increase_and_refusals_read_cleanly() {
     assert_eq!(r.to_string(), "the host GPU lacks wave size: needs waves of 64 to 64 lanes, has 32 to 32");
     assert!(reference::warp().summary().contains("software"));
 }
+
+#[test]
+fn doubles_need_the_device_to_say_so() {
+    for (said, want) in [(Some(true), true), (Some(false), false), (None, false)] {
+        let c = Caps { doubles: said, ..Caps::unknown() };
+        assert_eq!(doubles(&c), want, "{said:?}");
+    }
+}
