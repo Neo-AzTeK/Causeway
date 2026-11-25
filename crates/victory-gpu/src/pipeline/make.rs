@@ -125,6 +125,34 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// Indirect calls without a host pipeline, by (kind, root cause).
+#[cfg(feature = "diagnostics")]
+pub(crate) type IndirectMissing = std::collections::BTreeMap<(u32, &'static str), u64>;
+
+/// Counts one indirect call of kind `kind` dropped for `why`, a reason
+/// [`missing`] gave (or a skip).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn count_indirect(missing: &mut IndirectMissing, kind: u32, why: &str) {
+    let cause = ["refused", "untranslated", "being made", "skipped", "no pipeline set"]
+        .into_iter()
+        .find(|c| why.starts_with(c))
+        .unwrap_or("other");
+    *missing.entry((kind, cause)).or_default() += 1;
+}
+
+/// The log line for `missing` over `frames` frames, if any. Not a "dropped
+/// by reason" line: its calls are in those already.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn indirect_line(missing: &IndirectMissing, frames: f64) -> Option<String> {
+    let parts: Vec<String> = missing
+        .iter()
+        .map(|(&(kind, cause), &n)| format!("kind {kind} {cause} {:.1}", n as f64 / frames))
+        .collect();
+    (!parts.is_empty()).then(|| {
+        format!("indirect calls without a host pipeline, a frame (counted above too): {}", parts.join(", "))
+    })
+}
+
 /// Logs the library name of the host pipeline this thread just made or
 /// loaded for `key` (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -404,6 +432,24 @@ mod tests {
             ("dispatch: prepare failed".to_owned(), 3),
         ];
         assert_eq!(by_cause(&drops), [8, 7, 4]);
+    }
+
+    /// Indirect calls without a host pipeline split by kind and root cause,
+    /// in a line the run digest does not read as drops of its own.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn indirect_calls_without_a_pipeline_are_split_by_root_cause() {
+        let mut missing = IndirectMissing::new();
+        for why in ["refused [compute 01]", "refused [compute 02]", "untranslated pixel 03", "being made"] {
+            count_indirect(&mut missing, 2, why);
+        }
+        count_indirect(&mut missing, 10, "skipped shader 04");
+        let line = indirect_line(&missing, 2.0).unwrap();
+        assert!(line.ends_with(
+            ": kind 2 being made 0.5, kind 2 refused 1.0, kind 2 untranslated 0.5, kind 10 skipped 0.5"
+        ), "{line}");
+        assert!(!line.contains("/frame without a host pipeline: "));
+        assert_eq!(indirect_line(&IndirectMissing::new(), 2.0), None);
     }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,

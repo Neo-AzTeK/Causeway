@@ -2738,6 +2738,9 @@ impl Meter {
                         *n as f64 / frames
                     );
                 }
+                if let Some(line) = crate::pipeline::indirect_missing_line(frames) {
+                    tracing::info!("{line}");
+                }
             }
         }
         if self.caption.is_none() {
