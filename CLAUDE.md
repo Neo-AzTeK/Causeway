@@ -41,6 +41,13 @@ before working there.
   capability does this assume, and where is the fallback tested? Prefer the
   conservative portable path unless a capability is proven.
 
+## Work log
+
+`docs/worklog.md` is the shared record of state, ranked next work, open
+decisions and a log line per merge or finding (no game data). Whoever merges,
+finishes a task or runs the game updates it in the same change, and reads its
+"Next" section before choosing work.
+
 ## Spending tokens
 
 Everything in context is paid for again on every later call, so what enters
