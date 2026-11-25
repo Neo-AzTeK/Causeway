@@ -307,7 +307,14 @@ impl Log {
             self.host_failures.push(line.to_owned());
         } else if line.contains("pipeline refused") || line.contains("root signature refused") {
             let shaders = field(line, "shaders").unwrap_or("?").to_owned();
-            self.refused.insert(shaders, error(line));
+            // A refusal made before the host was asked has no `error`: its
+            // reason is the `wave` field, or else the message.
+            let reason = match field(line, "wave") {
+                Some(wave) if !line.contains(" error=") => clip(wave),
+                _ if line.contains(" error=") => error(line),
+                _ => message(line),
+            };
+            self.refused.insert(shaders, reason);
         } else if line.contains("no host pipeline: ") {
             let shaders = field(line, "shaders").unwrap_or("?").to_owned();
             self.refused.insert(shaders, message(line));
@@ -1035,6 +1042,19 @@ mod tests {
         let a = areas.iter().find(|a| a.name == "pipelines refused").unwrap();
         assert_eq!(a.status, Status::Fail);
         assert!(a.detail.starts_with("4: "), "{}", a.detail);
+    }
+
+    #[test]
+    fn a_refusal_before_the_host_names_its_wave_reason() {
+        let text = healthy()
+            + &gpu(
+                "WARN",
+                "pipeline::host: host pipeline refused: wave size shaders=[compute 01] \
+                 wave=\"requires waves of 64 to 64 lanes, the host has 32 to 32\"",
+            );
+        let areas = judge(&text, None);
+        let a = areas.iter().find(|a| a.name == "pipelines refused").unwrap();
+        assert!(a.detail.contains("requires waves of 64 to 64"), "{}", a.detail);
     }
 
     #[test]

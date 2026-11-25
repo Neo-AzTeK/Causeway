@@ -298,6 +298,9 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// The dynamic descriptor slots its draws took (title heap, take id),
+    /// retired once a submission of the list has run.
+    held: Mutex<Vec<(usize, u64)>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -483,6 +486,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                held: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -560,6 +564,13 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        // The submission has run: the dynamic slots its lists took may be
+        // taken back if the heap runs out before they are reset.
+        for list in runs {
+            for &(heap, id) in list.held.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                crate::descriptor::retire_dynamic(heap, id);
+            }
+        }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -898,12 +909,18 @@ impl HostList {
         }
     }
 
+    /// Records that a draw of this list took dynamic descriptor slots.
+    pub(crate) fn hold_dynamic(&self, heap: usize, id: u64) {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).push((heap, id));
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
