@@ -83,6 +83,9 @@ struct Rate {
     dropped: f64,
     making: f64,
     indirect: f64,
+    /// Logged after the host GPU device was removed: frames of a run that
+    /// goes on without the GPU, not a measure of the world.
+    removed: bool,
 }
 
 impl Rate {
@@ -98,6 +101,7 @@ impl Rate {
             dropped: before(line, " without a host pipeline (")?,
             making: before(line, " being made)")?,
             indirect: before(line, " indirect")?,
+            removed: false,
         })
     }
 
@@ -310,8 +314,9 @@ impl Log {
             return;
         }
         if line.contains("victory_gpu::host: ")
-            && let Some(rate) = Rate::parse(line)
+            && let Some(mut rate) = Rate::parse(line)
         {
+            rate.removed = !self.removed.is_empty();
             self.rates.push(rate);
             return;
         }
@@ -349,7 +354,7 @@ impl Log {
         self.diagnostics |= line.contains("copies per frame: ");
         if let Some(causes) = Self::causes(line) {
             self.causes.push(causes);
-            let world = self.rates.last().is_some_and(|r| r.asked() >= WORLD_DRAWS);
+            let world = self.rates.last().is_some_and(|r| r.asked() >= WORLD_DRAWS && !r.removed);
             self.blocks.push(DropBlock { world, why: Vec::new() });
         }
         if let Some((_, why)) = line.split_once("/frame without a host pipeline: ")
@@ -426,7 +431,7 @@ impl Log {
     }
 
     fn world(&self) -> impl Iterator<Item = &Rate> {
-        self.rates.iter().filter(|r| r.asked() >= WORLD_DRAWS)
+        self.rates.iter().filter(|r| r.asked() >= WORLD_DRAWS && !r.removed)
     }
 
     /// The report's areas. `flat` says whether a saved frame is one color
@@ -907,6 +912,15 @@ mod tests {
 
     fn status(areas: &[Area], name: &str) -> Status {
         areas.iter().find(|a| a.name == name).unwrap().status
+    }
+
+    #[test]
+    fn frames_after_a_device_removal_are_not_world_lines() {
+        let text = rate(30.0, 600, 0, 0)
+            + &gpu("ERROR", "host: host GPU device removed after a submission of 1 lists")
+            + &rate(0.4, 600, 0, 0);
+        let log = Log::parse(&text);
+        assert_eq!(log.world().count(), 1);
     }
 
     fn healthy() -> String {

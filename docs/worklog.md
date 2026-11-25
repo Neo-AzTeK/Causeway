@@ -21,6 +21,8 @@ error kinds, branches and commits only.
   pixels non-flat in the saved frame: no 3D scene yet.
 
 ## Next, ranked by effect on the picture
+0. (frame-wait hunt, see log) Real cost is GPU time before the removal
+   (4.6 s/frame) and 266 MB/frame of copies; item 1 below was mis-attributed.
 1. Frame time: 2.4 s per world frame with GPU/prep near 0: find the wait
    (present, pacing, fences). Biggest lever on everything else.
 2. Dropped draws per frame: indirect kind 10 "prepare failed (mesh)" 468,
@@ -48,6 +50,14 @@ prewarm, fmt-only commit, `lower.rs` split, journal hot-path cost, whether
 the guest `s_barrier` in a loop is lane-uniform.
 
 ## Log (newest first; one line per merge or finding)
+- 2026-11-25: frame-wait hunt (from smoke-out10 log, no run): the 2.4 s "other"
+  median was a digest artifact. Before the removal (12:36:32) world lines show
+  GPU 4-27 s/frame (4.6 s at 546 draws, 0.76 s at 5114 draws, preparing 0.4-0.5 s,
+  copies 266 MB/frame): the wait is GPU time, i.e. the load that ended in the
+  removal. After it, lines read P0 G0 C0 at 1.3-4.2 s/frame with 1500-4000
+  draws/frame: the host records without a GPU, cause not named (log spam of
+  ~1000 lines/s is a suspect). The digest now leaves post-removal lines out of
+  world lines. Pipeline wait cannot be it: capped at 500 ms/frame.
 - 2026-11-25: smoke 10 reached the world (0.4 fps, one removal survived).
 - 2026-11-25: merged check-health, run-digest, device-removal, wave64-refusals,
   caps wave plan, caps memory plan; added `VICTORY_SURVIVE_REMOVAL`.
