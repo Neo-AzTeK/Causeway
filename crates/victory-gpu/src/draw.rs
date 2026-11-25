@@ -89,6 +89,9 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// Binding an emulated mesh pipeline's compute pass: a compute
+    /// pipeline whose root arguments are the title's graphics ones.
+    mesh_pass: bool,
 }
 
 impl Drop for State {
@@ -1051,7 +1054,15 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = self.prepare_for(list, false, true)
+        let emulated = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.emulated.as_deref());
+        let ran = if let Some(e) = emulated {
+            let ran = self.dispatch_mesh_emulated(list, e, x);
+            if ran {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            }
+            ran
+        } else {
+            self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
@@ -1062,7 +1073,8 @@ impl State {
                     true
                 }
                 Err(_) => false,
-            };
+            }
+        };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1070,8 +1082,99 @@ impl State {
         }
     }
 
+    /// A mesh dispatch of `x` groups through an emulated mesh pipeline
+    /// (`pipeline::host`, module notes; [`crate::mesh::run_direct`]).
+    fn dispatch_mesh_emulated(&mut self, list: &HostList, e: &crate::pipeline::host::EmulatedMesh, x: u32) -> bool {
+        let (Some(scratch), Some(layout)) = (crate::mesh::scratch(), self.mesh_layout(e)) else {
+            not_run("no mesh scratch or scratch parameters");
+            return false;
+        };
+        // The most groups a mesh dispatch takes (as the indirect clamp's).
+        const MOST: u32 = 65_535;
+        if x > MOST {
+            once!("a mesh dispatch of more than 65,535 groups cut to 65,535");
+        }
+        let per_chunk = crate::mesh::groups_per_chunk(e.stride, e.max_vertices, e.max_primitives);
+        let ran = crate::mesh::run_direct(list, scratch, &layout, (x.min(MOST), per_chunk), |compute| {
+            self.bind_mesh_pass(list, e, compute)
+        });
+        // The title's topology again, and its index buffer at its next
+        // indexed draw (`prepare` sets that every time).
+        self.set_topology(list, self.topology);
+        ran
+    }
+
+    /// An emulated mesh pipeline's compute pass (`compute`: its title root
+    /// arguments are the graphics ones) or draw pass, bound.
+    fn bind_mesh_pass(&mut self, list: &HostList, e: &crate::pipeline::host::EmulatedMesh, compute: bool) -> bool {
+        if !compute {
+            return self.prepare_for(list, false, true);
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            return false;
+        }
+        // Something of ours may have bound its own compute pipeline.
+        (self.host_pipeline, self.host_roots[1]) = (0, 0);
+        self.mesh_pass = true;
+        let bound = self.bind(list, &e.compute, true);
+        self.mesh_pass = false;
+        #[cfg(feature = "diagnostics")]
+        if bound {
+            list.note_op(|| self.op_text("emulated mesh: compute pass".to_owned(), false));
+        }
+        bound
+    }
+
+    /// The scratch layout of the bound emulated mesh pipeline `e`.
+    fn mesh_layout(&self, e: &crate::pipeline::host::EmulatedMesh) -> Option<crate::mesh::Layout> {
+        let draw = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let (&[vertices, triangles, first], &[drawn]) = (&e.compute.scratch[..], &draw.scratch[..]) else {
+            return None;
+        };
+        Some(crate::mesh::Layout {
+            stride: e.stride,
+            max_vertices: e.max_vertices,
+            max_primitives: e.max_primitives,
+            compute: [vertices, triangles, first],
+            draw: drawn,
+        })
+    }
+
+    /// Indirect mesh dispatches through an emulated mesh pipeline
+    /// ([`crate::mesh::run_indirect`]): `max` clamped records `stride`
+    /// bytes apart at host address `args`, their count at `count` if given.
+    fn execute_mesh_emulated(
+        &mut self,
+        list: &HostList,
+        e: &crate::pipeline::host::EmulatedMesh,
+        (args, count): (u64, Option<u64>),
+        (stride, max): (u32, u32),
+    ) -> bool {
+        let (Some(scratch), Some(layout), Some((dispatches, draws))) =
+            (crate::mesh::scratch(), self.mesh_layout(e), e.signatures.as_ref())
+        else {
+            not_run("no mesh scratch, scratch parameters or indirect signatures");
+            return false;
+        };
+        let ran = crate::mesh::run_indirect(
+            list,
+            scratch,
+            &layout,
+            (dispatches, draws),
+            (args, count),
+            (stride, max),
+            |compute| self.bind_mesh_pass(list, e, compute),
+        );
+        if !ran {
+            not_run("emulated indirect mesh dispatch");
+        }
+        self.set_topology(list, self.topology);
+        ran
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
-        if compute {
+        if compute && !self.mesh_pass {
             &self.compute
         } else {
             &self.graphics
@@ -1605,13 +1708,19 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+        // A mesh dispatch through an emulated mesh pipeline runs as compute
+        // and a draw (`State::execute_mesh_emulated`): no mesh signature.
+        let emulated = (kind == MESH)
+            .then(|| crate::pipeline::host_pipeline(self.pipeline as This))
             .flatten()
-        else {
+            .and_then(|p| p.emulated.as_deref());
+        let signature = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+            .then(|| host_signature(kind, stride))
+            .flatten();
+        if signature.is_none() && emulated.is_none() {
             why("no host signature");
             return false;
-        };
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
@@ -1623,6 +1732,19 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
+        if let Some(e) = emulated {
+            // The clamped records are read as unordered access.
+            crate::indirect::done(list, &args.buffer);
+            let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
+            let ran = self.execute_mesh_emulated(list, e, (args.gpu(arguments), count), (stride, max));
+            if !ran {
+                why("emulated mesh dispatch not run");
+            }
+            return ran;
+        }
+        let Some(signature) = signature else {
+            return false;
+        };
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {

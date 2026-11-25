@@ -193,6 +193,33 @@
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
+//! * **Mesh shaders as compute** ([`Options::mesh_as_compute`]; added
+//!   2026-11-25), for hosts without mesh shaders: the mesh program is made
+//!   as a compute shader of the same group, which writes its vertices and
+//!   triangles to two raw root UAVs in [`MESH_SPACE`] instead of
+//!   outputting them. Group `g` (counted from the dispatch's first),
+//!   vertex `v`: element `e` of the output signature, channel `c`, at byte
+//!   `(g * max_vertices + v) * stride + e * 16 + 4 * c` of `u0`, where
+//!   `stride` is 16 bytes per element ([`MeshVertexShader::stride`]);
+//!   primitive `p`: three dwords at `(g * max_primitives + p) * 12` of `u1`,
+//!   the vertex indices `g * max_vertices + i` (from the dispatch's first
+//!   vertex; a culled primitive's three the group's vertex 0: no area). The
+//!   host then draws the triangles as an indexed list (`R32_UINT`) with the
+//!   vertex shader [`mesh_vertex_shader`] makes, which reads vertex
+//!   `SV_VertexID` from the raw root SRV `t0` in [`MESH_SPACE`] and outputs
+//!   the mesh program's signature, so its pixel shader links unchanged.
+//!   A dispatch may run part of the title's groups (the host splits
+//!   dispatches larger than its scratch): the group number the program
+//!   sees is its group id plus dword 0 of the raw root SRV `t1` in
+//!   [`MESH_SPACE`]; the scratch addresses count from the dispatch's
+//!   first group. Per-primitive outputs are refused (the title's programs
+//!   have none). The compute shader asks for no wave size and needs none:
+//!   mesh code reads no other lane (cross-lane operations are refused but
+//!   quad-local ones, and a 1D group's quads are threads 4n..4n+3 at any
+//!   wave size), and the console lane is the flat thread id modulo the
+//!   console's wave, not the host's lane. Every primitive slot is culled
+//!   first and indices past the group's vertices are clamped, so the draw
+//!   never reads a vertex outside the dispatch's scratch.
 
 mod bitcode;
 #[cfg(all(test, windows))]
@@ -214,6 +241,8 @@ mod flat;
 pub use flat::{FLAT_COLOUR, flat_pixel_shader};
 mod rect;
 pub use rect::rectangle_gs;
+mod mesh_vs;
+pub use mesh_vs::{MeshVertexShader, mesh_limits, mesh_vertex_shader};
 #[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
@@ -244,7 +273,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use container::required_waves;
 pub use shader::{
-    HEAP_SAMPLERS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_MARK_NONE,
+    HEAP_SAMPLERS, MEMORY_SPACE, MESH_ELEMENT_BYTES, MESH_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_MARK_NONE,
     VIEW_MARKS, VIEW_STRIDES, VIEW_TABLE_HEADER, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
@@ -385,6 +414,10 @@ pub struct Options {
     /// Sampling with a least-level clamp (D3D12 TiledResources tier 2 or
     /// better). Without it `image_sample_d_cl` is refused.
     pub min_lod_clamp: bool,
+    /// A mesh program is made as a compute shader writing its vertices and
+    /// triangles (module notes, "Mesh shaders as compute"), for hosts
+    /// without mesh shaders. Other stages are unchanged.
+    pub mesh_as_compute: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -493,15 +526,7 @@ fn emit_once(
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
-        e.interp = match (e.kind, e.comp) {
-            (3, _) => 4,
-            // Constant, as DXC declares it (the AMD compiler crashed on a
-            // front face without a mode).
-            (13, _) => 1,
-            (0 | 6 | 7, 9) => 2,
-            (0, _) => 1,
-            _ => 0,
-        };
+        e.interp = default_interp(e.kind, e.comp);
     }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
@@ -517,6 +542,13 @@ fn emit_once(
     prims.retain(|e| !matches!(e.kind, 10 | 30));
     for e in &mut prims {
         e.interp = 1;
+    }
+    let mesh_compute = options.mesh_as_compute && native.stage == HwStage::Ms;
+    if mesh_compute && !prims.is_empty() {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "per-primitive outputs of a mesh shader made as compute",
+        });
     }
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
@@ -547,6 +579,7 @@ fn emit_once(
         mesh_stride,
         view_marks: options.view_marks,
         min_lod_clamp: options.min_lod_clamp,
+        mesh_compute,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
@@ -586,6 +619,20 @@ fn emit_once(
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     })
+}
+
+/// The interpolation mode DXC declares by default for an element of this
+/// semantic kind and component type.
+fn default_interp(kind: u8, comp: u8) -> u8 {
+    match (kind, comp) {
+        (3, _) => 4,
+        // Constant, as DXC declares it (the AMD compiler crashed on a
+        // front face without a mode).
+        (13, _) => 1,
+        (0 | 6 | 7, 9) => 2,
+        (0, _) => 1,
+        _ => 0,
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1013,7 +1060,31 @@ mod tests {
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
     fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
-        let words = [
+        triangle_mesh_with(prim, false, false, 1, Options::default()).map(|m| m.1)
+    }
+
+    /// [`triangle_mesh`] of one wave of 32 or 64 lanes, made as `options`
+    /// say, with the console container it came from; `slots_per_lane`
+    /// primitive slots per lane (the lanes export the first only).
+    fn triangle_mesh_with(
+        prim: u32,
+        wave64: bool,
+        group_z: bool,
+        slots_per_lane: u32,
+        options: Options,
+    ) -> Result<(Vec<u8>, HostShader), ShaderError> {
+        let lanes = if wave64 { 64 } else { 32 };
+        // The position's z is the group number (as the console passes it in
+        // v5, times the group's lanes) instead of 0.5 when `group_z`.
+        let mut words: Vec<u32> = if group_z {
+            vec![
+                0x7E00_0505, // v_readfirstlane_b32 s0, v5
+                0x7E0C_0C00, // v_cvt_f32_u32 v6, s0
+            ]
+        } else {
+            vec![0x7E0C_02F0] // v_mov_b32 v6, 0.5
+        };
+        words.extend([
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
             0x3604_0281, // v_and_b32 v2, 1, v1
@@ -1024,7 +1095,6 @@ mod tests {
             0x0608_08F3, // v_add_f32 v4, -1.0, v4
             0x100A_06F4, // v_mul_f32 v5, 2.0, v3
             0x060A_0AF3, // v_add_f32 v5, -1.0, v5
-            0x7E0C_02F0, // v_mov_b32 v6, 0.5
             0x7E0E_02F2, // v_mov_b32 v7, 1.0
             0x7E12_02FF, // v_mov_b32 v9, prim
             prim,
@@ -1033,19 +1103,19 @@ mod tests {
             0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
             0x0706_0504,
             0xBF81_0000, // s_endpgm
-        ];
+        ]);
         let native = NativeProgram {
             stage: HwStage::Ms,
-            wave64: false,
+            wave64,
             vgprs: 10,
             layout: vec![],
             used: vec![],
             io: StageIo::Ms(crate::native::MeshIo {
                 outputs: vec![],
                 clip_cntl: 0,
-                threads: 32,
-                max_vertices: 32,
-                max_primitives: 32,
+                threads: lanes,
+                max_vertices: lanes,
+                max_primitives: lanes * slots_per_lane,
                 topology: 2,
                 lds_bytes: 0,
             }),
@@ -1070,7 +1140,189 @@ mod tests {
         let st = structure::structure(&p)?;
         let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
         let io = io::raise(&p, &native)?;
-        emit(&c, &native, &p, &st, &io, &res)
+        let shader = emit_with(&c, &native, &p, &st, &io, &res, options)?;
+        Ok((bytes, shader))
+    }
+
+    /// A mesh program made as compute (no mesh shaders needed) writes the
+    /// vertices and triangles the mesh shader outputs, group by group from
+    /// the dispatch's first, and the vertex shader made for it draws them
+    /// as `mesh_triangles_draw` draws the mesh shader. Waves of 32 and 64,
+    /// three groups, a culled primitive (the prologue's degenerate one
+    /// stays).
+    #[test]
+    fn mesh_as_compute_draws_as_a_mesh_shader() {
+        use super::host::{Dispatch, Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_SHADER_VISIBILITY_ALL, D3D12_SHADER_VISIBILITY_VERTEX,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let options = Options {
+            mesh_as_compute: true,
+            ..Options::default()
+        };
+        let ps = constant_color();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            for wave64 in [false, true] {
+                let lanes = if wave64 { 64u32 } else { 32 };
+                // Last: twice as many primitive slots as lanes, the ones no
+                // lane exports culled.
+                for (prim, culled, per_lane) in
+                    [(TRIANGLE, false, 1), (TRIANGLE | EDGE_FLAGS | CULL, true, 1), (TRIANGLE, false, 2)]
+                {
+                    let what = format!("{label}, wave64 {wave64}, {prim:#x}, {per_lane} slots a lane");
+                    let prims = lanes * per_lane;
+                    // The group number arrives times the group's lanes (no
+                    // PSV0 here: the translator's fallback).
+                    let stride = lanes;
+                    let (console, cs) = triangle_mesh_with(prim, wave64, false, per_lane, options)
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    // The same with the group number as z, for the readback.
+                    let (_, cs_z) = triangle_mesh_with(prim, wave64, true, per_lane, options)
+                        .unwrap_or_else(|e| panic!("{what}: group z: {e}"));
+                    let vs = mesh_vertex_shader(&console).unwrap();
+                    assert_eq!(vs.stride, MESH_ELEMENT_BYTES, "{what}");
+                    let path = super::validator::Validator::default_path();
+                    if let Ok(mut v) = super::validator::Validator::load(path.as_deref()) {
+                        for d in [&cs.dxil, &cs_z.dxil, &vs.shader.dxil] {
+                            v.validate(&mut d.clone()).unwrap_or_else(|e| panic!("{what}: {e}"));
+                        }
+                    }
+                    // A compute shader: program kind 5 in the DXIL part.
+                    let c = Container::parse(&cs.dxil).unwrap();
+                    let dxil = c.part(FourCC::DXIL).unwrap().data;
+                    assert_eq!(crate::dxbc::u32_at(dxil, 0).unwrap() >> 16, 5, "{what}");
+                    // Any host wave size (module notes): none is asked for.
+                    assert_eq!(required_waves(&cs.dxil), None, "{what}");
+                    let root = host
+                        .root_signature_with(
+                            &[(&cs_z, D3D12_SHADER_VISIBILITY_ALL)],
+                            &[(0, MESH_SPACE, 2), (1, MESH_SPACE, 2), (1, MESH_SPACE, 1)],
+                        )
+                        .unwrap();
+                    let pso = host
+                        .compute_pipeline_with(&root, &cs_z.dxil)
+                        .unwrap_or_else(|e| panic!("{what}: compute pipeline: {e}"));
+                    // The dispatch runs the title's groups 5 to 7.
+                    let (groups, base) = (3, 5);
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(vec![0])),
+                                    (1, Root::Uav(groups * lanes * 4)),
+                                    (2, Root::Uav(groups * prims * 3)),
+                                    (3, Root::View { srv: true, data: vec![base] }),
+                                ],
+                                views: &[],
+                                samplers: &[],
+                                groups: [groups, 1, 1],
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{what}: dispatch: {e}"));
+                    let [vertices, triangles] = &out[..] else {
+                        panic!("{what}: {} buffers read back", out.len());
+                    };
+                    for v in 0..groups * lanes {
+                        // `v_mbcnt_lo`: lanes past 32 count the 32 below.
+                        let lane = (v % lanes).min(32);
+                        let want = [
+                            4.0 * (lane & 1) as f32 - 1.0,
+                            2.0 * (lane & 2) as f32 - 1.0,
+                            ((base + v / lanes) * stride) as f32,
+                            1.0,
+                        ];
+                        let at = v as usize * 4;
+                        let got: Vec<f32> = vertices[at..at + 4].iter().map(|&b| f32::from_bits(b)).collect();
+                        assert_eq!(got, want, "{what}: vertex {v}");
+                    }
+                    for t in 0..groups * prims {
+                        let first = t / prims * lanes;
+                        let exported = t % prims < lanes && !culled;
+                        let want = if exported { [first, first + 1, first + 2] } else { [first; 3] };
+                        let at = t as usize * 3;
+                        assert_eq!(triangles[at..at + 3], want, "{what}: triangle {t}");
+                    }
+                    if culled {
+                        continue;
+                    }
+                    // The first triangle's corners, drawn by the vertex shader
+                    // from what the program without group z writes.
+                    let vertices: Vec<u32> = (0..3u32)
+                        .flat_map(|l| [4.0 * (l & 1) as f32 - 1.0, 2.0 * (l & 2) as f32 - 1.0, 0.5, 1.0])
+                        .map(f32::to_bits)
+                        .collect();
+                    let root = host
+                        .root_signature_with(
+                            &[(&cs, D3D12_SHADER_VISIBILITY_ALL)],
+                            &[(0, MESH_SPACE, 2), (1, MESH_SPACE, 2), (1, MESH_SPACE, 1)],
+                        )
+                        .unwrap();
+                    let pso = host.compute_pipeline_with(&root, &cs.dxil).unwrap();
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(vec![0])),
+                                    (1, Root::Uav(lanes * 4)),
+                                    (2, Root::Uav(prims * 3)),
+                                    (3, Root::View { srv: true, data: vec![0] }),
+                                ],
+                                views: &[],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{what}: dispatch: {e}"));
+                    assert_eq!(out[0][..12], vertices[..], "{what}: first triangle");
+                    let vroot = host
+                        .root_signature_with(&[(&vs.shader, D3D12_SHADER_VISIBILITY_VERTEX)], &[(0, MESH_SPACE, 1)])
+                        .unwrap();
+                    let vpso = host
+                        .pipeline_with(&vroot, &vs.shader.dxil, &ps)
+                        .unwrap_or_else(|e| panic!("{what}: vertex pipeline: {e}"));
+                    let texels = host
+                        .draw(
+                            &vroot,
+                            &vpso,
+                            &Draw {
+                                roots: vec![
+                                    (0, Root::Constants(vec![0])),
+                                    (1, Root::View { srv: true, data: out[0].clone() }),
+                                ],
+                                textures: &[],
+                                samplers: &[],
+                                vertices: &[],
+                                stride: 0,
+                                size: (16, 16),
+                                mesh_groups: 0,
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{what}: draw: {e}"));
+                    assert!(
+                        texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                        "{what}: {} of 256 texels lit",
+                        texels.iter().filter(|t| t[3] != 0.0).count()
+                    );
+                }
+            }
+            eprintln!("{label}: mesh program made as compute drew");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 device; skipped");
+        }
     }
 
     /// A primitive export's corners are 9-bit indices: the edge flag above

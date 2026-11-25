@@ -221,6 +221,7 @@ fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     let (host, cached) = crate::shader_cache::host_shader(
         container,
         crate::host::host().is_some_and(|h| h.min_lod_clamp()),
+        crate::host::host().is_some_and(|h| !h.mesh_shaders()),
     );
     (host.and_then(|host| with_resources(container, host)), cached)
 }
