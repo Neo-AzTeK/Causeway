@@ -514,6 +514,15 @@ impl Shadow {
         written.map_or(0, |_| n)
     }
 
+    /// Whether [`Shadow::update`] of `[address, address + len)` has anything
+    /// to copy: a page there changed since it was taken, or the memory is not
+    /// tracked (copied whole each time).
+    pub(crate) fn stale(&self, address: usize, len: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        from < to && self.tracked.as_ref().is_none_or(|t| t.any_changed(from, to))
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -523,14 +532,19 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        #[cfg(feature = "diagnostics")]
+        let scanning = std::time::Instant::now();
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PendingScanned, pending.len() as u64);
+        let mut busy: Vec<(usize, usize)> = pending
             .iter()
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        drop(pending);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::PendingUs, scanning.elapsed().as_micros() as u64);
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the

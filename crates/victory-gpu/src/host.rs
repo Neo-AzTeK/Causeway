@@ -2230,6 +2230,8 @@ impl Batch {
         self.flush();
         self.textures.clear();
         self.current.clear();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BatchInvalidations, 1);
     }
 
     /// Does the refreshes; returns the bytes copied.
@@ -2237,16 +2239,35 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        #[cfg(feature = "diagnostics")]
+        if !self.refreshes.is_empty() {
+            crate::copystat::add(crate::copystat::C::BatchFlushes, 1);
+        }
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
+            // Most refreshes find nothing: each of a world submission's
+            // thousands of heap-read copies is checked, over 100,000 checks a
+            // frame, and the full path's locks and timers cost far more than
+            // the check.
+            if shadow.stale(from, to - from) {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let took = started.elapsed();
+                let us = took.as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add, range};
+                    range(from, to - from, us, 0);
+                    add(C::Updates, 1);
+                    add(C::UpdateNs, took.as_nanos() as u64);
+                }
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+            } else {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::CleanSkips, 1);
+            }
             // Kept: the union with what was current if they touch, else
             // the larger.
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
@@ -3405,10 +3426,20 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         batch.add(&copy, p + 100, 200);
         assert_eq!(batch.flush(), PAGE, "the page written");
         assert_eq!(copy.read_host((p + PAGE + 8) as u64, 1)[0], 7);
+        // Nothing left to copy, so a flush skips it; a skipped range counts
+        // as up to date all the same.
+        assert!(!copy.stale(p, len));
+        let mut idle = Batch::default();
+        idle.add(&copy, p, len);
+        assert_eq!(idle.flush(), 0);
+        assert_eq!(idle.current.len(), 1);
         // SAFETY: as above.
         unsafe { (p as *mut u8).write_volatile(1) };
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), 0, "nothing again in the submission");
+        // Only the page written is stale.
+        assert!(copy.stale(p, len) && copy.stale(p + 8, 4));
+        assert!(!copy.stale(p + PAGE, 3 * PAGE) && !copy.stale(p, 0));
         batch.title_written();
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");

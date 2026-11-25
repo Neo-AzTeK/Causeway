@@ -354,6 +354,20 @@ impl Tracked {
             .contains(&page)
     }
 
+    /// Whether [`Tracked::take`] of `[from, to)` would return anything.
+    pub(crate) fn any_changed(&self, from: usize, to: usize) -> bool {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        from < to
+            && self
+                .changed
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .range(from / PAGE..to.div_ceil(PAGE))
+                .next()
+                .is_some()
+    }
+
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
@@ -874,6 +888,32 @@ pub(crate) mod tests {
         assert!(!t.changed(p / PAGE) && t.changed(p / PAGE + 1));
         assert_eq!(t.take(p, p + 3 * PAGE), [(p + PAGE, p + 2 * PAGE + 100)]);
         assert!(t.take(p, p + 3 * PAGE).is_empty());
+        drop(t);
+        free(p);
+    }
+
+    /// [`Tracked::any_changed`] says whether a take would return anything.
+    #[test]
+    fn any_changed_agrees_with_take() {
+        let p = pool(4);
+        let t = track(p + 100, 3 * PAGE, true).expect("tracked");
+        let (start, end) = (p + 100, p + 100 + 3 * PAGE);
+        assert!(t.any_changed(start, end), "all changed at first");
+        t.take(start, end);
+        assert!(!t.any_changed(start, end));
+        // SAFETY: our pool, guarded since the take.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write_volatile(1) };
+        assert!(t.any_changed(start, end) && t.any_changed(p + 2 * PAGE, p + 2 * PAGE + 1));
+        assert!(!t.any_changed(start, p + 2 * PAGE), "the pages before it");
+        assert!(!t.any_changed(p + 3 * PAGE, end), "the pages after it");
+        // Outside the tracked memory, or empty.
+        assert!(!t.any_changed(p, start) && !t.any_changed(end, end + PAGE));
+        assert!(!t.any_changed(p + 2 * PAGE, p + 2 * PAGE));
+        // A page taken in part stays changed.
+        assert_eq!(t.take(p + 2 * PAGE, p + 2 * PAGE + 16).len(), 1);
+        assert!(t.any_changed(start, end));
+        assert_eq!(t.take(start, end).len(), 1);
+        assert!(!t.any_changed(start, end));
         drop(t);
         free(p);
     }
