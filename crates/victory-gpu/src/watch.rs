@@ -14,7 +14,11 @@
 //! Only the runtime's GPU memory is tracked: its write-watched pools, its
 //! physical-page views and their placeholders. Other memory a copy takes
 //! (the C heap, where the kernel writes system call results into buffers a
-//! guard would make fail) is copied whole every time.
+//! guard would make fail) is copied whole every time, also where a tracked
+//! range covers it (a loose copy's 4 MiB window around title memory may
+//! cover the C heap): a guard there made the heap's own writes fault into
+//! our handler, which waits for the guard lock its thread may hold, and
+//! made kernel copies into the heap fail.
 //!
 //! Blocks that cannot be made read-only (placeholders, nothing mapped)
 //! read as zeros and count as taken: only a mapping changes them, which the
@@ -393,9 +397,53 @@ impl Tracked {
     }
 }
 
+/// Of pages `[first, last)`, the runs `[a, b)` holding plain committed
+/// memory now (private and not write-watched: the C heap), which no guard
+/// may cover. A page partly plain counts whole. Asked when guarding, not
+/// when tracking: the heap commits pages of its reservations later, also
+/// inside a loose copy's window. Title pools answer in one call.
+fn plain_pages(first: usize, last: usize) -> Vec<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let watched = |at: usize, len: usize| {
+        let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+        // SAFETY: room for one answer; no reset, so nothing changes.
+        unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+    };
+    let (start, end) = (first * PAGE, last * PAGE);
+    if watched(start, end - start) {
+        return Vec::new();
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if region_end <= at {
+            break;
+        }
+        if info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && !watched(at, 4096) {
+            let (a, b) = (at / PAGE, region_end.div_ceil(PAGE));
+            match runs.last_mut() {
+                Some((_, l)) if *l >= a => *l = (*l).max(b),
+                _ => runs.push((a, b)),
+            }
+        }
+        at = region_end;
+    }
+    runs
+}
+
 /// Makes `pages` read-only where not already (in runs), and returns those
 /// now guarded or with nothing mapped (taken either way); a page that is
-/// mapped but cannot be guarded is left out (it stays changed).
+/// mapped but cannot be guarded, or holds plain memory ([`plain_pages`]),
+/// is left out (it stays changed).
 fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
@@ -438,12 +486,17 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         i += 1;
         #[cfg(feature = "diagnostics")]
         counted(1, run.len() as u64);
-        if set(run[0], run[run.len() - 1] + 1) {
+        let plain = plain_pages(run[0], run[run.len() - 1] + 1);
+        if plain.is_empty() && set(run[0], run[run.len() - 1] + 1) {
             g.protected.extend(run);
             taken.extend(run);
             continue;
         }
         for &page in run {
+            if plain.iter().any(|&(a, b)| (a..b).contains(&page)) {
+                // Left out: it stays changed, copied whole each time.
+                continue;
+            }
             if set(page, page + 1) {
                 g.protected.insert(page);
                 taken.push(page);
@@ -740,6 +793,68 @@ pub(crate) mod tests {
         drop(t);
         // SAFETY: our reservation.
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+    }
+
+    fn protection(at: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        assert_ne!(unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) }, 0);
+        info.Protect
+    }
+
+    /// Plain committed memory in a tracked range (a loose copy's window
+    /// over the C heap, which commits its reserved pages later) is never
+    /// guarded: copied every time, writable without our handler.
+    #[test]
+    fn plain_memory_in_a_tracked_range_is_never_guarded() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        // SAFETY: a reservation of ours (tracked, as a placeholder); its
+        // second page committed as plain private memory once tracked.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(r, 0);
+        let t = track(r, 2 * PAGE, true).expect("a reservation is tracked");
+        // SAFETY: inside our reservation.
+        let plain = unsafe { VirtualAlloc((r + PAGE) as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_eq!(plain, r + PAGE);
+        assert_eq!(t.take(r, r + 2 * PAGE), [(r, r + 2 * PAGE)], "all of it at first");
+        assert_eq!(t.take(r, r + 2 * PAGE), [(r + PAGE, r + 2 * PAGE)], "the plain page every time");
+        assert_ne!(protection(plain), PAGE_READONLY, "not guarded by a take");
+        t.taken(&[r / PAGE + 1]);
+        assert_ne!(protection(plain), PAGE_READONLY, "not guarded by a copy-back");
+        assert!(t.changed(r / PAGE + 1));
+        drop(t);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A run of pages from a write-watched pool into plain memory next to
+    /// it: the pool's page is guarded, the plain one is not.
+    #[test]
+    fn a_run_from_a_pool_into_plain_memory_guards_only_the_pool() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        // Two pages of address space, then a pool and plain memory in them.
+        let r = pool(2);
+        free(r);
+        // SAFETY: fresh allocations where we just freed ours (another
+        // thread may take the space first: then there is nothing to test).
+        let (p, plain) = unsafe {
+            let p = VirtualAlloc(r as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            let plain = VirtualAlloc((r + PAGE) as *const _, PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            (p, plain)
+        };
+        if p == r && plain == r + PAGE {
+            let t = track(r, 2 * PAGE, true).expect("pool memory is tracked");
+            assert_eq!(t.take(r, r + 2 * PAGE), [(r, r + 2 * PAGE)]);
+            assert_eq!(protection(r), PAGE_READONLY, "the pool's page guarded");
+            assert_ne!(protection(plain), PAGE_READONLY, "the plain page not");
+            assert_eq!(t.take(r, r + 2 * PAGE), [(r + PAGE, r + 2 * PAGE)]);
+            drop(t);
+        }
+        for a in [p, plain].into_iter().filter(|&a| a != 0) {
+            free(a);
+        }
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
