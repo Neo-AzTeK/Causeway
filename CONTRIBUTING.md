@@ -29,8 +29,26 @@ Run `cargo xtask install-hooks` once per clone: it installs that hook and makes
 - Mark a deliberate simplification `// shortcut:` with its limit.
 - A new dependency needs a measured gain or a correctness reason, and a
   GPL-3.0-compatible licence.
-- `decision NNNN` and `TODO.md` in comments point at files that are not in this
-  repo; do not guess what they say.
+
+## Comments
+
+If a change contradicts a comment, either the change is wrong or the comment is
+updated in the same diff. Match a comment to how binding it is:
+
+| The comment | What to do |
+|---|---|
+| must always hold, and code can check it | make it a test, an assert or a type |
+| must hold, and a test proves it | `// invariant(<test_name>): why` |
+| explains why (hardware quirk, rejected approach) | keep it, short |
+| marks a deliberate limit | `// shortcut:` with the limit |
+| restates the code, or is stale | delete it in code you already change, never in a sweep |
+
+`cargo xtask policy` (pre-commit, and CI through the tests) fails when an
+invariant names no existing test, and when the number of `decision NNNN`
+references grows: those documents are not in this repo (nor is `TODO.md`), so do
+not guess what they say. Keep `// SAFETY:` on `unsafe` blocks. What a machine
+cannot see (a weakened test, a comment the diff makes false) is the `reviewer`
+agent's job: run it, or review by its list, before merging a code change.
 
 ## Checks
 
