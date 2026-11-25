@@ -418,6 +418,12 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
+            // Refuse before creating: the host answers a wave size it lacks
+            // with E_INVALIDARG, which says nothing.
+            if let Some(wave) = wave_mismatch(&code_bytes(&code(0)), wave_lanes(&host.device)) {
+                tracing::warn!(?shaders, wave, "host pipeline refused: wave size");
+                return None;
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
