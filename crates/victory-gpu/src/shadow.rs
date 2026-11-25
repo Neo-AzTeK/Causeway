@@ -528,6 +528,8 @@ impl Shadow {
                     bytes += self.update_free(at, a);
                 }
                 if e > a.max(at) {
+                    #[cfg(feature = "diagnostics")]
+                    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UpdateBusyUs);
                     bytes += self.update_busy(a.max(at), e);
                 }
                 at = at.max(e);
@@ -579,6 +581,8 @@ impl Shadow {
     /// shader writes: the pages changed since taken, or all of it where the
     /// memory is not tracked.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UpdateFreeUs);
         if let Some(t) = &self.tracked {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
