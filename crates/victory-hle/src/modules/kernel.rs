@@ -694,7 +694,7 @@ mod tests {
         if let Some(log) = std::env::var_os(LOG) {
             victory_loader::log_crashes_to(log.into());
             SetUnhandledExceptionFilter(title_filter as *const () as usize);
-            // A thread of its own: the test harness catches nothing here.
+            // Nothing here catches it, the test harness neither.
             // SAFETY: nobody handles it, so it reaches the filter.
             unsafe { RaiseException(EXCEPTION_BREAKPOINT as u32, 0, 0, std::ptr::null()) };
             return;

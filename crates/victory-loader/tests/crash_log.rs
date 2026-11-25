@@ -5,8 +5,8 @@ use std::process::Command;
 
 use windows_sys::Win32::Foundation::EXCEPTION_BREAKPOINT;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-    EXCEPTION_POINTERS, RaiseException,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    EXCEPTION_POINTERS, EXCEPTION_RECORD, RaiseException,
 };
 
 const TEST_LOG: &str = "VICTORY_TEST_CRASH_LOG";
@@ -57,11 +57,55 @@ fn first_chance_breakpoint_logging() {
             assert!(report.contains("first-chance exception 0x80000003 at "));
             assert!(report.contains("  #0 "));
             assert!(report.contains("  title said: synthetic title output"));
+            // Register memory is for the breakpoint nobody handles.
+            assert!(!report.contains("  [r"), "{report}");
             assert!(!report.contains("unhandled exception"));
         } else {
             assert!(!log.exists());
         }
     }
+}
+
+const TEST_REGISTERS: &str = "VICTORY_TEST_CRASH_REGISTERS";
+
+#[test]
+fn an_unhandled_breakpoint_logs_register_memory_in_diagnostics_builds() {
+    if let Some(log) = std::env::var_os(TEST_REGISTERS) {
+        victory_loader::log_crashes_to(PathBuf::from(log));
+        let data = Box::new([0x1111u64; 8]);
+        // SAFETY: zeroed records are valid, and `report_unhandled` only reads
+        // them; a zero `rsp` ends the unwind at the first frame.
+        unsafe {
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_BREAKPOINT;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rcx = data.as_ptr() as u64;
+            let pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            victory_loader::report_unhandled(&pointers);
+        }
+        std::hint::black_box(&data);
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("crashes.log");
+    let name = "an_unhandled_breakpoint_logs_register_memory_in_diagnostics_builds";
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name])
+        .env(TEST_REGISTERS, &log)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output.status);
+    let report = std::fs::read_to_string(&log).unwrap();
+    assert!(report.contains("unhandled exception 0x80000003"), "{report}");
+    assert_eq!(
+        report.contains("  [rcx] 0x1111 0x1111 "),
+        cfg!(feature = "diagnostics"),
+        "{report}"
+    );
 }
 
 const TEST_ENTRIES: &str = "VICTORY_TEST_CRASH_ENTRIES";
