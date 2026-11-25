@@ -43,7 +43,7 @@ updated in the same diff. Match a comment to how binding it is:
 | marks a deliberate limit | `// shortcut:` with the limit |
 | restates the code, or is stale | delete it in code you already change, never in a sweep |
 
-`cargo xtask policy` (pre-commit, and CI through the tests) fails when an
+`cargo xtask policy` (pre-commit, and the workspace tests) fails when an
 invariant names no existing test, and when the number of `decision NNNN`
 references grows: those documents are not in this repo (nor is `TODO.md`), so do
 not guess what they say. Keep `// SAFETY:` on `unsafe` blocks. What a machine
@@ -57,7 +57,7 @@ While iterating, only the crate you changed:
     cargo clippy -q -p <crate> --all-targets --locked -- -D warnings
     cargo test -q -p <crate> --locked <filter>
 
-Before merging, what CI runs, plus the policy check:
+Before merging, the full chain. There is no CI: nobody else runs it.
 
     cargo clippy -q --workspace --all-targets --locked -- -D warnings
     cargo clippy -q --workspace --all-targets --all-features --locked -- -D warnings
