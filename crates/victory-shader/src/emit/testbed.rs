@@ -83,6 +83,7 @@ fn build(body: &[u32]) -> Result<HostShader, String> {
         prims: Vec::new(),
         mesh_stride: 0,
         min_lod_clamp: false,
+        view_marks: false,
     })
     .map_err(|x| format!("lower: {x:?}"))?;
     let shader = HostShader {
@@ -99,6 +100,7 @@ fn build(body: &[u32]) -> Result<HostShader, String> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     };
     // shortcut: validated only when `dxil.dll` is found; otherwise the
     // device's own checks are all there is.

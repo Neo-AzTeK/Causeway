@@ -115,6 +115,7 @@ pub(super) fn translate_caps(
         prims: Vec::new(),
         mesh_stride: 0,
         min_lod_clamp,
+        view_marks: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
@@ -130,6 +131,7 @@ pub(super) fn translate_caps(
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     })
 }
 

@@ -22,6 +22,10 @@ diagnostics = []
 # Headless translation checks (`emit::testbed`, used by `victory-testbed`).
 testbed = ["host"]
 
+[[bench]]
+name = "guard_runs"
+harness = false
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
 windows = { workspace = true, optional = true, features = [
