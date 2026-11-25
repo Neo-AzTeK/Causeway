@@ -234,6 +234,8 @@ fn create() -> windows::core::Result<Host> {
                 "host D3D12 adapter"
             );
         }
+        log_caps(&device);
+        tracing::info!("{}", switches_line(std::env::vars()));
         tracing::info!("host D3D12 device ready");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
@@ -290,6 +292,59 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         }
         Ok(adapter)
     }
+}
+
+/// For the run digest: what this device can do, `n/a` where it cannot say.
+fn log_caps(device: &ID3D12Device) {
+    fn query<T: Default>(device: &ID3D12Device, feature: D3D12_FEATURE) -> Option<T> {
+        let mut data = T::default();
+        // SAFETY: the query writes its own structure of the given size.
+        unsafe {
+            device.CheckFeatureSupport(feature, (&raw mut data).cast(), size_of::<T>() as u32).ok()?
+        };
+        Some(data)
+    }
+    let tier = |t: Option<i32>| t.map_or("n/a".to_owned(), |t| t.to_string());
+    let waves = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>(device, D3D12_FEATURE_D3D12_OPTIONS1)
+        .map_or("n/a".to_owned(), |o| format!("{}-{}", o.WaveLaneCountMin, o.WaveLaneCountMax));
+    let binding = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS>(device, D3D12_FEATURE_D3D12_OPTIONS)
+        .map(|o| o.ResourceBindingTier.0);
+    let mesh = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS7>(device, D3D12_FEATURE_D3D12_OPTIONS7)
+        .map(|o| o.MeshShaderTier.0);
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL_6_6 };
+    // SAFETY: the query writes its own structure of the given size.
+    let model = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+            .ok()
+            .map(|()| format!("{:#x}", model.HighestShaderModel.0))
+    };
+    tracing::info!(
+        "host D3D12 caps: wave {waves}, binding tier {}, mesh tier {}, shader model {}",
+        tier(binding),
+        tier(mesh),
+        model.as_deref().unwrap_or("n/a")
+    );
+}
+
+/// The longest value of a switch the log keeps.
+const SWITCH_VALUE: usize = 80;
+
+/// The `VICTORY_*` variables this process sees, in one log line for the run
+/// digest: `NAME="value"`, sorted, values cut. It shows a switch that never
+/// reached the process.
+fn switches_line(vars: impl Iterator<Item = (String, String)>) -> String {
+    let mut seen: Vec<(String, String)> = vars
+        .filter(|(n, _)| n.to_ascii_uppercase().starts_with("VICTORY_"))
+        .map(|(n, v)| (n.to_ascii_uppercase(), v.chars().take(SWITCH_VALUE).collect()))
+        .collect();
+    seen.sort();
+    let list: Vec<String> = seen.iter().map(|(n, v)| format!("{n}={v:?}")).collect();
+    format!("process switches ({}): {}", seen.len(), list.join(" "))
 }
 
 fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
@@ -390,6 +445,23 @@ fn create_hardware_device() -> windows::core::Result<ID3D12Device> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_switch_echo_lists_only_ours_sorted_upper_case_and_cut() {
+        let vars = [
+            ("PATH", "x"),
+            ("victory_b", "2"),
+            ("VICTORY_A", "a \"q\""),
+            ("VICTORY_LONG", &"z".repeat(200)),
+        ];
+        let line = super::switches_line(vars.iter().map(|(n, v)| (n.to_string(), v.to_string())));
+        let long = format!("VICTORY_LONG=\"{}\"", "z".repeat(super::SWITCH_VALUE));
+        assert_eq!(
+            line,
+            format!("process switches (3): VICTORY_A=\"a \\\"q\\\"\" VICTORY_B=\"2\" {long}")
+        );
+        assert_eq!(super::switches_line(std::iter::empty()), "process switches (0): ");
+    }
+
     #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
         use super::{Duration, Instant, SwapChainRetry};

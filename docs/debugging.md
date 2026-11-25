@@ -36,7 +36,12 @@ title's data folder.
 runs a title unattended with this build (300 s, `--seconds`), skips its menus
 with `VICTORY_KEYS` (`--keys` replaces them; they do nothing while an XInput pad is
 connected), and judges each graphics area in `report.txt` and `report.json`.
-`--log <file>` judges an existing log instead. It exits with an error when an
+`--log <file>` judges an existing log instead. It also writes `digest.md` (at most 60
+lines: run header with the switches the game saw, delta against `--baseline <report.json>`,
+frame cost, draws lost by cause and pipeline, refusals ranked by draws lost, a contact
+sheet and the top 3 next items). `--env NAME=VALUE` passes a `VICTORY_*` switch to the
+game (the runner removes all others) and the digest warns when the log does not show it.
+It exits with an error when an
 area failed; what a log does not show is "unknown".
 
 On a real GPU this can reset the display driver. The default keys press
