@@ -314,6 +314,11 @@ impl Log {
         }
     }
 
+    /// When the story000 pack was first opened (Unix time), if it was.
+    pub fn pack_opened(&self) -> Option<f64> {
+        self.starve.pack_opened()
+    }
+
     /// When the first world line was logged (Unix time).
     pub fn world_start(&self) -> Option<f64> {
         self.world().find_map(|r| unix_time(&r.time))

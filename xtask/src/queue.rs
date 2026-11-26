@@ -627,8 +627,17 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
         match outcome {
             Ok(Ran::Exit(code)) => {
                 let digest = dirs.runs.join(&name).join("digest.md");
-                write_done(dirs, &name, code.into(), digest.is_file().then_some(digest.as_path()), None)?;
-                println!("runner: done {name} exit={code}");
+                // A run stopped for want of a world is to be run again, not read.
+                let rerun = fs::read_to_string(dirs.runs.join(&name).join(smoke::RERUN_FILE)).ok();
+                let why = rerun.as_deref().map(|text| format!("rerun: {}", text.trim()));
+                write_done(
+                    dirs,
+                    &name,
+                    code.into(),
+                    digest.is_file().then_some(digest.as_path()),
+                    why.as_deref(),
+                )?;
+                println!("runner: done {name} exit={code}{}", if why.is_some() { " (rerun)" } else { "" });
             }
             Ok(Ran::LockBusy) => {
                 // The smoke run did not start: back to the head, its request

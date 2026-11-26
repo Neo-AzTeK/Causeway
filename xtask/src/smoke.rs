@@ -111,6 +111,8 @@ const INHERITED: &[&str] =
 
 pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     victory_core::ensure_outside_repo(&args.out)?;
+    // A marker from an earlier run in this folder is not this run's.
+    let _ = std::fs::remove_file(args.out.join(RERUN_FILE));
     let (log, end) = match &args.log {
         Some(log) => (log.clone(), None),
         None => {
@@ -131,6 +133,13 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     }
     let text = log.text(&areas);
     create(&args.out)?;
+    // Only the no-world stop ends a run with lines to come and none there: the
+    // queue runner reads this file and marks the request `rerun`.
+    if matches!(end, Some((End::Enough, _))) && log.world_start().is_none() {
+        let note = format!("no world line {NO_WORLD_CAP:.0} s after the story000 pack opened: stopped early, rerun\n");
+        std::fs::write(args.out.join(RERUN_FILE), &note).context("writing rerun.txt")?;
+        println!("smoke: {}", note.trim_end());
+    }
 
     // The digest: pictures first, for the metrics hold their measure.
     let frames: Vec<PathBuf> =
@@ -334,7 +343,7 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file);
-    let mut watch = args.world_lines.map(|asked| Watch::new(&log, asked as usize));
+    let mut watch = Watch::new(&log, args.world_lines.map(|asked| asked as usize));
     let mut meter = load::Meter::default();
     let mut beside = Load::default();
     beside.sample(at_start);
@@ -351,6 +360,7 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     };
     let enough = |title: Option<u64>| {
         let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
+        let wall = at.as_ref().map_or(0.0, |&at| at);
         if let (Ok(at), Some(now), Some(title)) = (at, load::system_times(), title)
             && let Some(mut sample) = meter.sample(at, now, title)
         {
@@ -358,7 +368,7 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
             // A look that cannot be written is one less.
             let _ = record.write_all(load::Record::line(sample).as_bytes());
         }
-        watch.as_mut().is_some_and(Watch::enough)
+        watch.enough(wall)
     };
     let end = run_for(command, Duration::from_secs(args.seconds), look, enough)
         .with_context(|| format!("running {}", victory.display()))?;
@@ -608,25 +618,47 @@ impl Follow {
     }
 }
 
-/// Follows the growing log for `--world-lines`.
+/// A run with no world line this long after the story000 pack opened is
+/// stopped early (a starved boot gets this long: the pack opens ~30 s after the
+/// first line when quiet, 176 s and 264 s when starved).
+const NO_WORLD_CAP: f64 = 150.0;
+
+/// Written into the run's folder when the run was stopped for want of a world:
+/// the queue runner marks such a run `rerun`.
+pub(crate) const RERUN_FILE: &str = "rerun.txt";
+
+/// Whether a run has gone `NO_WORLD_CAP` seconds since the story000 pack opened
+/// without a world line (all times Unix seconds).
+fn no_world_stalled(pack: Option<f64>, world: Option<f64>, now: f64) -> bool {
+    world.is_none() && pack.is_some_and(|at| now - at >= NO_WORLD_CAP)
+}
+
+/// Follows the growing log: for `--world-lines`, and for the no-world stop.
 struct Watch {
     log: Follow,
-    asked: usize,
+    asked: Option<usize>,
     reached: bool,
 }
 
 impl Watch {
-    fn new(log_file: &Path, asked: usize) -> Watch {
+    fn new(log_file: &Path, asked: Option<usize>) -> Watch {
         Watch { log: Follow::new(log_file), asked, reached: false }
     }
 
-    /// Whether the lines asked for were there at the look before this one: the
-    /// run goes on for one more, so that what a world line brings with it
-    /// (its drops, by cause and reason) is in the log. A log that cannot be
-    /// read is never enough: the run goes to its cap.
-    fn enough(&mut self) -> bool {
-        let steady = self.log.read().steady_lines();
-        std::mem::replace(&mut self.reached, steady >= self.asked)
+    /// Whether the run is over early: the lines asked for were there at the
+    /// look before this one (the run goes on for one more, so that what a world
+    /// line brings with it, its drops by cause and reason, is in the log), or no
+    /// world line came `NO_WORLD_CAP` seconds after the story pack opened. A log
+    /// that cannot be read is never enough: the run goes to its cap. `now` is
+    /// Unix time.
+    fn enough(&mut self, now: f64) -> bool {
+        let (steady, pack, world) = {
+            let log = self.log.read();
+            (log.steady_lines(), log.pack_opened(), log.world_start())
+        };
+        let reached = self.asked.is_some_and(|asked| steady >= asked);
+        let was = std::mem::replace(&mut self.reached, reached);
+        (self.asked.is_some() && was) || no_world_stalled(pack, world, now)
     }
 }
 
@@ -1045,8 +1077,8 @@ mod tests {
     #[test]
     fn a_growing_log_is_enough_one_look_after_its_last_line_asked_for() {
         let path = std::env::temp_dir().join(format!("xtask-watch-{}", std::process::id()));
-        let mut watch = Watch::new(&path, 2);
-        assert!(!watch.enough(), "no log yet");
+        let mut watch = Watch::new(&path, Some(2));
+        assert!(!watch.enough(0.0), "no log yet");
         let append = |text: &str| {
             use std::io::Write as _;
             let mut file =
@@ -1056,18 +1088,50 @@ mod tests {
         std::fs::write(&path, world_line(0)).unwrap();
         append(&world_line(50));
         append(&world_line(95)); // The first steady one.
-        assert!(!watch.enough());
-        assert!(!watch.enough(), "one steady line of two");
+        assert!(!watch.enough(0.0));
+        assert!(!watch.enough(0.0), "one steady line of two");
         // Half a line counts for nothing.
         let second = world_line(100);
         let (head, tail) = second.split_at(60);
         append(head);
-        assert!(!watch.enough());
-        assert!(!watch.enough());
+        assert!(!watch.enough(0.0));
+        assert!(!watch.enough(0.0));
         append(tail);
-        assert!(!watch.enough(), "the look that sees it: what follows it may not be there");
-        assert!(watch.enough());
+        assert!(!watch.enough(0.0), "the look that sees it: what follows it may not be there");
+        assert!(watch.enough(0.0));
         assert_eq!(watch.log.read().steady_lines(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// 2026-01-01T00:00:00Z, in Unix seconds.
+    const JAN_1_2026: f64 = 1_767_225_600.0;
+
+    /// The story000 pack opened `at` seconds in.
+    fn pack_line(at: u32) -> String {
+        format!(
+            "2026-01-01T00:{:02}:{:02}Z  INFO victory_hle::modules::dstorage: dstorage: file \
+             opened path=\"G:\\\\pack\\\\story000\\\\story000_script.rpf\"\n",
+            at / 60,
+            at % 60
+        )
+    }
+
+    #[test]
+    fn no_world_stops_150_s_after_the_story_pack_opened_and_not_before() {
+        assert!(!no_world_stalled(None, None, JAN_1_2026 + 1000.0), "no pack yet");
+        let pack = JAN_1_2026 + 30.0;
+        assert!(!no_world_stalled(Some(pack), None, pack + 149.0), "a starved boot keeps its chance");
+        assert!(no_world_stalled(Some(pack), None, pack + 150.0));
+        assert!(!no_world_stalled(Some(pack), Some(pack + 20.0), pack + 500.0), "a world came");
+    }
+
+    #[test]
+    fn a_watch_without_a_world_line_ends_the_run_150_s_after_the_pack() {
+        let path = std::env::temp_dir().join(format!("xtask-watch-pack-{}", std::process::id()));
+        std::fs::write(&path, pack_line(30)).unwrap();
+        let mut watch = Watch::new(&path, None);
+        assert!(!watch.enough(JAN_1_2026 + 30.0 + 149.0));
+        assert!(watch.enough(JAN_1_2026 + 30.0 + 150.0));
         std::fs::remove_file(&path).unwrap();
     }
 

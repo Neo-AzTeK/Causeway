@@ -64,6 +64,11 @@ impl Starve {
         }
     }
 
+    /// When the story000 pack was first opened (Unix time), if it was.
+    pub fn pack_opened(&self) -> Option<f64> {
+        self.pack
+    }
+
     /// What in the log shows the machine was starved, one sign each. A sign
     /// alone can be a cold disk cache: `Log::starved` weighs them.
     pub fn signs(&self) -> Vec<String> {
