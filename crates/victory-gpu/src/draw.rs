@@ -35,6 +35,26 @@ enum Root {
     View(u64),
 }
 
+impl Root {
+    /// The address a shader reading this root parameter as a root view
+    /// takes: a root view's.
+    /// shortcut: titles also set root constants whose first two dwords are
+    /// an address where their shader reads a root view (a world compute
+    /// pass's slot 8: ~370 dispatches a frame dropped, "root view offset:
+    /// no root view set"). Reading those addresses drew them, but they lie
+    /// in title memory outside buffers, at ring positions: each root view
+    /// refreshed its 4 MiB window to the end (0.7-2.2 GB of copies a frame,
+    /// +300-700 ms preparing) and the windows, never freed, ran system
+    /// memory out after 8 minutes (mesh-emu-5). Take them once copies of
+    /// such memory are bounded to what the shader reads and freed.
+    fn address(&self) -> Option<u64> {
+        match self {
+            Root::View(address) => Some(*address),
+            _ => None,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -149,7 +169,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// it in the list (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
-    let why = NOT_RUN.with(|w| w.replace(""));
+    let why = take_not_run();
     if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
         crate::pipeline::note_drop(pipeline as This);
     } else {
@@ -165,6 +185,33 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
 thread_local! {
     /// Why the draw or dispatch this thread last prepared cannot run.
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// The reason noted for the draw or dispatch just prepared, left empty for
+/// the next one, which may fail without naming one (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn take_not_run() -> &'static str {
+    NOT_RUN.with(|w| w.replace(""))
+}
+
+/// Why an indirect mesh call through an emulated pipeline did not run, as
+/// its note and count give it (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn emulated_mesh_why() -> String {
+    format!("emulated mesh: {}", take_not_run())
+}
+
+/// Notes why the draw or dispatch being prepared cannot run, unless an
+/// inner step named it already (diagnostics).
+fn not_run_unless_named(why: &'static str) {
+    #[cfg(feature = "diagnostics")]
+    NOT_RUN.with(|w| {
+        if w.get().is_empty() {
+            w.set(why);
+        }
+    });
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = why;
 }
 
 /// Notes why the draw or dispatch being prepared cannot run (diagnostics).
@@ -635,16 +682,16 @@ impl State {
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
-                        && let Some(Root::View(address)) =
-                            self.roots_ref(compute).get(usize::from(u.slot))
-                        && let Some(shadow) = crate::shadow::find(*address, 1)
+                        && let Some(address) =
+                            self.roots_ref(compute).get(usize::from(u.slot)).and_then(Root::address)
+                        && let Some(shadow) = crate::shadow::find(address, 1)
                     {
                         let uav = t.used.iter().any(|r| {
                             r.slot == u.slot
                                 && r.root == RootType::Descriptor
                                 && r.kind == ResourceType::Uav
                         });
-                        roots.push((*address, uav.then_some(shadow)));
+                        roots.push((address, uav.then_some(shadow)));
                     }
                     let fresh = made
                         .iter()
@@ -653,14 +700,31 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
-                            let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
+                            let root = self.roots_ref(compute).get(usize::from(u.slot));
+                            let offset = match root.and_then(Root::address) {
+                                Some(address) => crate::shadow::find(address, 1)
                                     .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
+                                None => None,
                             };
                             match offset {
                                 Some(offset) => offset,
-                                None => return false,
+                                None => {
+                                    let why = match root.and_then(Root::address) {
+                                        Some(_) => "root view offset: outside title buffers",
+                                        None => "root view offset: no root view set",
+                                    };
+                                    #[cfg(feature = "diagnostics")]
+                                    {
+                                        // Eight of each: mesh passes, the rest.
+                                        static SEEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+                                        if SEEN[usize::from(self.mesh_pass)].fetch_add(1, Ordering::Relaxed) < 8 {
+                                            let root = root.map(|r| format!("{r:?}"));
+                                            tracing::warn!(slot = u.slot, ?root, compute, mesh_pass = self.mesh_pass, pipeline = %p.name, "{why}: dropped");
+                                        }
+                                    }
+                                    not_run(why);
+                                    return false;
+                                }
                             }
                         }
                         None if is_root_view(u) => {
@@ -708,12 +772,12 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let Some(address) = self.roots_ref(compute).get(usize::from(slot)).and_then(Root::address)
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
+                    let Some(gpu) = root_view(list, address, kind == 1, kind == 2) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -800,7 +864,7 @@ impl State {
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
-        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+        let Some(address) = self.roots_ref(compute).get(usize::from(slot)).and_then(Root::address) else {
             once!(slot, "a shader reads a root view the title did not set: dropped");
             return None;
         };
@@ -843,6 +907,7 @@ impl State {
         if run_heap != key || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
                 once!("no dynamic slots for root views: dropped");
+                not_run("no dynamic slots for root views");
                 return None;
             };
             self.dynamic.push((key, first, ROOT_VIEW_RUN));
@@ -1166,11 +1231,11 @@ impl State {
             (stride, max),
             |compute| self.bind_mesh_pass(list, e, compute),
         );
-        if !ran {
-            not_run("emulated indirect mesh dispatch");
+        if let Err(e) = ran {
+            not_run_unless_named(e);
         }
         self.set_topology(list, self.topology);
-        ran
+        ran.is_ok()
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -1738,7 +1803,8 @@ impl State {
             let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
             let ran = self.execute_mesh_emulated(list, e, (args.gpu(arguments), count), (stride, max));
             if !ran {
-                why("emulated mesh dispatch not run");
+                #[cfg(feature = "diagnostics")]
+                why(&emulated_mesh_why());
             }
             return ran;
         }
@@ -1771,7 +1837,7 @@ impl State {
                     "prepare failed (compute {}, mesh {}): {}",
                     p.compute,
                     p.mesh,
-                    NOT_RUN.with(|w| w.replace(""))
+                    take_not_run()
                 )),
             }
             return false;
@@ -2014,6 +2080,44 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A shader reading a root parameter as a root view takes the address
+    /// of the root view the title set there, not root constants (see
+    /// `Root::address`); the mesh pass reads the graphics ones.
+    #[test]
+    fn root_view_addresses_come_from_views_only() {
+        let mut s = State::default();
+        let address = 0xD_72C8_0000u64;
+        s.set_constants(true, 8, &[address as u32, (address >> 32) as u32, 0, 0, 2, 2], 0);
+        s.set_view(false, 3, 0x1234_5000);
+        s.set_table(true, 2, 0x10);
+        let read = |s: &State, compute, slot: u8, dword| s.user_value(compute, slot, RootType::Descriptor, dword);
+        assert_eq!((read(&s, false, 3, 0), read(&s, false, 3, 1)), (0x1234_5000, 0));
+        assert_eq!((read(&s, true, 8, 0), read(&s, true, 8, 1)), (0, 0), "constants read as a root view");
+        assert_eq!(s.roots_ref(true).get(8).and_then(Root::address), None, "constants holding {address:#x}");
+        assert_eq!(s.roots_ref(false).get(3).and_then(Root::address), Some(0x1234_5000));
+        assert_eq!(s.roots_ref(true).get(2).and_then(Root::address), None, "a table is no address");
+        // One dword of constants is no address either.
+        s.set_constants(true, 9, &[7], 0);
+        assert_eq!(s.roots_ref(true).get(9).and_then(Root::address), None);
+        // The emulated mesh pass's compute bind reads the graphics roots.
+        s.mesh_pass = true;
+        assert_eq!(s.roots_ref(true).get(3).and_then(Root::address), Some(0x1234_5000));
+    }
+
+    /// The reason an inner step of an emulated mesh call gave is the one its
+    /// note and count carry, an outer reason does not cover it, and the
+    /// next call that fails without one is not given it.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn emulated_mesh_drops_keep_the_inner_reason() {
+        not_run("no dynamic slots for root views");
+        not_run_unless_named("compute pass not bound");
+        assert_eq!(emulated_mesh_why(), "emulated mesh: no dynamic slots for root views");
+        assert_eq!(take_not_run(), "", "taken, not left for the next call");
+        not_run_unless_named("compute pass not bound");
+        assert_eq!(emulated_mesh_why(), "emulated mesh: compute pass not bound");
+    }
+
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;

@@ -809,7 +809,14 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                // The emulated draw pass: what of the pixel shader's inputs
+                // our vertex shader does not output as it reads them.
+                let unlinked = if mesh_draw {
+                    unlinked(&code_bytes(&code(0)), &code_bytes(&code(1)))
+                } else {
+                    Vec::new()
+                };
+                tracing::warn!(error = %e, ?shaders, ?unlinked, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
@@ -841,6 +848,44 @@ impl HostPipeline {
             emulated: None,
         })
     }
+}
+
+/// The pixel inputs of `ps` that the outputs of `vs` do not cover (same
+/// semantic, component type, register and components), as `name index
+/// type T rRow mMask`; system
+/// values the rasteriser makes are left out. Empty if a signature does not
+/// parse.
+fn unlinked(vs: &[u8], ps: &[u8]) -> Vec<String> {
+    use victory_shader::{Container, FourCC};
+    /// Name, index, system value, component type, register, mask.
+    type Element = (String, u32, u32, u32, u32, u8);
+    let elements = |c: &[u8], part: FourCC| -> Option<Vec<Element>> {
+        let c = Container::parse(c).ok()?;
+        let d = c.part(part)?.data;
+        let word = |at: usize| Some(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?));
+        (0..word(0)? as usize)
+            .map(|i| {
+                let at = word(4)? as usize + 32 * i;
+                let name = d.get(word(at + 4)? as usize..)?.split(|&b| b == 0).next()?;
+                let name = String::from_utf8_lossy(name).into_owned();
+                Some((name, word(at + 8)?, word(at + 12)?, word(at + 16)?, word(at + 20)?, *d.get(at + 24)?))
+            })
+            .collect()
+    };
+    let (Some(outs), Some(ins)) = (elements(vs, FourCC::OSG1), elements(ps, FourCC::ISG1)) else {
+        return Vec::new();
+    };
+    ins.iter()
+        // Arbitrary semantics, position, clip and cull distances come from
+        // the vertex shader; the rest (primitive id, front face...) not.
+        .filter(|i| matches!(i.2, 0..=3))
+        .filter(|i| {
+            !outs.iter().any(|o| {
+                o.0.eq_ignore_ascii_case(&i.0) && o.1 == i.1 && o.3 == i.3 && o.4 == i.4 && o.5 & i.5 == i.5
+            })
+        })
+        .map(|i| format!("{} {} type {} r{} m{:#x}", i.0, i.1, i.3, i.4, i.5))
+        .collect()
 }
 
 /// The host's topology type: the console's rectangle and quad types draw
