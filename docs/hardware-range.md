@@ -9,8 +9,9 @@ is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
 1. `Caps::probe(&device, &formats)` asks the device once, when it is made.
    Every query may fail; a failed field is `None` and means "not supported".
 2. A planner is a pure function `&Caps -> decision` (`wave_plan`,
-   `binding_plan`, `memory_plan`, `min_lod_clamp`, `mesh_shaders`,
-   `wave64_native`, `atomics64_heap`, `aniso_point_mip`, `format_choice`). It never sees vendor
+   `binding_plan`, `heap_indexing`, `memory_plan`, `min_lod_clamp`,
+   `mesh_shaders`, `wave64_native`, `atomics64_heap`, `aniso_point_mip`,
+   `format_choice`). It never sees vendor
    or driver.
 3. A planner that cannot serve the device returns a `Refusal`, which prints as
    `the host GPU lacks <feature>: needs <x>, has <y>`.
@@ -25,6 +26,7 @@ is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
 | wave pinning, mesh shaders | `shader_model` | `SHADER_MODEL`, asked 6.8 down | `wave_plan`, `mesh_shaders` |
 | waves of 64 or two of 32 | `wave` | OPTIONS1 | `wave64_native` |
 | descriptor limits | `binding_tier` | OPTIONS `ResourceBindingTier` | `binding_plan` |
+| translated shaders at all | `binding_tier`, `shader_model` | tier 3 and SM 6.6 | `heap_indexing` |
 | least-level clamp | `tiled_tier` | OPTIONS `TiledResourcesTier` | `min_lod_clamp` |
 | mesh shaders | `mesh_tier` | OPTIONS7 | `mesh_shaders` |
 | 64-bit image atomics | `typed_atomics64`, `heap_atomics64` | OPTIONS9, OPTIONS11 | `atomics64_heap` |
@@ -32,9 +34,9 @@ is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
 | memory | `memory`, `uma` | `GetDesc1`, `QueryVideoMemoryInfo`, ARCHITECTURE1 | `memory_plan` |
 | format use | `formats` (probed list) | `FORMAT_SUPPORT` | `format_choice` |
 
-Descriptor and heap code belongs to another owner: it reads `binding_plan`
-(class, `max_views`, `max_samplers`, per-stage limits at tier 1) and nothing
-else from here. Limits are the specification's per tier; a driver may allow
+Descriptor and heap code belongs to another owner: what it may read from here
+is `binding_plan` (class, `max_views`, `max_samplers`); today it does not call
+it (see "Still open"). Limits are the specification's per tier; a driver may allow
 more. Where a tier sets no bound (`max_views: None`), try the size wanted and
 treat a creation failure as the refusal.
 
@@ -72,10 +74,12 @@ budget.
 
 `reference::all()`: the NVIDIA generations (`nvidia_maxwell`, `nvidia_pascal`
 = the owner's GTX 1070, `nvidia_turing`, `nvidia_ampere`, `nvidia_ada`,
-`nvidia_blackwell`; `nvidia_modern` is the class name older tests use), `amd_rdna` (waves 32 to 64), `amd_gcn` (wave64 only),
+`nvidia_blackwell`; the side case `nvidia_maxwell1`, first-generation Maxwell
+at binding tier 2; `nvidia_modern` is the class name older tests use), `amd_rdna` (waves 32 to 64), `amd_gcn` (wave64 only),
 `intel_arc` (8 to 32), `intel_igpu` (UMA, 128 MiB "dedicated"), `warp`.
-These are class profiles written from public documentation, not dumps; the
-code says so. A change is verified on a class only through its fake or WARP.
+`nvidia_pascal` takes its figures from the GTX 1070's start log; the others
+are class profiles written from public documentation and inference, not dumps;
+the code says which is which. A change is verified on a class only through its fake or WARP.
 Every brief and report says which adapters ran for real, which only as fakes.
 
 ## Vendor and driver
@@ -147,25 +151,41 @@ here; add it when a second person has a device to dump.
 
 ## NVIDIA: each path the GTX 1070 takes, and the other side
 
-The owner's card is Pascal (`nvidia_pascal`): wave32, no mesh shaders. Each
-row is a decision made from `Caps` (or its creation failure, where marked);
-the generations differ only in the fields shown, and no code branches on
-vendor. Tests: `caps/tests.rs` unless a path is given.
+The owner's card is Pascal (`nvidia_pascal`, figures from its start log):
+waves of 32, SM 6.8, binding tier 3, tiled tier 4, mesh tier 0, 64-bit heap
+atomics. Each row is a decision made from `Caps` (or its creation failure,
+where marked); the generations differ only in the fields shown, and no code
+branches on vendor. Tests: `caps/tests.rs` unless a path is given.
 
-| Decision | GTX 1070 path | Modern NVIDIA path (Turing and on) | Covered by |
-|----------|---------------|------------------------------------|------------|
-| mesh shaders (`mesh_shaders`: tier >= 1 and SM 6.6) | tier 0: mesh programs are made as compute and drawn indexed | native mesh pipeline | `nvidia_generations_take_the_paths_their_feature_level_gives`, `a_gtx_1070_and_a_modern_card_differ_only_in_what_the_caps_say`, `shader_cache::mesh_as_compute_is_part_of_the_key` |
+| Decision | GTX 1070 path | Other NVIDIA | Covered by |
+|----------|---------------|--------------|------------|
+| translated shaders at all (`heap_indexing`: SM 6.6 and binding tier 3) | yes | yes in the fakes from Maxwell 2 on; first-generation Maxwell at tier 2 is refused (one reason for every translated pipeline, and an error in the start log) | `heap_indexing_needs_shader_model_6_6_and_binding_tier_3`, `a_first_generation_maxwell_at_binding_tier_2_is_refused_cleanly` |
+| mesh shaders (`mesh_shaders`: tier >= 1 and SM 6.6) | tier 0: mesh programs are made as compute and drawn indexed | Maxwell the same; native from Turing (RTX; GTX 16 is listed at feature level 12_1 and has no profile) | `nvidia_generations_take_the_paths_their_feature_level_gives`, `a_gtx_1070_and_a_modern_card_differ_only_in_what_the_caps_say`, `shader_cache::mesh_as_compute_is_part_of_the_key` |
 | console wave of 64 (`wave64_native`) | two waves of 32 stand in for one (`[WaveSize(32)]`) | same: every NVIDIA part has waves of 32 only | `waves_of_64_are_asked_for_only_where_waves_of_32_do_not_exist`, `victory-shader` lane test `a_host_without_waves_of_32_is_asked_for_waves_of_64`, `shader_cache::wave64_native_is_part_of_the_key` |
 | wave plan of a program that asks for 32 or 64 (`wave_plan`) | 32 native; 64 refused | same | `wave_plan_serves_each_reference_class`, `nvidia_generations_take_the_paths_...`, `pipeline::host` `wave_sizes_the_host_lacks_are_refused` |
-| least-level clamp (`min_lod_clamp`) | tiled tier 3: native | same | `tiers_are_compared_with_at_least` |
-| 64-bit atomics on heap resources (`atomics64_heap`) | off: such pipelines are refused | on from Ampere (kept off for Turing: no report seen) | `heap_atomics_need_both_caps`, `nvidia_generations_take_the_paths_...` |
-| binding model (`binding_plan`) | tier 3, bindless | same | `tiers_are_compared_with_at_least`, `view_heap_limits_are_the_specifications_on_every_tier` |
+| least-level clamp (`min_lod_clamp`) | native (tiled tier 4) | native in the fakes from Maxwell 2 (a guess for Maxwell 2); off in the Maxwell 1 fake (guess) | `tiers_are_compared_with_at_least` |
+| 64-bit atomics on heap resources (`atomics64_heap`) | on (start log) | on in the later fakes (inferred); off in the Maxwell fakes (guess): such pipelines are refused | `heap_atomics_need_both_caps`, `nvidia_generations_take_the_paths_...` |
+| point-mip anisotropy (`aniso_point_mip`) | off in the fake (not logged): the nearest filter | off in every NVIDIA fake (not established) | `nvidia_generations_take_the_paths_...` |
+| binding model (`binding_plan`; no caller) | tier 3, bindless | same; Maxwell 1 fake: tables | `tiers_are_compared_with_at_least`, `view_heap_limits_are_the_specifications_on_every_tier` |
 | view heap size (creation failure, `PORTABLE_VIEWS`) | the host refuses a heap past 1,000,000 views: capped heap with a pool for the title's slots | a driver that accepts the larger heap keeps the title's slots (RTX 2060 SUPER, 2026-11-25) | `descriptor::host::tests::title_slots_past_a_capped_heap_take_pool_slots` (forced limit, needs a GPU); the large path runs wherever the heap is accepted (not on the 1070) |
 | view copies on 64 KiB heap blocks (`shadow::placed_buffer`) | `ALLOW_ONLY_BUFFERS` heap, valid on resource heap tiers 1 and 2 | same: no tier is read | `shadow::tests` (refused heap, refused placement: copies take a buffer of their own) |
 | memory budget (`memory_plan`) | 8 GiB card: the OS's figure | the card's own figure | `nvidia_memory_budgets_follow_the_card_not_a_constant`, `memory_budget_is_chosen_from_the_figures_it_has` |
 | formats a host cannot store to or render | asked per resource (`per_resource`) | same query | no fake: needs the device |
 
-The `Caps` figures of these generations are class profiles from public
-documentation, not dumps. Not shown by any fake, so it needs a real modern
-card: the heap limit a driver accepts (differs by driver, not generation), the
-64-bit typed atomics of Turing, and the speed of native mesh against emulation.
+Public sources: feature level per generation from Wikipedia, "Feature levels
+in Direct3D" (Maxwell 1 11_0; Maxwell 2, Pascal and GTX 16 12_1; RTX 20 and
+later 12_2, which requires mesh shaders and tiled tier 3; binding tier 3 for
+12_2 is read from the same page); SM 6.7 for Maxwell from Wikipedia's GeForce
+700 and 900 series pages; the tier 3 with SM 6.6 requirement from
+DirectX-Specs, "HLSL Dynamic Resources". No public source read here gives
+64-bit atomics, waves, or Maxwell's binding tier (forum reports disagree). Not
+shown by any fake, so it needs a real card: those, the heap limit a driver
+accepts (differs by driver, not generation) and the speed of native mesh
+against emulation.
+
+Gaps: features a translated shader can declare that no `Caps` field or planner
+covers, so a host without one would show it only as a failed pipeline (support
+per NVIDIA generation not established): pixel-shader stencil reference,
+rasterizer ordered views, typed UAV loads of additional formats, 64-bit shader
+integers. A wave program with no required size (`WaveNeed::Any`) is not
+refused on a host that reports no wave operations.

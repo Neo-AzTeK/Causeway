@@ -6,14 +6,16 @@ update "Last run" after each smoke run. No game data.
 | Adapter | Wave | Mesh tier | Binding tier | View heap | Last run |
 |---------|------|-----------|--------------|-----------|--------------------|
 | NVIDIA RTX 2060 SUPER (Turing, 8 GB) | 32 | native (tier 1) | 3 | large | smoke, 2026-11-25 |
-| NVIDIA GTX 1070 (Pascal) | 32 | none (emulated as compute, being built) | unknown | 1,000,000 slots | smoke 12, 2026-11-25 |
+| NVIDIA GTX 1070 (Pascal) | 32 | none (emulated as compute, being built) | 3 | 1,000,000 slots | smoke 12, 2026-11-25 |
 
 ## Fake classes only (`caps::reference`, no run)
 
-NVIDIA Maxwell, Ampere, Ada and Blackwell: planned as class profiles from
-public documentation (`docs/hardware-range.md`, "NVIDIA: each path the GTX 1070
-takes"). Turing ran on a real card (above); its 64-bit typed atomics were not
-seen, so the fake keeps them off.
+NVIDIA Maxwell (both generations), Ampere, Ada and Blackwell: planned as class
+profiles from public documentation and inference (`docs/hardware-range.md`,
+"NVIDIA: each path the GTX 1070 takes"). First-generation Maxwell at binding
+tier 2 cannot run translated shaders (refused; tested with fake caps only).
+Turing ran on a real card (above); no dump of its caps is kept, so its fake's
+64-bit atomics (on) are inferred from the GTX 1070, which reports them.
 
 ## Not yet verified (assume nothing)
 - native mesh shaders and the large view heap on anything but the RTX 2060

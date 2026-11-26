@@ -111,6 +111,26 @@ pub fn aniso_point_mip(caps: &Caps) -> bool {
     caps.aniso_point_mip == Some(true)
 }
 
+/// Whether translated shaders can reach their descriptors. All of them index
+/// the descriptor heaps directly (SM 6.6 `ResourceDescriptorHeap`, root
+/// signatures flagged heap-directly-indexed), which D3D12 guarantees only
+/// with shader model 6.6 and resource binding tier 3 together (DirectX-Specs,
+/// "HLSL Dynamic Resources"). There is no fallback binding path.
+pub fn heap_indexing(caps: &Caps) -> Result<(), Refusal> {
+    if caps.shader_model.is_some_and(|m| m >= ShaderModel::SM6_6) && caps.binding_tier.is_some_and(|t| t >= 3) {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        "heap-indexed descriptors",
+        "shader model 6.6 and resource binding tier 3",
+        format!(
+            "shader model {}, binding tier {}",
+            caps.shader_model.map_or_else(|| "unknown".into(), |m| format!("{:#x}", m.0)),
+            caps.binding_tier.map_or_else(|| "unknown".into(), |t| t.to_string()),
+        ),
+    ))
+}
+
 /// How much the binding model allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingClass {

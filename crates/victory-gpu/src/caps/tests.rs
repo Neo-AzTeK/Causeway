@@ -115,6 +115,7 @@ fn unknown_means_unsupported() {
     assert!(!min_lod_clamp(&c) && !mesh_shaders(&c) && !atomics64_heap(&c) && !aniso_point_mip(&c));
     assert!(matches!(wave_plan(&c, WaveNeed::Lanes { min: 32, max: 32, pinnable: true }), WavePlan::Refuse(_)));
     assert_eq!(binding_plan(&c).class, BindingClass::Slots);
+    assert!(heap_indexing(&c).is_err());
     assert_eq!(memory_plan(&c).source, BudgetSource::Fallback);
     assert!(format_choice(&c, &[(28, 1)]).is_err());
 }
@@ -296,12 +297,13 @@ fn generations_increase_and_refusals_read_cleanly() {
 // Each decision the owner's GTX 1070 (`nvidia_pascal`) takes, against the
 // NVIDIA generations that take the other side or the same one.
 
-/// What each NVIDIA generation must plan, written out from the feature
-/// levels: native mesh shaders from Turing, 64-bit typed atomics from Ampere.
+/// What each NVIDIA generation must plan: native mesh shaders from Turing
+/// (feature level 12_2), 64-bit heap atomics from Pascal (seen on the GTX 1070;
+/// off in the Maxwell fake, a guess).
 const GENERATIONS: [(&str, bool, bool); 6] = [
     ("nvidia-maxwell", false, false),
-    ("nvidia-pascal", false, false),
-    ("nvidia-turing", true, false),
+    ("nvidia-pascal", false, true),
+    ("nvidia-turing", true, true),
     ("nvidia-ampere", true, true),
     ("nvidia-ada", true, true),
     ("nvidia-blackwell", true, true),
@@ -320,6 +322,7 @@ fn nvidia_generations_take_the_paths_their_feature_level_gives() {
         // The same on every generation: sampling clamp, bindless binding,
         // waves of 32, no waves of 64.
         assert!(min_lod_clamp(caps) && !aniso_point_mip(caps), "{name}");
+        assert_eq!(heap_indexing(caps), Ok(()), "{name}");
         let binding = binding_plan(caps);
         assert_eq!((binding.class, binding.max_views), (BindingClass::Bindless, None), "{name}");
         assert!(!wave64_native(caps), "{name}");
@@ -342,6 +345,7 @@ fn a_newer_nvidia_generation_never_loses_a_path() {
         assert!(!mesh_shaders(old) || mesh_shaders(new), "{what}");
         assert!(!atomics64_heap(old) || atomics64_heap(new), "{what}");
         assert!(!min_lod_clamp(old) || min_lod_clamp(new), "{what}");
+        assert!(heap_indexing(old).is_err() || heap_indexing(new).is_ok(), "{what}");
         assert_eq!(binding_plan(new).class, binding_plan(old).class, "{what}");
         assert!(new.shader_model >= old.shader_model, "{what}");
     }
@@ -426,4 +430,61 @@ fn nvidia_memory_budgets_follow_the_card_not_a_constant() {
     let mut small = reference::nvidia_pascal();
     small.memory = MemoryCaps { budget: None, dedicated: 2 << 30, shared: 16 << 30 };
     assert_eq!(memory_plan(&small).budget, 2 << 30);
+}
+
+#[test]
+fn heap_indexing_needs_shader_model_6_6_and_binding_tier_3() {
+    for &tier in TIERS {
+        for &sm in SMS {
+            let c = Caps { binding_tier: tier, shader_model: sm.map(ShaderModel), ..Caps::unknown() };
+            let want = tier.is_some_and(|t| t >= 3) && sm.is_some_and(|m| m >= 0x66);
+            match heap_indexing(&c) {
+                Ok(()) => assert!(want, "tier {tier:?} sm {sm:x?}"),
+                Err(r) => {
+                    assert!(!want, "tier {tier:?} sm {sm:x?}: {r}");
+                    assert!(r.to_string().starts_with("the host GPU lacks heap-indexed descriptors: needs "), "{r}");
+                }
+            }
+        }
+    }
+}
+
+/// First-generation Maxwell at its pessimistic report: the other planners
+/// each have an answer (emulated mesh, no clamp, waves of 32), but no
+/// translated shader can run, and that must be one clean refusal rather than
+/// a failed root signature per pipeline.
+#[test]
+fn a_first_generation_maxwell_at_binding_tier_2_is_refused_cleanly() {
+    let c = reference::nvidia_maxwell1();
+    assert_eq!(
+        heap_indexing(&c).expect_err("refused").to_string(),
+        "the host GPU lacks heap-indexed descriptors: needs shader model 6.6 and resource binding tier 3, \
+         has shader model 0x67, binding tier 2"
+    );
+    assert!(!mesh_shaders(&c) && !min_lod_clamp(&c) && !atomics64_heap(&c) && !wave64_native(&c));
+    assert_eq!(binding_plan(&c).class, BindingClass::Tables);
+    assert_eq!(memory_plan(&c).source, BudgetSource::Queried);
+    // A driver that reports tier 3 for the same chip can run them.
+    assert_eq!(heap_indexing(&Caps { binding_tier: Some(3), ..c }), Ok(()));
+}
+
+/// The decisions for the other vendors' classes, so that a change made for an
+/// NVIDIA class cannot move them unseen: (name, mesh, heap atomics, clamp,
+/// waves of 64 asked, heap indexing).
+#[test]
+fn the_other_classes_keep_their_paths() {
+    let want = [
+        (reference::amd_rdna(), true, true, true, false, true),
+        // The GCN fake reports shader model 6.5: translated shaders are 6.6.
+        (reference::amd_gcn(), false, false, true, true, false),
+        (reference::intel_arc(), true, false, true, false, true),
+        (reference::intel_igpu(), false, false, false, false, true),
+        (reference::warp(), false, false, true, false, true),
+    ];
+    for (c, mesh, atomics, clamp, w64, heap) in want {
+        let got = (mesh_shaders(&c), atomics64_heap(&c), min_lod_clamp(&c), wave64_native(&c), heap_indexing(&c).is_ok());
+        assert_eq!(got, (mesh, atomics, clamp, w64, heap), "{}", c.adapter.name);
+    }
+    let current = Caps { shader_model: Some(ShaderModel::SM6_6), ..reference::amd_gcn() };
+    assert_eq!(heap_indexing(&current), Ok(()));
 }

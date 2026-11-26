@@ -25,7 +25,7 @@ use windows::core::PCSTR;
 
 use super::{Shader, Translated, fallback};
 use crate::caps::{
-    Caps, Refusal, WaveNeed, WavePlan, aniso_point_mip, atomics64_heap, mesh_shaders, wave_plan,
+    Caps, Refusal, WaveNeed, WavePlan, aniso_point_mip, atomics64_heap, heap_indexing, mesh_shaders, wave_plan,
 };
 use crate::host::host;
 
@@ -455,6 +455,14 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        // Every translated stage indexes the heaps; the start log has the
+        // device's figures.
+        if heap_indexing(&host.caps).is_err() {
+            return refuse(
+                "the host GPU lacks heap-indexed descriptors (shader model 6.6 and resource binding tier 3)",
+                shaders,
+            );
+        }
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
             let Some(t) = s.translated() else {
@@ -1069,6 +1077,11 @@ mod tests {
         assert!(r.contains("64 to 64") && r.contains("32 to 32"), "{r}");
         assert!(wave_refusal(&turing, &wave32).is_none());
         assert!(wave_refusal(&turing, &any).is_none());
+        // Every NVIDIA class runs waves of 32 only.
+        for caps in reference::nvidia_generations().into_iter().chain([reference::nvidia_maxwell1()]) {
+            assert!(wave_refusal(&caps, &wave64).is_some(), "{}", caps.adapter.name);
+            assert!(wave_refusal(&caps, &wave32).is_none() && wave_refusal(&caps, &any).is_none());
+        }
         // Wave64 only: the mirror image.
         assert!(wave_refusal(&gcn, &wave64).is_none());
         assert!(wave_refusal(&gcn, &wave32).is_some());

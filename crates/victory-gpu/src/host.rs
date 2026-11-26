@@ -312,8 +312,11 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 /// The device's figures for the run digest, and the paths they decide.
 fn log_caps(caps: &crate::caps::Caps) {
-    use crate::caps::{atomics64_heap, mesh_shaders, min_lod_clamp};
+    use crate::caps::{atomics64_heap, heap_indexing, mesh_shaders, min_lod_clamp};
     tracing::info!("host D3D12 caps: {}", caps.digest());
+    if let Err(refusal) = heap_indexing(caps) {
+        tracing::error!("{refusal}: no translated shader can run");
+    }
     let mesh = mesh_shaders(caps);
     tracing::info!(mesh, emulated = !mesh, "host mesh shader support");
     tracing::info!(clamp = min_lod_clamp(caps), "host least-level clamp support");

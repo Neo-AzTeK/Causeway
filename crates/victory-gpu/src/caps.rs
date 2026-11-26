@@ -37,8 +37,8 @@ mod tests;
 
 pub use planner::{
     BindingClass, BindingPlan, BudgetSource, FALLBACK_BUDGET, MemoryPlan, WaveNeed, WavePlan, aniso_point_mip,
-    atomics64_heap, binding_plan, format_choice, memory_plan, mesh_shaders, min_lod_clamp, wave64_native,
-    wave_plan,
+    atomics64_heap, binding_plan, format_choice, heap_indexing, memory_plan, mesh_shaders, min_lod_clamp,
+    wave64_native, wave_plan,
 };
 
 use std::collections::BTreeMap;
