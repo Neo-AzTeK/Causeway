@@ -1,7 +1,8 @@
 # Problem sessions
 
-One session takes one overall problem and keeps it until it is 100% fixed.
-Several run side by side. The ranked list is `docs/problems.md`. Start one by
+Optional: by default one main session does the work (`docs/agent-workflow.md`).
+These rules apply when a problem is handed to a separate session, which keeps
+it until it is 100% fixed. The ranked list is `docs/problems.md`. Start one by
 telling a new session:
 
     /problem-session <id>

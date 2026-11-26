@@ -30,8 +30,8 @@ driver change).
 - When its checks pass, ask the owner. Merge into `main` only on their explicit
   yes, and push only with their OK. Never force-push or rewrite `main`. Open
   PRs only when the owner asks.
-- A game problem is owned by one problem session until fixed, with a stricter
-  bar for "done": `docs/problem-sessions.md`.
+- A game problem handed to a separate session is owned by it until fixed, with
+  a stricter bar for "done": `docs/problem-sessions.md`.
 - Mark a deliberate simplification `// shortcut:` with its limit.
 - A new dependency needs a measured gain or a correctness reason, and a
   GPL-3.0-compatible licence.
