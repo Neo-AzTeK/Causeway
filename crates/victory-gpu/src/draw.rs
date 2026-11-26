@@ -1539,8 +1539,13 @@ impl State {
                     ranges.iter().zip(&title).map(|(&(o, _), b)| format!("+{o:#x}:{}", words(b))).collect();
                 let (s, w, t2) = (shadow.clone(), who.clone(), t2.join(" "));
                 list.defer_host(move || {
-                    let copy: Vec<Vec<u8>> =
-                        ranges.iter().map(|&(o, n)| s.peek_bytes(at + off + o, n)).collect();
+                    let Some(copy) = ranges
+                        .iter()
+                        .map(|&(o, n)| s.peek_bytes(at + off + o, n))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return;
+                    };
                     if big && !past && !title_big && !counts(&copy).iter().any(|&c| c > 4096) {
                         return;
                     }

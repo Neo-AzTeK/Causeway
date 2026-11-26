@@ -788,7 +788,11 @@ fn a_do_while_in_a_lane_mask_runs_that_many_times_in_the_lanes_inside() {
 #[test]
 fn a_do_while_runs_that_many_times_in_wave64() {
     let body = counted_loop(0xBE8C_0386); // s_mov_b32 s12, 6
-    if let Some(got) = on_waves_of_32(&body, 64) {
-        assert_eq!(got, [6; 64]);
-    }
+    // Translation and validation always; execution needs a host with waves of
+    // 32 (WARP, and so `VICTORY_WARP=1`, has none).
+    let Some(got) = on_waves_of_32(&body, 64) else {
+        eprintln!("not executed: no host with waves of 32 (translated and validated only)");
+        return;
+    };
+    assert_eq!(got, [6; 64]);
 }
