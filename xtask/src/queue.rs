@@ -323,7 +323,8 @@ impl Request {
 
     /// What the disk must show: the worktree is one of this repository's, at
     /// the commit, with nothing tracked changed (the run would not be of the
-    /// commit), and the baseline and the run's folder are as they should be.
+    /// commit), and the run's folder is new. Not the baseline: a run without
+    /// one is still a run (see `missing_baseline`).
     fn check(&self, root: &Path, dirs: &Dirs) -> Result<()> {
         let listed = git(root, &["worktree", "list", "--porcelain"])?;
         let known = listed
@@ -351,10 +352,6 @@ impl Request {
         );
         let dirty = git(&self.worktree, &["status", "--porcelain", "--untracked-files=no"])?;
         ensure!(dirty.is_empty(), "the worktree has uncommitted changes: commit them first");
-        if let Some(b) = self.baseline.as_deref().filter(|b| plain_name(b)) {
-            let json = dirs.runs.join(b).join("report.json");
-            ensure!(json.is_file(), "baseline {b}: no {}", json.display());
-        }
         ensure!(!dirs.runs.join(&self.name).exists(), "{} exists already", dirs.runs.join(&self.name).display());
         Ok(())
     }
@@ -412,6 +409,12 @@ fn add_request(root: &Path, dirs: &Dirs, add: &Add) -> Result<()> {
     let text = request.to_toml();
     let request = Request::parse(&text)?;
     request.check(root, dirs)?;
+    if let Some(b) = request.baseline.as_deref().filter(|b| plain_name(b)) {
+        ensure!(
+            baseline_can_exist(dirs, b),
+            "baseline {b}: it has no report.json, and no run of that name is queued or running"
+        );
+    }
     fs::create_dir_all(&dirs.queue).with_context(|| format!("creating {}", dirs.queue.display()))?;
     publish(dirs, &request.name, &text)?;
     let done = dirs.file(&request.name, "done");
@@ -455,8 +458,13 @@ fn publish(dirs: &Dirs, name: &str, text: &str) -> Result<()> {
 fn write_done(dirs: &Dirs, name: &str, exit: i64, digest: Option<&Path>, error: Option<&str>) -> Result<()> {
     let mut table = toml::Table::new();
     table.insert("name".into(), name.to_owned().into());
-    if let Some(who) = requester_of(dirs, name) {
-        table.insert("requester".into(), who.into());
+    if let Some(request) = request_of(dirs, name) {
+        if let Some(warning) = missing_baseline(dirs, &request) {
+            table.insert("warning".into(), warning.into());
+        }
+        if let Some(who) = request.requester {
+            table.insert("requester".into(), who.into());
+        }
     }
     table.insert("exit".into(), exit.into());
     table.insert("finished_unix".into(), (unix_now() as i64).into());
@@ -591,6 +599,9 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
                 ensure!(request.name == name, "the request names {}, its file {name}", request.name);
                 request.check(root, dirs)?;
                 println!("runner: start {name} ({})", length(&request));
+                if let Some(warning) = missing_baseline(dirs, &request) {
+                    println!("runner: {name}: {warning}");
+                }
                 let mut window = Window::new(dirs.runs.join(&request.name).join("log.txt"));
                 launch(dirs, &request, &args.exe, || {
                     let open = window.open(unix_now() as f64);
@@ -864,10 +875,27 @@ fn launch(
     Ok(Ran::Exit(code))
 }
 
-/// The session a request names, if its file reads.
-fn requester_of(dirs: &Dirs, name: &str) -> Option<String> {
+/// A queued request as its file reads, if it does.
+fn request_of(dirs: &Dirs, name: &str) -> Option<Request> {
     let text = fs::read_to_string(dirs.file(name, "toml")).ok()?;
-    Request::parse(&text).ok()?.requester
+    Request::parse(&text).ok()
+}
+
+/// What to say of a baseline named by a run that has no report (it was
+/// refused, or failed before one). The digest then has no delta, and says so.
+fn missing_baseline(dirs: &Dirs, request: &Request) -> Option<String> {
+    let name = request.baseline.as_deref().filter(|b| plain_name(b))?;
+    let json = dirs.runs.join(name).join("report.json");
+    (!json.is_file()).then(|| {
+        format!("baseline {name} has no report.json: the digest has no comparison with it")
+    })
+}
+
+/// A baseline worth asking for: a run with a report, or one queued or running
+/// that will make it. Anything else is a mistake to tell at `add`.
+fn baseline_can_exist(dirs: &Dirs, name: &str) -> bool {
+    dirs.runs.join(name).join("report.json").is_file()
+        || dirs.file(name, "toml").is_file() && !dirs.file(name, "done").exists()
 }
 
 fn status(dirs: &Dirs) -> Result<()> {
@@ -1055,6 +1083,32 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
         assert_eq!(done["requester"].as_str(), Some("local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"));
         assert_eq!(done["exit"].as_integer(), Some(0));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_baseline_is_a_warning_not_a_refusal() {
+        let dirs = scratch("baseline");
+        let name = "mesh-emu-8";
+        fs::write(dirs.file(name, "toml"), GOOD).unwrap();
+        // Neither a report nor a run to come: a mistake at `add`.
+        assert!(!baseline_can_exist(&dirs, "smoke-16"));
+        // Queued, it can; once done without a report, it never will.
+        fs::write(dirs.file("smoke-16", "toml"), "x").unwrap();
+        assert!(baseline_can_exist(&dirs, "smoke-16"));
+        fs::write(dirs.file("smoke-16", "done"), "exit = -1\n").unwrap();
+        assert!(!baseline_can_exist(&dirs, "smoke-16"));
+        // The run that named it goes on, and its .done says what it lacks.
+        write_done(&dirs, name, 0, None, None).unwrap();
+        let warned = done(&dirs, name);
+        assert_eq!(warned["exit"].as_integer(), Some(0));
+        assert!(warned["warning"].as_str().unwrap().starts_with("baseline smoke-16 has no"));
+        // With the report, there is nothing to warn of.
+        fs::create_dir_all(dirs.runs.join("smoke-16")).unwrap();
+        fs::write(dirs.runs.join("smoke-16").join("report.json"), "{}").unwrap();
+        assert!(baseline_can_exist(&dirs, "smoke-16"));
+        write_done(&dirs, name, 0, None, None).unwrap();
+        assert!(!done(&dirs, name).contains_key("warning"));
+        fs::remove_dir_all(&dirs.queue).unwrap();
     }
 
     /// A queue folder of its own for one test.

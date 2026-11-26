@@ -94,7 +94,10 @@ by default; the runner refuses a worktree at another commit, with uncommitted
 tracked changes, or that `git worktree list` does not show), `seconds`, `world_lines`
 (`--world-lines`; the worktree's own `xtask` must know it), `env`
 (`VICTORY_*` only), `baseline` (a run's name, or an absolute `report.json`),
-`requester`, and `data_dir`, `data_from`, `keys`. Any other field, or a switch
+`requester`, and `data_dir`, `data_from`, `keys`. A baseline named by run must
+have a report, or be queued or running (`add` refuses it otherwise); if it still
+has none when this run's turn comes, the run goes on and its `.done` has a
+`warning`. Any other field, or a switch
 that is not `VICTORY_*`, refuses the request; `--accept-terms` is not one. `run`
 takes the oldest request and runs exactly `cargo xtask smoke --exe <its --exe> --out
 <runs>\<name> ...` in that worktree, one at a time (a runner holds `runner.lock`
