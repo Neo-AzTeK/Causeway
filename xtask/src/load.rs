@@ -2,7 +2,10 @@
 //! things compile reads slower, and its pipelines are still being made or are
 //! refused when it draws. So a run waits for a quiet machine before it starts
 //! the title, records what processes other than the title use while it plays,
-//! and is marked busy when that was much over the lines measured.
+//! and is marked busy when that was much over the lines measured. A quiet
+//! machine also has memory to spare: the title holds about 32 GB private, and a
+//! run that starts with less reads its files from disk and never reaches the
+//! world (the report calls that STARVED).
 //!
 //! "Other" is the system's busy time less the title's own (its job's), so a
 //! title that fills the processor by itself is not "busy".
@@ -19,6 +22,12 @@ pub const FILE: &str = "load.txt";
 /// running, for `QUIET_FOR`.
 const QUIET_CPU: f64 = 30.0;
 const QUIET_FOR: Duration = Duration::from_secs(20);
+/// ... and has this much memory free, in GB: commit (what the system can still
+/// promise) and physical RAM (what keeps the pipeline library and the packs in
+/// the page cache). The title holds ~32 GB private; runs that began with free
+/// RAM near 1 GB and free commit near 2 GB were starved. 0 asks for none.
+pub const QUIET_COMMIT_GB: u64 = 12;
+pub const QUIET_RAM_GB: u64 = 4;
 /// A look is busy when processes other than the title use more than this
 /// percent of all cores; a run is when more than `BUSY_PART` of its looks are,
 /// where the medians and spreads that `compare` reads start to move.
@@ -55,6 +64,59 @@ pub fn system_times() -> Option<Times> {
 
 #[cfg(not(windows))]
 pub fn system_times() -> Option<Times> {
+    None
+}
+
+/// Memory the machine has free, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Free {
+    /// Commit not yet promised: the limit less what is committed.
+    pub commit: u64,
+    /// Physical RAM that is available.
+    pub ram: u64,
+}
+
+/// How much free memory a quiet machine has, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Need {
+    pub commit: u64,
+    pub ram: u64,
+}
+
+const GB: u64 = 1 << 30;
+
+impl Need {
+    pub const fn gb(commit: u64, ram: u64) -> Need {
+        Need { commit: commit * GB, ram: ram * GB }
+    }
+
+    /// Whether `free` has that much. A machine that does not say is not
+    /// refused: the wait looks at what it can.
+    pub fn met(self, free: Option<Free>) -> bool {
+        free.is_none_or(|f| f.commit >= self.commit && f.ram >= self.ram)
+    }
+}
+
+impl std::fmt::Display for Free {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gb = |bytes: u64| bytes as f64 / GB as f64;
+        write!(f, "{:.1} GB commit and {:.1} GB RAM free", gb(self.commit), gb(self.ram))
+    }
+}
+
+#[cfg(windows)]
+pub fn free_memory() -> Option<Free> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // SAFETY: a structure that says its size, which the call fills.
+    let read = unsafe { GlobalMemoryStatusEx(&mut status) };
+    // The page file's figure is what this process can still commit: the
+    // system's available commit, less any job limit (none on a smoke run).
+    (read != 0).then_some(Free { commit: status.ullAvailPageFile, ram: status.ullAvailPhys })
+}
+
+#[cfg(not(windows))]
+pub fn free_memory() -> Option<Free> {
     None
 }
 
@@ -139,13 +201,13 @@ pub struct Wait {
 }
 
 /// Waits until `look` (the time waited so far, the processor's percent since
-/// the look before, the compilers running) has been quiet for `QUIET_FOR`, or
-/// `cap` has passed. `look` does the pausing.
-fn wait_for(cap: Duration, mut look: impl FnMut() -> (Duration, f64, usize)) -> Wait {
+/// the look before, the compilers running, whether the free memory is enough)
+/// has been quiet for `QUIET_FOR`, or `cap` has passed. `look` does the pausing.
+fn wait_for(cap: Duration, mut look: impl FnMut() -> (Duration, f64, usize, bool)) -> Wait {
     let mut since = None;
     loop {
-        let (waited, cpu, compilers) = look();
-        if cpu >= QUIET_CPU || compilers > 0 {
+        let (waited, cpu, compilers, roomy) = look();
+        if cpu >= QUIET_CPU || compilers > 0 || !roomy {
             since = None;
         } else if waited - *since.get_or_insert(waited) >= QUIET_FOR {
             return Wait { seconds: waited.as_secs(), quiet: true };
@@ -156,9 +218,9 @@ fn wait_for(cap: Duration, mut look: impl FnMut() -> (Duration, f64, usize)) -> 
     }
 }
 
-/// `wait_for` on this machine, looked at every `every`. `None`: the machine
-/// does not say how busy it is.
-pub fn wait_quiet(cap: Duration, every: Duration) -> Option<Wait> {
+/// `wait_for` on this machine, looked at every `every`, with `need` free
+/// memory. `None`: the machine does not say how busy it is.
+pub fn wait_quiet(cap: Duration, every: Duration, need: Need) -> Option<Wait> {
     let mut last = system_times()?;
     let start = Instant::now();
     let mut said = Instant::now();
@@ -169,13 +231,15 @@ pub fn wait_quiet(cap: Duration, every: Duration) -> Option<Wait> {
         let cpu = now.busy.saturating_sub(last.busy) as f64 * 100.0 / all as f64;
         last = now;
         let compilers = compilers_running();
+        let free = free_memory();
         if said.elapsed() >= Duration::from_secs(30) {
             said = Instant::now();
+            let memory = free.map_or(String::new(), |f| format!(", {f}"));
             println!(
-                "waiting for a quiet machine: {cpu:.0}% of the CPU, {compilers} compilers running"
+                "waiting for a quiet machine: {cpu:.0}% of the CPU, {compilers} compilers running{memory}"
             );
         }
-        (start.elapsed(), cpu, compilers)
+        (start.elapsed(), cpu, compilers, need.met(free))
     }))
 }
 
@@ -309,14 +373,23 @@ mod tests {
         Duration::from_secs(n)
     }
 
-    /// A wait over looks every 2 s, each `(cpu, compilers)` from `at`.
+    /// A wait over looks every 2 s, each `(cpu, compilers)` from `at`, with
+    /// the memory free.
     fn waited(cap: u64, at: impl Fn(u64) -> (f64, usize)) -> Wait {
+        waited_with(cap, at, |_| true)
+    }
+
+    fn waited_with(cap: u64, at: impl Fn(u64) -> (f64, usize), roomy: impl Fn(u64) -> bool) -> Wait {
         let mut now = 0;
         wait_for(secs(cap), || {
             now += 2;
             let (cpu, compilers) = at(now);
-            (secs(now), cpu, compilers)
+            (secs(now), cpu, compilers, roomy(now))
         })
+    }
+
+    const fn free(commit_gb: u64, ram_gb: u64) -> Option<Free> {
+        Some(Free { commit: commit_gb * GB, ram: ram_gb * GB })
     }
 
     #[test]
@@ -334,6 +407,24 @@ mod tests {
         // A spike starts the twenty seconds again.
         let spike = |t| if t == 16 { (80.0, 0) } else { (5.0, 0) };
         assert_eq!(waited(600, spike).seconds, 38);
+    }
+
+    #[test]
+    fn a_quiet_machine_has_memory_to_spare() {
+        let need = Need::gb(QUIET_COMMIT_GB, QUIET_RAM_GB);
+        // The runs that never reached the world: 1.6 GB of commit, 0.6 GB of RAM.
+        assert!(!need.met(Some(Free { commit: GB * 16 / 10, ram: GB * 6 / 10 })));
+        // Each limit alone refuses, and the limits themselves are enough.
+        assert!(!need.met(free(11, 8)) && !need.met(free(30, 3)));
+        assert!(need.met(free(12, 4)) && need.met(free(40, 20)));
+        // A machine that does not say is not refused; 0 asks for nothing.
+        assert!(need.met(None));
+        assert!(Need::gb(0, 0).met(free(0, 0)));
+        // Memory held to 100 s: quiet 20 s after it is freed.
+        let held = |t| t > 100;
+        assert_eq!(waited_with(600, |_| (5.0, 0), held), Wait { seconds: 122, quiet: true });
+        // Never freed: the wait ends at its cap, started anyway.
+        assert_eq!(waited_with(60, |_| (5.0, 0), |_| false), Wait { seconds: 60, quiet: false });
     }
 
     #[test]
@@ -429,7 +520,12 @@ mod tests {
         assert!(then.all > first.all && then.busy <= then.all);
         compilers_running();
         // A cap shorter than the quiet it wants ends the wait.
-        let wait = wait_quiet(Duration::from_secs(1), Duration::from_millis(100)).unwrap();
+        let wait =
+            wait_quiet(Duration::from_secs(1), Duration::from_millis(100), Need::gb(0, 0)).unwrap();
         assert!(!wait.quiet, "{wait:?}");
+        // Windows says its memory: some is free, and no machine has 1 PB free.
+        let free = free_memory().unwrap();
+        assert!(free.ram > 0 && free.commit > 0, "{free:?}");
+        assert!(Need::gb(0, 0).met(Some(free)) && !Need::gb(1 << 20, 0).met(Some(free)));
     }
 }

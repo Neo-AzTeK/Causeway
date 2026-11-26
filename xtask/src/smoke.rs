@@ -34,10 +34,18 @@ pub struct Smoke {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=100000))]
     world_lines: Option<u64>,
     /// Before the title starts, waits at most this long for a quiet machine
-    /// (no compiler running and under 30% of the CPU for 20 s); 0 starts at
+    /// (no compiler running, under 30% of the CPU and enough free memory, see
+    /// --quiet-commit-gb and --quiet-ram-gb, for 20 s); 0 starts at
     /// once. What other processes use while it plays goes to `load.txt`.
     #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=86400))]
     quiet_wait: u64,
+    /// A quiet machine also has this much commit free, in GB (what the system
+    /// can still promise; the title holds ~32 GB private); 0 asks for none.
+    #[arg(long, default_value_t = load::QUIET_COMMIT_GB, value_parser = clap::value_parser!(u64).range(0..=4096))]
+    quiet_commit_gb: u64,
+    /// ... and this much physical RAM free, in GB; 0 asks for none.
+    #[arg(long, default_value_t = load::QUIET_RAM_GB, value_parser = clap::value_parser!(u64).range(0..=4096))]
+    quiet_ram_gb: u64,
     /// The title's saves and settings; a folder in --out by default, so
     /// every run goes through the first-start menus (see --accept-terms).
     #[arg(long)]
@@ -245,7 +253,8 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         0 => None,
         cap => {
             println!("waiting for a quiet machine ({cap} s at most)");
-            let wait = load::wait_quiet(Duration::from_secs(cap), LOOK);
+            let need = load::Need::gb(args.quiet_commit_gb, args.quiet_ram_gb);
+            let wait = load::wait_quiet(Duration::from_secs(cap), LOOK, need);
             if let Some(w) = wait {
                 let how = if w.quiet { "quiet" } else { "never quiet, starting anyway" };
                 println!("{how} after {} s", w.seconds);
@@ -775,6 +784,8 @@ mod tests {
             seconds: 1,
             world_lines: None,
             quiet_wait: 0,
+            quiet_commit_gb: 0,
+            quiet_ram_gb: 0,
             data_dir: None,
             data_from: None,
             accept_terms: false,

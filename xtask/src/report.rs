@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 mod digest;
 pub use digest::{Baseline, Context, read_baseline};
 mod series;
+mod starve;
 pub use series::Series;
 pub mod sheet;
 
@@ -228,6 +229,7 @@ pub struct Log {
     switches: Option<Vec<(String, String)>>,
     blocks: Vec<DropBlock>,
     journal: Vec<String>,
+    starve: starve::Starve,
 }
 
 /// One log interval's dropped draws: when it was in the world, the counts
@@ -354,7 +356,15 @@ impl Log {
         Area { name: STEADY_AREA, status, detail }
     }
 
+    /// Why the machine looks starved (memory short: the same work takes far
+    /// longer on the clock), or `None`. Such a run says nothing about the code.
+    pub fn starved(&self) -> Option<String> {
+        let signs = self.starve.signs();
+        (!signs.is_empty()).then(|| signs.join("; "))
+    }
+
     fn line(&mut self, line: &str) {
+        self.starve.read(line);
         if self.journal.len() < 20 && (line.contains("DRED") || line.contains("removal journal")) {
             self.journal.push(clip(line));
         }
@@ -528,7 +538,14 @@ impl Log {
                 format!("at {}, {} lines (inferred from draw counts)", r.time, world.len()),
             ),
             None if self.rates.is_empty() => (Status::Unknown, "no frame-rate lines".into()),
-            None => (Status::Fail, format!("at most {most:.0} draws/frame asked for")),
+            None => {
+                // A starved run never reached the world for want of memory,
+                // not for what the code does: it is run again, not debugged.
+                let why = self
+                    .starved()
+                    .map_or(String::new(), |s| format!("STARVED machine, rerun on a quiet machine ({s}); "));
+                (Status::Fail, format!("{why}at most {most:.0} draws/frame asked for"))
+            }
         });
 
         add("hang", match silence {
@@ -1081,6 +1098,32 @@ mod tests {
         for a in judge("", None) {
             assert_eq!(a.status, Status::Unknown, "{}", a.name);
         }
+    }
+
+    fn slow_library() -> String {
+        gpu("INFO", "pipeline::library: host pipeline library loaded bytes=396681626 ms=2679")
+    }
+
+    #[test]
+    fn a_starved_run_without_a_world_says_to_rerun_it() {
+        let menus = rate(30.0, 39, 0, 0).repeat(9);
+        let world = |text: &str| judge(text, None).into_iter().find(|a| a.name == "world reached").unwrap();
+        let quiet = world(&menus);
+        assert_eq!(quiet.status, Status::Fail);
+        assert!(!quiet.detail.contains("STARVED"), "{}", quiet.detail);
+        // The same log with a library read from disk: still a failure, now with its cause.
+        let starved = world(&(slow_library() + &menus));
+        assert_eq!(starved.status, Status::Fail);
+        assert!(
+            starved.detail.starts_with("STARVED machine, rerun on a quiet machine (pipeline library load took 2679 ms"),
+            "{}",
+            starved.detail
+        );
+        assert!(starved.detail.ends_with("at most 39 draws/frame asked for"), "{}", starved.detail);
+        // A world that was reached is not called starved away.
+        let reached = world(&(slow_library() + &healthy()));
+        assert_eq!(reached.status, Status::Pass);
+        assert!(!reached.detail.contains("STARVED"), "{}", reached.detail);
     }
 
     #[test]

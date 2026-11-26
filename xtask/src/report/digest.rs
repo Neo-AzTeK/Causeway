@@ -474,6 +474,16 @@ impl Log {
             stability: bool,
         }
         let mut items = Vec::new();
+        // First: whatever else this log says was measured on a starved machine.
+        if let Some(signs) = self.starved() {
+            items.push(Item {
+                text: format!("STARVED machine, rerun on a quiet machine: {}", cut(&signs, 90)),
+                area: "machine (memory)".into(),
+                draws: 0.0,
+                frames: 0,
+                stability: true,
+            });
+        }
         for a in areas.iter().filter(|a| {
             a.status == Status::Fail
                 && ["crash", "hang", "device removed", "host GPU failure"].contains(&a.name)
@@ -666,6 +676,24 @@ mod tests {
         let d = digest(&text, &ctx(&[], Baseline::Off));
         let next: Vec<&str> = d.lines().skip_while(|l| !l.starts_with("## 8")).collect();
         assert!(next[2].starts_with("1. [stability"), "{d}");
+    }
+
+    #[test]
+    fn a_starved_run_is_to_be_rerun_before_anything_else() {
+        let slow = format!(
+            "{T}  INFO victory_gpu::pipeline::library: host pipeline library loaded bytes=1 ms=2679\n"
+        );
+        let text = slow + &window(&[("being made", 5.0)]);
+        let d = digest(&text, &ctx(&[], Baseline::Off));
+        let next: Vec<&str> = d.lines().skip_while(|l| !l.starts_with("## 8")).collect();
+        assert!(
+            next[2].starts_with("1. [machine (memory)] STARVED machine, rerun on a quiet machine: pipeline library"),
+            "{d}"
+        );
+        assert!(next[3].starts_with("2. "), "{d}");
+        // A quiet machine's log has no such line.
+        let quiet = digest(&window(&[("being made", 5.0)]), &ctx(&[], Baseline::Off));
+        assert!(!quiet.contains("STARVED"), "{quiet}");
     }
 
     #[test]

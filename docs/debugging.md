@@ -53,8 +53,17 @@ of the time; `--seconds` stays the cap, and a run that ends short of `n` fails t
 A run measured on a busy machine reads slower and can lose draws to pipelines
 still being made. So after its build, a run waits for a quiet machine before it
 starts the title: no compiler or linker running (`rustc`, `clippy-driver`, `link`,
-`rust-lld`, `cl`) and under 30% of all cores for 20 s, for 600 s at most
-(`--quiet-wait`; 0 starts at once; `log.txt` is made when the title starts). While
+`rust-lld`, `cl`), under 30% of all cores, at least 12 GB of commit free and at
+least 4 GB of RAM free (`--quiet-commit-gb`, `--quiet-ram-gb`; 0 asks for none;
+the title holds ~32 GB private), all for 20 s, for 600 s at most
+(`--quiet-wait`; 0 starts at once; `log.txt` is made when the title starts). A
+machine short of memory is *starved*: the title boots, translates and loads at
+a crawl and may never reach the world. The report reads that from the log (the
+pipeline library load over 1000 ms against 30 ms, cached shader translations
+that take 20 times their CPU time on the clock, or the story000 pack opened over
+120 s after boot) and then says **STARVED machine, rerun on a quiet machine**:
+in "world reached" when there is no world, and first in the digest's "Next". Such
+a run is run again, not debugged. While
 the title plays it records in `load.txt`, every 2 s, the CPU in all, the CPU of
 processes other than the title's (the system's busy time less the title's job),
 and the compilers running. The "machine load" area gives the wait, the load over
