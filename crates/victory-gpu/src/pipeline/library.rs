@@ -22,7 +22,7 @@
 //! The library is free-threaded but for loads of one pipeline on several
 //! threads (`ID3D12Device1::CreatePipelineLibrary`, "Thread Safety"), so
 //! pipelines of different names load at the same time. A load is not always
-//! quick: the library of an AMD driver holds about 140 bytes per pipeline,
+//! quick: the library of an AMD driver, as seen, holds about 140 bytes per pipeline,
 //! and what its own cache lacks is compiled inside the load, for seconds.
 //! Loaded one at a time, 650 pipelines kept the eight workers to one core
 //! for minutes, while each title frame could wait out its 500 ms for

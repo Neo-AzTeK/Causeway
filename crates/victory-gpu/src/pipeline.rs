@@ -3,15 +3,16 @@
 //! carry the rest of the graphics state as subobjects of the standard
 //! types.
 //!
-//! Host pipelines are made on a pipeline's first draw, not at creation:
+//! Host pipelines are made on a pipeline's first draw, not at creation (or at
+//! creation if an earlier run drew with it, see [`make`]):
 //! The title creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
+//! shortcut: stream pipelines of vertex or mesh plus pixel stages, and compute
+//! pipelines, get host pipelines (`host` refuses other stages); the plain
+//! graphics description keeps its containers only. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]

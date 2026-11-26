@@ -312,8 +312,9 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            // shortcut: every use of every format; answer from the host
-            // device once there is one.
+            // shortcut: every use of every format; answer from the host's
+            // support (`caps::per_resource`) if a title depends on a use
+            // being refused.
             q[1] = 0x7fff_ffff;
             q[2] = 0xffff;
             S_OK

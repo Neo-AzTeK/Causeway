@@ -5,7 +5,7 @@
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
 //!
-//! Emulated mesh pipelines (added 2026-11-25): where the host has no mesh
+//! Emulated mesh pipelines: where the host has no mesh
 //! shaders (`caps::mesh_shaders`), a title mesh pipeline is
 //! two host pipelines ([`EmulatedMesh`]): the mesh program made as compute,
 //! which writes its vertices and triangles to scratch buffers, and a
@@ -1211,12 +1211,12 @@ mod tests {
         let mut rdna = reference::amd_rdna();
         let mut unknown = reference::amd_rdna();
         unknown.wave = None;
-        // The owner's wave32-only card: as before, wave64 is refused.
+        // A wave32-only host: wave64 is refused.
         let r = wave_refusal(&turing, &wave64).expect("refused").to_string();
         assert!(r.contains("64 to 64") && r.contains("32 to 32"), "{r}");
         assert!(wave_refusal(&turing, &wave32).is_none());
         assert!(wave_refusal(&turing, &any).is_none());
-        // Every NVIDIA class runs waves of 32 only.
+        // As is every NVIDIA fake in `caps::reference` (waves of 32 only).
         for caps in reference::nvidia_generations().into_iter().chain([reference::nvidia_maxwell1()]) {
             assert!(wave_refusal(&caps, &wave64).is_some(), "{}", caps.adapter.name);
             assert!(wave_refusal(&caps, &wave32).is_none() && wave_refusal(&caps, &any).is_none());
@@ -1260,9 +1260,9 @@ mod tests {
         state.elements().iter().map(|e| e.offset).collect()
     }
 
-    /// An appended element after one of 1 or 2 bytes started right after
-    /// it; D3D12 aligns it to min(4, its size), so the rectangle expansion
-    /// read its vertices from the wrong bytes.
+    /// D3D12 aligns an appended element after one of 1 or 2 bytes to
+    /// min(4, its size); starting it right after would make the rectangle
+    /// expansion read its vertices from the wrong bytes.
     #[test]
     fn appended_elements_are_aligned() {
         const APPEND: u32 = D3D12_APPEND_ALIGNED_ELEMENT;
@@ -1288,8 +1288,8 @@ mod tests {
         assert_eq!(offsets(&c), [0, 4, 12]);
     }
 
-    /// An explicit offset near 4 GiB overflowed the next appended offset
-    /// (a panic in debug builds).
+    /// An explicit offset near 4 GiB must not overflow the next appended
+    /// offset (a panic in debug builds).
     #[test]
     fn a_huge_explicit_offset_does_not_overflow() {
         let inputs = [

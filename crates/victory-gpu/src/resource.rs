@@ -750,8 +750,8 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
-    /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// A texture's host copy (decision 0007). A buffer has none here:
+    /// `crate::shadow` makes and keeps buffers' copies on use.
     #[cfg(windows)]
     host: Option<std::sync::Arc<HostTexture>>,
 }
@@ -1256,8 +1256,8 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 const TARGET: u32 = 1;
 
 /// `flags` without the uses the host has no support for in `format`: the
-/// console renders to and writes formats a PC GPU may only sample (NVIDIA:
-/// no unordered access to B5G5R5A1, no rendering to B4G4R4A4), and the host
+/// console renders to and writes formats a PC GPU may only sample (seen on
+/// NVIDIA: no unordered access to B5G5R5A1, no rendering to B4G4R4A4), and the host
 /// refuses a texture that asks for one. Typeless formats are left alone:
 /// their views name the format.
 /// shortcut: what the title does through a use left out is lost; a copy in
@@ -1341,7 +1341,7 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
-    // Without the uses the host lacks in this format (NVIDIA).
+    // Without the uses the host lacks in this format.
     if let Some(host) = crate::host::host() {
         d.flags = supported_flags(&host.device, d.format, d.flags);
     }
@@ -1753,8 +1753,8 @@ impl Drop for Resource {
             .as_ref()
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
-            // Before lists held their textures, this freed a texture that
-            // lists not yet run still named (a GPU page fault).
+            // Counted, not a fault: the lists hold the host copy, which
+            // keeps it alive (freed while named, it is a GPU page fault).
             static OUTLIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = OUTLIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if n.is_power_of_two() {

@@ -9,7 +9,7 @@
 //!
 //! A first use queues the pipeline and waits for it within a budget per
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
-//! bake) are there at once as before; past the budget a draw or dispatch
+//! bake) are there at once; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
