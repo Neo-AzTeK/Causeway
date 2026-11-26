@@ -858,7 +858,7 @@ fn two_halves_with_lds(body: &[u32], threads: u32) -> Option<Vec<u32>> {
         return None;
     }
     let dummy = [[0.0f32; 4]];
-    let views = [View::Texture(1, 1, &dummy), View::RawUav(64)];
+    let views = [View::Texture(1, 1, &dummy), View::RawUav(threads.max(64))];
     let mut out = run_on(&shader, &views, &[("hardware", false)]);
     Some(out.remove(0).1.remove(0)[..threads as usize].to_vec())
 }
@@ -1199,5 +1199,192 @@ fn a_wave64_first_lane_read_is_the_console_waves_first() {
         if let Some(got) = on_waves_of_32(&body, threads) {
             assert_eq!(got, vec![5; threads as usize], "{threads} threads");
         }
+    }
+}
+
+#[test]
+fn a_wave_of_a_wider_group_skips_a_block_another_runs() {
+    // Only the first console wave takes the block: it exchanges through LDS
+    // within itself and sets s14. The others keep v8 and s14 as they were.
+    for threads in [128u32, 96] {
+        let body = [
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0x3A22_00BF, // v_xor_b32 v17, 63, v0
+            0x3422_2282, // v_lshlrev_b32 v17, 2, v17
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0xBE8E_0380, // s_mov_b32 s14, 0
+            0x7D88_00C0, // v_cmp_gt_u32 vcc, 64, v0
+            0xBF86_0006, // s_cbranch_vccz past the block
+            0xD834_0000,
+            0x0000_0110, // ds_write_b32 v16, v1
+            0xD8D8_0000,
+            0x0800_0011, // ds_read_b32 v8, v17
+            0xD760_000E,
+            0x0001_0101, // v_readlane_b32 s14, v1, 0 (1: lane 0)
+            0x4A10_100E, // v_add_nc_u32 v8, s14, v8
+        ];
+        if let Some(got) = two_halves_with_lds(&body, threads) {
+            let want: Vec<u32> = (0..threads)
+                .map(|l| if l < 64 { (l ^ 63) + 1 + 1 } else { 0 })
+                .collect();
+            assert_eq!(got, want, "{threads} threads");
+        }
+    }
+}
+
+/// s19 += s18: what the lane read in a loop gives, 64 × the wave.
+const LANE_SUM: u32 = 0x8113_1213; // s_add_i32 s19, s19, s18
+const ADD_LANE_SUM: u32 = 0x4A10_1013; // v_add_nc_u32 v8, s19, v8
+
+/// v8 = 0, s14 = the console wave's number + 1, s15 = s16 = s19 = s20 = 0.
+const TRIPS: [u32; 9] = [
+    0x7E10_0280, // v_mov_b32 v8, 0
+    0xD760_000E,
+    0x0001_0100, // v_readlane_b32 s14, v0, 0 (which makes two halves)
+    0x900E_860E, // s_lshr_b32 s14, s14, 6
+    0x810E_810E, // s_add_i32 s14, s14, 1
+    0xBE8F_0380, // s_mov_b32 s15, 0
+    0xBE90_0380, // s_mov_b32 s16, 0
+    0xBE94_0380, // s_mov_b32 s20, 0
+    0xBE93_0380, // s_mov_b32 s19, 0
+];
+
+/// `body` after [`TRIPS`] in groups of 96 and 160 threads (waves of
+/// different trip counts, the last with its lower half only): v8 of each lane
+/// is `want` of its wave's trip count.
+fn waves_of_different_trips(body: &[u32], want: impl Fn(u32) -> u32) {
+    for threads in [96u32, 160] {
+        let words = [&TRIPS[..], body].concat();
+        if let Some(got) = two_halves_with_lds(&words, threads) {
+            let want: Vec<u32> = (0..threads).map(|l| want(l / 64 + 1)).collect();
+            assert_eq!(got, want, "{threads} threads");
+        }
+    }
+}
+
+/// A wave that left the loop keeps what it computed in it, scalar and vector,
+/// while the group goes round for the others.
+#[test]
+fn a_wave_of_a_wider_group_keeps_its_values_after_leaving_a_loop() {
+    let body = [
+        0xD760_0012,
+        0x0001_0100, // v_readlane_b32 s18, v0, 0 (an exchange in the loop)
+        LANE_SUM,
+        0x810F_850F, // s_add_i32 s15, s15, 5
+        0x4A10_1081, // v_add_nc_u32 v8, 1, v8
+        0x8114_8114, // s_add_i32 s20, s20, 1
+        0xBF0A_0E14, // s_cmp_lt_u32 s20, s14
+        0xBF85_FFF8, // s_cbranch_scc1 -> the pass
+        ADD_LANE_SUM,
+        0x4A10_100F, // v_add_nc_u32 v8, s15, v8
+    ];
+    waves_of_different_trips(&body, |n| n + 5 * n + 64 * (n - 1) * n);
+}
+
+#[test]
+fn a_wave_of_a_wider_group_breaks_out_of_a_loop() {
+    let body = [
+        0xD760_0012,
+        0x0001_0100, // v_readlane_b32 s18, v0, 0 (an exchange in the loop)
+        LANE_SUM,
+        0x8114_8114, // s_add_i32 s20, s20, 1
+        0x4A10_1081, // v_add_nc_u32 v8, 1, v8
+        0xBF06_0E14, // s_cmp_eq_u32 s20, s14
+        0xBF85_0003, // s_cbranch_scc1 -> out
+        0x810F_850F, // s_add_i32 s15, s15, 5
+        0xBF0A_8814, // s_cmp_lt_u32 s20, 8
+        0xBF85_FFF6, // s_cbranch_scc1 -> the pass
+        ADD_LANE_SUM,
+        0x4A10_100F, // v_add_nc_u32 v8, s15, v8
+    ];
+    waves_of_different_trips(&body, |n| n + 5 * (n - 1) + 64 * (n - 1) * n);
+}
+
+/// Three passes of an outer loop, an inner one of each wave's own length in
+/// each: what the inner loop computed is read after it and after both.
+#[test]
+fn a_wave_of_a_wider_group_runs_nested_loops_of_its_own_length() {
+    let body = [
+        0xBE91_0380, // s_mov_b32 s17, 0
+        // The outer pass:
+        0xBE94_0380, // s_mov_b32 s20, 0
+        // The inner pass:
+        0xD760_0012,
+        0x0001_0100, // v_readlane_b32 s18, v0, 0 (an exchange in the loop)
+        LANE_SUM,
+        0x810F_810F, // s_add_i32 s15, s15, 1
+        0x4A10_1081, // v_add_nc_u32 v8, 1, v8
+        0x8114_8114, // s_add_i32 s20, s20, 1
+        0xBF0A_0E14, // s_cmp_lt_u32 s20, s14
+        0xBF85_FFF8, // s_cbranch_scc1 -> the inner pass
+        0x8110_0F10, // s_add_i32 s16, s16, s15
+        0x8111_8111, // s_add_i32 s17, s17, 1
+        0xBF0A_8311, // s_cmp_lt_u32 s17, 3
+        0xBF85_FFF3, // s_cbranch_scc1 -> the outer pass
+        ADD_LANE_SUM,
+        0x4A10_100F, // v_add_nc_u32 v8, s15, v8
+        0x4A10_1010, // v_add_nc_u32 v8, s16, v8
+    ];
+    // v8 and s15 count 3n; s16 sums s15 after each outer pass.
+    waves_of_different_trips(&body, |n| 3 * n + 3 * n + 6 * n + 64 * (n - 1) * 3 * n);
+}
+
+/// A wave that is off in a block writes no shared memory there.
+#[test]
+fn a_wave_of_a_wider_group_writes_no_shared_memory_where_it_is_off() {
+    // Every lane clears its dword; only the first console wave takes the
+    // block that writes it (and reads a lane, which makes two halves).
+    for threads in [128u32, 96] {
+        let body = [
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xBE8E_0380, // s_mov_b32 s14, 0
+            0xD834_0000,
+            0x0000_0210, // ds_write_b32 v16, v2
+            0x7D88_00C0, // v_cmp_gt_u32 vcc, 64, v0
+            0xBF86_0004, // s_cbranch_vccz past the write and the lane read
+            0xD834_0000,
+            0x0000_0110, // ds_write_b32 v16, v1
+            0xD760_000E,
+            0x0001_0101, // v_readlane_b32 s14, v1, 0 (1: lane 0)
+            0xD8D8_0000,
+            0x0800_0010, // ds_read_b32 v8, v16
+            0x4A10_100E, // v_add_nc_u32 v8, s14, v8
+        ];
+        if let Some(got) = two_halves_with_lds(&body, threads) {
+            let want: Vec<u32> = (0..threads)
+                .map(|l| if l < 64 { l + 2 } else { 0 })
+                .collect();
+            assert_eq!(got, want, "{threads} threads");
+        }
+    }
+}
+
+/// A program whose shared memory leaves no room for the two halves'
+/// exchanges asks for waves of 64: a larger one would not be created.
+#[test]
+fn a_wave64_program_with_full_shared_memory_asks_for_waves_of_64() {
+    let body = [
+        0xD760_000E,
+        0x0001_0100, // v_readlane_b32 s14, v0, 0
+        0x4A10_100E, // v_add_nc_u32 v8, s14, v8
+    ];
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    // 96 threads take 134 dwords: 62 blocks of 128 leave room, 63 do not.
+    for (blocks, waves) in [(62, (32, 32)), (63, (64, 64))] {
+        let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 96, blocks).unwrap();
+        check(&shader);
+        assert_eq!(
+            crate::emit::required_waves(&shader.dxil),
+            Some(waves),
+            "{blocks} blocks: {:?}",
+            shader.wave64_why
+        );
+        assert_eq!(
+            shader.wave64_why.is_some(),
+            waves == (64, 64),
+            "{blocks} blocks: {:?}",
+            shader.wave64_why
+        );
     }
 }

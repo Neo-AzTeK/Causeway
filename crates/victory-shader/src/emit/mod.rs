@@ -478,8 +478,9 @@ pub fn emit(
 
 /// The form in which two host waves follow the console's wave through every
 /// branch ([`structure::wave_flow`]), for a compute program that is otherwise
-/// refused: only where a group is one console wave, which keeps every thread
-/// of the group together. `None` where that does not apply.
+/// refused: where a group is one console wave, or several in a program module
+/// [`lower::linear`] supports.
+/// `None` where that does not apply.
 fn together(
     native: &NativeProgram,
     p: &ir::Program,
@@ -487,7 +488,9 @@ fn together(
     let crate::native::StageIo::Cs(cs) = &native.io else {
         return None;
     };
-    if !native.wave64 || cs.threads.iter().product::<u32>() > 64 {
+    if !native.wave64
+        || cs.threads.iter().product::<u32>() > 64 && lower::linear::supports(p).is_err()
+    {
         return None;
     }
     Some(structure::wave_flow(p))

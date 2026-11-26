@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+pub(super) mod linear;
 
 type Why = &'static str;
 
@@ -257,6 +258,8 @@ struct Lower<'a> {
     /// The console's waves of 64 run as two host waves of 32 (see
     /// [Self::exchange]).
     virt: bool,
+    /// Several console waves per group (module `linear`).
+    linear: Option<linear::Linear>,
     wave64_why: Option<Why>,
     /// IR blocks every lane runs exactly once.
     common: Vec<bool>,
@@ -390,6 +393,9 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// What a D3D12 compute group may share (32 KiB), on every adapter.
+const HOST_LDS_DWORDS: u32 = 8192;
 
 /// The iteration limit of a loop nested depth deep (1 = not nested): the
 /// depth-th root of limit, at least 16, so a nest stays near one limit.
@@ -634,14 +640,25 @@ impl<'a> Lower<'a> {
                     } else {
                         apart_steps()
                     };
+                    // Per console wave: 2 pair slots, then 64 lane slots.
+                    // Several waves also vote: a slot each. All of it comes
+                    // after the program's own, in the host's 32 KiB.
+                    let waves = threads.div_ceil(64);
+                    let extra = waves * if waves > 1 { 67 } else { 66 };
+                    let steps = steps.and_then(|at| {
+                        if s.lds_dwords + extra > HOST_LDS_DWORDS {
+                            Err("no room in shared memory for two halves to exchange")
+                        } else {
+                            Ok(at)
+                        }
+                    });
                     wave64_why = steps.as_ref().err().copied();
                     if let Ok(at) = steps {
                         lockstep.extend(at);
                         virt = true;
                         s.wave_size = Some(32);
                         xbase = s.lds_dwords;
-                        // Per console wave: 2 pair slots, then 64 lane slots.
-                        s.lds_extra = threads.div_ceil(64) * 66;
+                        s.lds_extra = extra;
                     }
                 } else if !enough && wave == 64 && threads > 1024 {
                     wave64_why = Some("a group of more than 1024 threads");
@@ -746,6 +763,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             virt,
             wave64_why,
+            linear: linear::new(x.p, x.st, x.native),
             // With the halves together, every thread of a group of one
             // console wave runs every block the same number of times.
             common: if x.st.wave_flow {
@@ -1423,12 +1441,12 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
-        let order = crate::ir::reverse_postorder(&p.blocks);
+        let order = self.block_order();
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
         for (n, &b) in order.iter().enumerate() {
-            self.block[b] = Some(if n == 0 {
+            self.block[b] = Some(if n == 0 && !self.linear_header(b) {
                 self.s.entry
             } else {
                 self.s.m.new_block()
@@ -1485,6 +1503,7 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        self.linear_start(order[0]);
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -1513,6 +1532,7 @@ impl<'a> Lower<'a> {
                 self.vals.insert(phi.value, val);
             }
             let mut i = 0;
+            self.linear_enter(b);
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
                 self.lockstep_barrier(b, i);
@@ -1544,6 +1564,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.linear_hold()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2776,10 +2797,11 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        let g = match self.x.st.guards[b][i] {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(self.linear_guard(g))
     }
 
     /// Whether every lane outside the guard of the export at (b, i) runs
@@ -3301,7 +3323,8 @@ impl<'a> Lower<'a> {
         let wave64 = self.s.m.bin(c, Bin::LShr, pairs, one);
         let k6 = k(self, 6);
         let first = self.s.m.bin(c, Bin::Shl, wave64, k6);
-        let region = k(self, self.xbase + self.s.lds_extra / 33);
+        let [tx, ty, tz] = self.s.threads.ok_or("a lane read across host waves")?;
+        let region = k(self, self.xbase + (tx * ty * tz).div_ceil(64) * 2);
         let first = self.s.m.bin(c, Bin::Add, first, region);
         let up = self.s.m.bin(c, Bin::Shl, half, k5);
         let me = self.lane_index();
@@ -10053,6 +10076,9 @@ impl<'a> Lower<'a> {
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
+        if self.linear.is_some() {
+            return self.linear_exit(b);
+        }
         let offset = self.x.p.blocks[b]
             .insts
             .last()
@@ -10603,9 +10629,9 @@ impl<'a> Lower<'a> {
                     .or_else(|| self.x.st.other.get(arg))
                     .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
-                incoming.push((x, qb));
+                incoming.push((x, qb, q));
             }
-            self.s.m.set_phi(v, incoming);
+            self.join(v, b, incoming);
         }
         let mut unread = HashMap::new();
         let mut votes: HashMap<usize, Vec<Value>> = HashMap::new();
@@ -10656,9 +10682,9 @@ impl<'a> Lower<'a> {
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
-                incoming.push((x, qb));
+                incoming.push((x, qb, q));
             }
-            self.s.m.set_phi(v, incoming);
+            self.join(v, b, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);

@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+pub(crate) mod hold;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
