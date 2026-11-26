@@ -62,16 +62,16 @@ pub fn read_baseline(json: &Path) -> Baseline {
 const HIGHER_IS_BETTER: &[&str] = &["fps", "world_lines", "drawn_per_frame", "detail_pct"];
 
 /// Where a draw was lost: what the host named, and who would fix it.
-struct Lost {
+pub(super) struct Lost {
     /// Hash or verb: what names it.
     id: String,
     kind: String,
     reason: String,
     /// Merges what one fix removes.
     group: String,
-    tag: &'static str,
+    pub(super) tag: &'static str,
     area: &'static str,
-    per_frame: f64,
+    pub(super) per_frame: f64,
 }
 
 fn area_of(reason: &str) -> &'static str {
@@ -118,7 +118,7 @@ impl Log {
         })
     }
 
-    fn classify(&self, why: &str, per_frame: f64) -> Lost {
+    pub(super) fn classify(&self, why: &str, per_frame: f64) -> Lost {
         let unknown = "reason not logged".to_owned();
         let mut lost = Lost {
             id: why.split_whitespace().last().unwrap_or("?").to_owned(),

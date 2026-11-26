@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 mod digest;
 pub use digest::{Baseline, Context, read_baseline};
+pub use series::Series;
+mod series;
 pub mod sheet;
 
 /// Draws and dispatches asked for per frame that mean the menus draw. The
