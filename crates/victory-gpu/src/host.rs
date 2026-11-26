@@ -1,8 +1,10 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap;
-//! overlap them with per-submission fences once more than clears run.
+//! shortcut: every submission is waited for, so CPU and GPU never overlap.
+//! Overlapping them takes per-submission fences, and must keep the order:
+//! copy-back first, then the bottom-of-pipe writes. Other code relies on the
+//! wait (mesh scratch, eviction, list resets): check it when changing this.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -135,8 +137,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
-/// The host GPU, created on first use; `None` without one (a run then
-/// behaves as before: nothing executes).
+/// The host GPU, created on first use; `None` without one (then nothing
+/// executes).
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {

@@ -297,8 +297,8 @@ mod tests {
         assert!(blob.is_null() && error.is_null());
     }
 
-    /// A null `riid` used to be forwarded to the host, which dereferences it
-    /// (an access violation in `d3d12.dll`); an empty blob is malformed.
+    /// A null `riid` must not reach the host, which dereferences it (an
+    /// access violation in `d3d12.dll`); an empty blob is malformed.
     #[test]
     fn deserializer_creation_rejects_missing_arguments() {
         let iid = ROOT_SIGNATURE_IIDS[0];

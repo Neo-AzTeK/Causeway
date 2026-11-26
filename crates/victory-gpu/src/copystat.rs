@@ -175,7 +175,7 @@ pub(crate) fn part(i: usize, n: u64) {
     PARTS[i].fetch_add(n, Relaxed);
 }
 
-/// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
+/// How copies run: 0 guarded (the default), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_COPY_MODE").as_deref() {

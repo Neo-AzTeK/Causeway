@@ -163,7 +163,9 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     }
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
+/// A queue wait does not block: each submission has completed when it returns
+/// (`host`), so no work of ours is left to order after. Revise if submissions
+/// overlap.
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
     if fence.is_null() { E_INVALIDARG } else { S_OK }
 }

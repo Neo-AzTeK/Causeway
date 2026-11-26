@@ -13,8 +13,8 @@
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
 //! share, [`console`] which console model the title sees, `external` host
-//! libraries recording into title lists. Planned:
-//! `present` (swap chain).
+//! libraries recording into title lists. Presentation is in [`queue`] and
+//! `host`.
 
 #[cfg(windows)]
 mod bindless;

@@ -1124,8 +1124,8 @@ pub(crate) mod tests {
     }
 
     /// A write or mapping that runs past the end of the address space (a
-    /// title's `fread` with a huge count) covers up to the end; the sum used
-    /// to overflow. Up there no test has guarded blocks.
+    /// title's `fread` with a huge count) covers up to the end: the sum must
+    /// not overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let top = usize::MAX - 16;

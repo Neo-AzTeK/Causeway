@@ -4,8 +4,9 @@ use std::ffi::OsStr;
 
 /// Whether a switch's value turns it on: it is set, and is not `0`.
 ///
-/// A switch used to be on whenever its variable existed, so `VICTORY_D3D12_WARP=0` (typed to switch it off, or left
-/// over from comparing two runs) still selected the software adapter. Any other value keeps the old meaning.
+/// `0` is off so that `VICTORY_D3D12_WARP=0` (typed to switch it off, or left
+/// over from comparing two runs) does not select the software adapter. Every
+/// other value, the empty one too, is on.
 fn value_is_on(value: Option<&OsStr>) -> bool {
     value.is_some_and(|v| v != "0")
 }
@@ -37,7 +38,7 @@ mod tests {
 
     #[test]
     fn other_values_keep_their_old_meaning() {
-        // Documented as `=1`; anything else that was on before stays on: only `0` is new.
+        // Documented as `=1`; only `0` is off.
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");
         }

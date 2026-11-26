@@ -204,7 +204,7 @@ mod tests {
     }
 
     /// A rounding that carries out of the mantissa raises the exponent
-    /// (the carry used to be or-ed into an odd exponent, halving the value).
+    /// (or-ing the carry into an odd exponent would halve the value).
     #[test]
     fn halves_round_up_into_the_next_power_of_two() {
         assert_eq!(f32_to_half(2.0 - 2f32.powi(-12)), 0x4000);
@@ -223,8 +223,8 @@ mod tests {
 
     /// An element that reaches past the stride (float4 at 4 in 8-byte
     /// vertices, RGBA8 at the stride itself): the components inside get
-    /// the fourth corner, the rest keep the first vertex's bytes. The old
-    /// code indexed past the vertex and panicked.
+    /// the fourth corner, the rest keep the first vertex's bytes, and
+    /// nothing indexes past the vertex.
     #[test]
     fn elements_past_the_stride_are_left_alone() {
         let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();

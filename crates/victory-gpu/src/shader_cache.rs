@@ -121,9 +121,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
-/// What of the device is in the cache key. A host with waves of 32 keeps the
-/// key it had before `wave64_native` existed: its bit is set only where the
-/// flag is.
+/// What of the device is in the cache key. `wave64_native` adds its bit only
+/// where set, so that a new flag done this way leaves the entries of hosts
+/// without it valid.
 fn device_key(min_lod_clamp: bool, mesh_as_compute: bool, wave64_native: bool) -> u8 {
     u8::from(min_lod_clamp) | u8::from(mesh_as_compute) << 1 | u8::from(wave64_native) << 2
 }

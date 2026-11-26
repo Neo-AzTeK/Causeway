@@ -236,7 +236,7 @@ mod tests {
 
     /// Two waits for one kind that begin together (two threads) take two
     /// ticks: the first takes its tick before it sleeps. A time-out takes
-    /// none. The old code marked the tick after the sleep, so both got it.
+    /// none. (Marking the tick after the sleep would give both the same one.)
     #[test]
     fn waits_begun_together_take_different_ticks() {
         const VBLANK: u32 = 1;
