@@ -8,7 +8,19 @@ use std::path::{Path, PathBuf};
 
 mod digest;
 pub use digest::{Baseline, Context, read_baseline};
+mod series;
+mod starve;
+pub use series::Series;
 pub mod sheet;
+
+/// The area `--world-lines` adds.
+const STEADY_AREA: &str = "steady world lines";
+/// Seconds after the world is reached that a steady measure leaves out: about
+/// a minute of 0.2 to 0.8 fps, then preparing times still falling. A fixed
+/// time, so a slower build cannot make its own warm-up longer.
+pub const WARM_UP: f64 = 90.0;
+/// The seconds a frame-rate line measures, about.
+const LINE_SPAN: f64 = 5.0;
 
 /// Draws and dispatches asked for per frame that mean the menus draw. The
 /// title's first screens ask for 3 to 7.
@@ -67,6 +79,8 @@ pub struct Area {
 pub enum End {
     /// Still running when its time was up.
     TimedOut,
+    /// Still running when we ended it, with the world lines asked for.
+    Enough,
     Exited(Option<i32>),
 }
 
@@ -222,6 +236,7 @@ pub struct Log {
     switches: Option<Vec<(String, String)>>,
     blocks: Vec<DropBlock>,
     journal: Vec<String>,
+    starve: starve::Starve,
 }
 
 /// One log interval's dropped draws: when it was in the world, the counts
@@ -229,6 +244,8 @@ pub struct Log {
 #[derive(Default)]
 struct DropBlock {
     world: bool,
+    /// When the frame-rate line it follows was logged (Unix time).
+    at: Option<f64>,
     why: Vec<(String, f64)>,
 }
 
@@ -286,13 +303,78 @@ impl Log {
 
     pub fn parse(text: &str) -> Log {
         let mut log = Log::default();
-        for line in text.lines() {
-            log.line(&plain(line));
-        }
+        log.feed(text);
         log
     }
 
+    /// More of the log, in whole lines.
+    pub fn feed(&mut self, text: &str) {
+        for line in text.lines() {
+            self.line(&plain(line));
+        }
+    }
+
+    /// When the first world line was logged (Unix time).
+    pub fn world_start(&self) -> Option<f64> {
+        self.world().find_map(|r| unix_time(&r.time))
+    }
+
+    /// Whether a line logged `at` is past the world's warm-up.
+    fn is_steady(&self, at: Option<f64>) -> bool {
+        self.world_start().zip(at).is_some_and(|(start, at)| at - start >= WARM_UP)
+    }
+
+    /// When each steady world line was logged.
+    fn steady_times(&self) -> Vec<f64> {
+        let times = self.world().filter_map(|r| unix_time(&r.time));
+        let Some(start) = self.world_start() else { return Vec::new() };
+        times.filter(|at| at - start >= WARM_UP).collect()
+    }
+
+    /// World lines logged `WARM_UP` seconds or more after the first one.
+    pub fn steady_lines(&self) -> usize {
+        self.steady_times().len()
+    }
+
+    /// The Unix times a run's numbers are measured over: its steady lines, or
+    /// all its world lines when fewer than `WORLD_LINES` are steady. `None`:
+    /// no world line.
+    pub fn measured_window(&self) -> Option<(f64, f64)> {
+        let mut times = self.steady_times();
+        if times.len() < WORLD_LINES {
+            times = self.world().filter_map(|r| unix_time(&r.time)).collect();
+        }
+        // A line measures the seconds before it.
+        Some((times.first()? - LINE_SPAN, *times.last()?))
+    }
+
+    /// Whether the run logged the steady world lines it was asked for.
+    pub fn steady_area(&self, asked: usize, end: Option<End>) -> Area {
+        let got = self.steady_lines();
+        let (status, why) = match end {
+            _ if got >= asked => (Status::Pass, ""),
+            Some(End::TimedOut) => (Status::Fail, ": the --seconds cap came first"),
+            Some(End::Exited(_)) => (Status::Fail, ": the title ended first"),
+            _ => (Status::Fail, ""),
+        };
+        let detail = format!(
+            "{got} of the {asked} asked, counted from {WARM_UP:.0} s after the world was reached{why}"
+        );
+        Area { name: STEADY_AREA, status, detail }
+    }
+
+    /// Why the machine looks starved (memory short: the same work takes far
+    /// longer on the clock), or `None`. Such a run says nothing about the code.
+    /// A run that never reached the world is called starved on one sign; one
+    /// that did, on two: a cold disk cache alone makes one.
+    pub fn starved(&self) -> Option<String> {
+        let signs = self.starve.signs();
+        let needed = if self.world().next().is_some() { 2 } else { 1 };
+        (signs.len() >= needed).then(|| signs.join("; "))
+    }
+
     fn line(&mut self, line: &str) {
+        self.starve.read(line);
         if self.journal.len() < 20 && (line.contains("DRED") || line.contains("removal journal")) {
             self.journal.push(clip(line));
         }
@@ -362,7 +444,8 @@ impl Log {
         if let Some(causes) = Self::causes(line) {
             self.causes.push(causes);
             let world = self.rates.last().is_some_and(|r| r.asked() >= WORLD_DRAWS && !r.removed);
-            self.blocks.push(DropBlock { world, why: Vec::new() });
+            let at = self.rates.last().and_then(|r| unix_time(&r.time));
+            self.blocks.push(DropBlock { world, at, why: Vec::new() });
         }
         if let Some((_, why)) = line.split_once("/frame without a host pipeline: ")
             && let Some(n) = before(line, "/frame without a host pipeline: ")
@@ -465,7 +548,14 @@ impl Log {
                 format!("at {}, {} lines (inferred from draw counts)", r.time, world.len()),
             ),
             None if self.rates.is_empty() => (Status::Unknown, "no frame-rate lines".into()),
-            None => (Status::Fail, format!("at most {most:.0} draws/frame asked for")),
+            None => {
+                // A starved run never reached the world for want of memory,
+                // not for what the code does: it is run again, not debugged.
+                let why = self
+                    .starved()
+                    .map_or(String::new(), |s| format!("STARVED machine, rerun on a quiet machine ({s}); "));
+                (Status::Fail, format!("{why}at most {most:.0} draws/frame asked for"))
+            }
         });
 
         add("hang", match silence {
@@ -479,14 +569,17 @@ impl Log {
 
         add("crash", match (self.crashes.first(), end) {
             (Some(first), _) => (Status::Fail, clip(first)),
-            (None, Some(End::TimedOut)) if silence.is_none() => {
+            (None, Some(End::TimedOut | End::Enough)) if silence.is_none() => {
                 (Status::Unknown, "no crash line, but no frame-rate line either".into())
             }
-            (None, Some(End::TimedOut)) if hung => {
+            (None, Some(End::TimedOut | End::Enough)) if hung => {
                 (Status::Unknown, "no crash line, but it hung".into())
             }
             (None, Some(End::TimedOut)) => {
                 (Status::Pass, "running until its time was up".into())
+            }
+            (None, Some(End::Enough)) => {
+                (Status::Pass, "running until it had the world lines asked for".into())
             }
             (None, Some(End::Exited(code))) => {
                 let code = code.map_or("no code".into(), |c| format!("{c:#x}"));
@@ -930,6 +1023,65 @@ mod tests {
         assert_eq!(log.world().count(), 1);
     }
 
+    /// A frame-rate line `at` seconds in, asking for `draws`.
+    fn rate_at(at: u32, draws: u32) -> String {
+        let time = format!("T00:{:02}:{:02}Z", at / 60, at % 60);
+        rate(1.0, draws, 0, 0).replace("T00:00:00Z", &time)
+    }
+
+    #[test]
+    fn steady_lines_are_world_lines_after_the_warm_up() {
+        // Menus for 30 s, then a world line every 5 s from 30 to 150 s.
+        let menu: String = (0..6).map(|i| rate_at(i * 5, 40)).collect();
+        let world: String = (6..=30).map(|i| rate_at(i * 5, 900)).collect();
+        // 120 s after the world, 90 of them warm-up: lines at 120..=150.
+        let log = Log::parse(&(menu.clone() + &world));
+        assert_eq!(log.steady_lines(), 7);
+        assert_eq!(Log::parse(&menu).steady_lines(), 0);
+        // A menu after the warm-up is no world line, nor one without the GPU.
+        let after = menu.clone() + &world + &rate_at(155, 40);
+        assert_eq!(Log::parse(&after).steady_lines(), 7);
+        let removed = after
+            + &gpu("ERROR", "host: host GPU device removed after a submission of 1 lists")
+            + &rate_at(160, 900);
+        assert_eq!(Log::parse(&removed).steady_lines(), 7);
+        // Fed in pieces, the same.
+        let mut pieces = Log::default();
+        pieces.feed(&menu);
+        pieces.feed(&world);
+        assert_eq!(pieces.steady_lines(), 7);
+    }
+
+    #[test]
+    fn the_measured_window_is_the_steady_lines() {
+        let world: String = (6..=30).map(|i| rate_at(i * 5, 900)).collect();
+        // World from 30 s: steady from 120 s to 150 s.
+        let (from, to) = Log::parse(&world).measured_window().unwrap();
+        assert_eq!((from - THEN, to - THEN), (115.0, 150.0));
+        // Two steady lines: every world line.
+        let short: String = (6..=25).map(|i| rate_at(i * 5, 900)).collect();
+        let (from, to) = Log::parse(&short).measured_window().unwrap();
+        assert_eq!((from - THEN, to - THEN), (25.0, 125.0));
+        assert_eq!(Log::parse(&rate_at(5, 40)).measured_window(), None);
+    }
+
+    #[test]
+    fn a_run_that_hit_its_cap_short_of_its_lines_is_marked() {
+        let world: String = (0..=30).map(|i| rate_at(i * 5, 900)).collect();
+        let log = Log::parse(&world); // 13 steady lines
+        let met = log.steady_area(13, Some(End::Enough));
+        assert_eq!((met.name, met.status), ("steady world lines", Status::Pass));
+        let short = log.steady_area(14, Some(End::TimedOut));
+        assert_eq!(short.status, Status::Fail);
+        assert!(short.detail.starts_with("13 of the 14"), "{}", short.detail);
+        assert!(short.detail.ends_with("the --seconds cap came first"), "{}", short.detail);
+        let died = log.steady_area(14, Some(End::Exited(Some(1))));
+        assert!(died.detail.ends_with("the title ended first"), "{}", died.detail);
+        // Stopped with its lines: the run was healthy when it ended.
+        let areas = judge(&healthy(), Some(End::Enough));
+        assert_eq!(status(&areas, "crash"), Status::Pass);
+    }
+
     fn healthy() -> String {
         gpu("INFO", "host: host D3D12 device ready")
             + &gpu("INFO", "copystat: copies per frame: 1.0 submissions; 1 title copies")
@@ -956,6 +1108,32 @@ mod tests {
         for a in judge("", None) {
             assert_eq!(a.status, Status::Unknown, "{}", a.name);
         }
+    }
+
+    fn slow_library() -> String {
+        gpu("INFO", "pipeline::library: host pipeline library loaded bytes=396681626 ms=2679")
+    }
+
+    #[test]
+    fn a_starved_run_without_a_world_says_to_rerun_it() {
+        let menus = rate(30.0, 39, 0, 0).repeat(9);
+        let world = |text: &str| judge(text, None).into_iter().find(|a| a.name == "world reached").unwrap();
+        let quiet = world(&menus);
+        assert_eq!(quiet.status, Status::Fail);
+        assert!(!quiet.detail.contains("STARVED"), "{}", quiet.detail);
+        // The same log with a library read from disk: still a failure, now with its cause.
+        let starved = world(&(slow_library() + &menus));
+        assert_eq!(starved.status, Status::Fail);
+        assert!(
+            starved.detail.starts_with("STARVED machine, rerun on a quiet machine (pipeline library load took 2679 ms"),
+            "{}",
+            starved.detail
+        );
+        assert!(starved.detail.ends_with("at most 39 draws/frame asked for"), "{}", starved.detail);
+        // A world that was reached is not called starved away.
+        let reached = world(&(slow_library() + &healthy()));
+        assert_eq!(reached.status, Status::Pass);
+        assert!(!reached.detail.contains("STARVED"), "{}", reached.detail);
     }
 
     #[test]

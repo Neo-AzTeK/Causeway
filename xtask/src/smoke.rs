@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +15,7 @@ use clap::Args;
 
 use crate::machine::{self, Others};
 use crate::problem;
+use crate::load;
 use crate::report::sheet;
 use crate::report::{Baseline, Context as Inputs, End, Log, Status, flat_png, read_baseline};
 
@@ -29,6 +31,24 @@ pub struct Smoke {
     /// How long the title runs.
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86400))]
     seconds: u64,
+    /// Ends the run once this many world lines are logged after the world's
+    /// warm-up. --seconds stays the cap: a run that ends short of them fails
+    /// the "steady world lines" area.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=100000))]
+    world_lines: Option<u64>,
+    /// Before the title starts, waits at most this long for a quiet machine
+    /// (no compiler running, under 30% of the CPU and enough free memory, see
+    /// --quiet-commit-gb and --quiet-ram-gb, for 20 s); 0 starts at
+    /// once. What other processes use while it plays goes to `load.txt`.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=86400))]
+    quiet_wait: u64,
+    /// A quiet machine also has this much commit free, in GB (what the system
+    /// can still promise; the title holds ~32 GB private); 0 asks for none.
+    #[arg(long, default_value_t = load::QUIET_COMMIT_GB, value_parser = clap::value_parser!(u64).range(0..=4096))]
+    quiet_commit_gb: u64,
+    /// ... and this much physical RAM free, in GB; 0 asks for none.
+    #[arg(long, default_value_t = load::QUIET_RAM_GB, value_parser = clap::value_parser!(u64).range(0..=4096))]
+    quiet_ram_gb: u64,
     /// The title's saves and settings; a folder in --out by default, so
     /// every run goes through the first-start menus (see --accept-terms).
     #[arg(long)]
@@ -102,7 +122,13 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     let log_path = log;
     let mut log = Log::parse(&String::from_utf8_lossy(&bytes));
     log.ended = end.map(|(_, at)| at);
-    let areas = log.judge(end.map(|(end, _)| end), |png| flat_png(&std::fs::read(png).ok()?));
+    let mut areas = log.judge(end.map(|(end, _)| end), |png| flat_png(&std::fs::read(png).ok()?));
+    if let Some(asked) = args.world_lines {
+        areas.push(log.steady_area(asked as usize, end.map(|(end, _)| end)));
+    }
+    if let Some(record) = load::Record::beside(&log_path) {
+        areas.push(record.area(log.measured_window()));
+    }
     let text = log.text(&areas);
     create(&args.out)?;
 
@@ -255,6 +281,25 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         copy_dir(from, &data)?;
     }
 
+    // After the build and the copies, so that nothing of ours is going on when
+    // the title starts. `log.txt` is made after it: it says the title started.
+    let wait = match args.quiet_wait {
+        0 => None,
+        cap => {
+            println!("waiting for a quiet machine ({cap} s at most)");
+            let need = load::Need::gb(args.quiet_commit_gb, args.quiet_ram_gb);
+            let wait = load::wait_quiet(Duration::from_secs(cap), LOOK, need);
+            if let Some(w) = wait {
+                let how = if w.quiet { "quiet" } else { "never quiet, starting anyway" };
+                println!("{how} after {} s", w.seconds);
+            }
+            wait
+        }
+    };
+    let record_path = out.join(load::FILE);
+    std::fs::write(&record_path, load::Record::header(wait)).context("writing load.txt")?;
+    let mut record = std::fs::OpenOptions::new().append(true).open(&record_path)?;
+
     let log = out.join("log.txt");
     let file = File::create(&log).context("creating log.txt")?;
     let mut command = Command::new(&victory);
@@ -289,26 +334,49 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file);
-    let mut load = Load::default();
-    load.sample(at_start);
+    let mut watch = args.world_lines.map(|asked| Watch::new(&log, asked as usize));
+    let mut meter = load::Meter::default();
+    let mut beside = Load::default();
+    beside.sample(at_start);
     // The first at once: copying the data folder may have taken a while.
     let mut next = Instant::now();
-    let end = run_for(command, Duration::from_secs(args.seconds), |title| {
+    let look = |job: &Group| {
         if Instant::now() >= next {
             next = Instant::now() + SAMPLE_EVERY;
-            match title.ids().and_then(|ids| others(&ids)) {
-                Ok(found) => load.sample(found),
-                Err(_) => load.failed += 1,
+            match job.ids().and_then(|ids| others(&ids)) {
+                Ok(found) => beside.sample(found),
+                Err(_) => beside.failed += 1,
             }
         }
-    })
-    .with_context(|| format!("running {}", victory.display()))?;
-    let verdict = load.verdict();
+    };
+    let enough = |title: Option<u64>| {
+        let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
+        if let (Ok(at), Some(now), Some(title)) = (at, load::system_times(), title)
+            && let Some(mut sample) = meter.sample(at, now, title)
+        {
+            sample.compilers = load::compilers_running();
+            // A look that cannot be written is one less.
+            let _ = record.write_all(load::Record::line(sample).as_bytes());
+        }
+        watch.as_mut().is_some_and(Watch::enough)
+    };
+    let end = run_for(command, Duration::from_secs(args.seconds), look, enough)
+        .with_context(|| format!("running {}", victory.display()))?;
+    let verdict = beside.verdict();
     println!("machine: {verdict}");
     let mut info = File::options().append(true).open(out.join("run.txt"))?;
-    std::io::Write::write_all(&mut info, format!("machine {verdict}\n").as_bytes())
+    std::io::Write::write_all(&mut info, format!("machine {verdict}
+").as_bytes())
         .context("writing run.txt")?;
     Ok((log, end))
+}
+
+/// What `one_run` says when it fails: the queue runner puts a run back for it.
+pub(crate) const LOCK_BUSY: &str = "is not free";
+
+/// Whether no smoke run holds the machine's lock now.
+pub(crate) fn lock_free() -> bool {
+    one_run(&lock_path()).is_ok()
 }
 
 /// What runs beside this run, whose title's processes are `title`.
@@ -414,7 +482,7 @@ fn one_run(path: &Path) -> Result<File> {
     options
         .open(path)
         .with_context(|| {
-            format!("is a smoke run or `xtask alone` on? {} is not free", path.display())
+            format!("is a smoke run or `xtask alone` on? {} {LOCK_BUSY}", path.display())
         })
 }
 
@@ -470,12 +538,15 @@ fn capture_frames(seconds: u64) -> String {
     listed.join(",")
 }
 
+/// The diagnostics build a run makes (`queue run` makes it ahead of one).
+pub(crate) const DIAG_BUILD: &[&str] =
+    &["build", "--locked", "--profile", "diag", "-p", "victory", "--features", "diagnostics"];
+
 /// Builds the diagnostics build; its path.
 fn build(root: &Path) -> Result<PathBuf> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let built = Command::new(cargo)
-        .args(["build", "--locked", "--profile", "diag", "-p", "victory"])
-        .args(["--features", "diagnostics"])
+        .args(DIAG_BUILD)
         .args(["--message-format", "json-render-diagnostics"])
         .current_dir(root)
         .stderr(Stdio::inherit())
@@ -502,13 +573,72 @@ fn executable(messages: &str) -> Option<PathBuf> {
     }
 }
 
-/// Runs a process for at most `time`, then ends it and what it started.
-/// Also when it ended, or was ended (Unix time). `watch` is called with its
-/// job while it runs.
+/// How often a running title's log is read.
+const LOOK: Duration = Duration::from_secs(2);
+
+/// A log read as it grows.
+pub(crate) struct Follow {
+    log_file: PathBuf,
+    /// Bytes read, and the last line while it is not whole.
+    at: u64,
+    rest: Vec<u8>,
+    log: Log,
+}
+
+impl Follow {
+    pub(crate) fn new(log_file: &Path) -> Follow {
+        Follow { log_file: log_file.to_owned(), at: 0, rest: Vec::new(), log: Log::default() }
+    }
+
+    /// The log's whole lines so far; what cannot be read yet is not in it.
+    pub(crate) fn read(&mut self) -> &Log {
+        let mut new = Vec::new();
+        if let Ok(mut file) = File::open(&self.log_file)
+            && file.seek(SeekFrom::Start(self.at)).is_ok()
+            && file.read_to_end(&mut new).is_ok()
+        {
+            self.at += new.len() as u64;
+            self.rest.append(&mut new);
+        }
+        if let Some(end) = self.rest.iter().rposition(|&b| b == b'\n') {
+            let whole: Vec<u8> = self.rest.drain(..=end).collect();
+            self.log.feed(&String::from_utf8_lossy(&whole));
+        }
+        &self.log
+    }
+}
+
+/// Follows the growing log for `--world-lines`.
+struct Watch {
+    log: Follow,
+    asked: usize,
+    reached: bool,
+}
+
+impl Watch {
+    fn new(log_file: &Path, asked: usize) -> Watch {
+        Watch { log: Follow::new(log_file), asked, reached: false }
+    }
+
+    /// Whether the lines asked for were there at the look before this one: the
+    /// run goes on for one more, so that what a world line brings with it
+    /// (its drops, by cause and reason) is in the log. A log that cannot be
+    /// read is never enough: the run goes to its cap.
+    fn enough(&mut self) -> bool {
+        let steady = self.log.read().steady_lines();
+        std::mem::replace(&mut self.reached, steady >= self.asked)
+    }
+}
+
+/// Runs a process for at most `time`, or until `enough` says so, then ends it
+/// and what it started. `enough` is asked every `LOOK`, and given the processor
+/// time its processes have had (100 ns); `watch` is called with its job
+/// every turn. Also when it ended, or was ended (Unix time).
 fn run_for(
     mut command: Command,
     time: Duration,
     mut watch: impl FnMut(&Group),
+    mut enough: impl FnMut(Option<u64>) -> bool,
 ) -> Result<(End, f64)> {
     let now = || SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
     let group = Group::new()?;
@@ -519,6 +649,8 @@ fn run_for(
         return Err(e);
     }
     let start = Instant::now();
+    let mut looked = start;
+    let mut end = End::TimedOut;
     while start.elapsed() < time {
         watch(&group);
         // A title that relaunches itself goes on in a child.
@@ -527,23 +659,30 @@ fn run_for(
         {
             return Ok((End::Exited(status.code()), now()?));
         }
+        if looked.elapsed() >= LOOK {
+            looked = Instant::now();
+            if enough(group.cpu_time()) {
+                end = End::Enough;
+                break;
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     // Before ending it, which takes a while for a process of this size.
     let ended = now()?;
     group.kill(&mut child)?;
     child.wait()?;
-    Ok((End::TimedOut, ended))
+    Ok((end, ended))
 }
 
 /// A job: the process and what it starts, and nothing else. They end with
 /// this process too.
 #[cfg(windows)]
-struct Group(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct Group(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl Group {
-    fn new() -> Result<Group> {
+    pub(crate) fn new() -> Result<Group> {
         use windows_sys::Win32::System::JobObjects::*;
         // SAFETY: plain creation, no name or security attributes.
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -566,7 +705,7 @@ impl Group {
 
     // shortcut: what the process starts before this is not in the job; it
     // is still loading its DLLs.
-    fn add(&self, child: &Child) -> Result<()> {
+    pub(crate) fn add(&self, child: &Child) -> Result<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
         // SAFETY: both handles are live.
@@ -576,6 +715,19 @@ impl Group {
     }
 
     fn running(&self) -> Result<bool> {
+        Ok(self.accounting()?.ActiveProcesses > 0)
+    }
+
+    /// The processor time of everything that is or was in the job, in 100 ns.
+    fn cpu_time(&self) -> Option<u64> {
+        let info = self.accounting().ok()?;
+        u64::try_from(info.TotalUserTime + info.TotalKernelTime).ok()
+    }
+
+    fn accounting(
+        &self,
+    ) -> Result<windows_sys::Win32::System::JobObjects::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>
+    {
         use windows_sys::Win32::System::JobObjects::*;
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: the structure of this class, with its size.
@@ -589,7 +741,7 @@ impl Group {
             )
         };
         ensure!(read != 0, std::io::Error::last_os_error());
-        Ok(info.ActiveProcesses > 0)
+        Ok(info)
     }
 
     /// The ids of the processes in the job.
@@ -618,7 +770,7 @@ impl Group {
         Ok(list.ids.iter().take(list.listed as usize).map(|&id| id as u32).collect())
     }
 
-    fn kill(&self, _: &mut Child) -> Result<()> {
+    pub(crate) fn kill(&self, _: &mut Child) -> Result<()> {
         // SAFETY: a live job.
         let ended =
             unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) };
@@ -638,15 +790,15 @@ impl Drop for Group {
 // shortcut: elsewhere only the process itself is watched and ended; titles
 // run on Windows only.
 #[cfg(not(windows))]
-struct Group;
+pub(crate) struct Group;
 
 #[cfg(not(windows))]
 impl Group {
-    fn new() -> Result<Group> {
+    pub(crate) fn new() -> Result<Group> {
         Ok(Group)
     }
 
-    fn add(&self, _: &Child) -> Result<()> {
+    pub(crate) fn add(&self, _: &Child) -> Result<()> {
         Ok(())
     }
 
@@ -658,7 +810,11 @@ impl Group {
         Ok(Vec::new())
     }
 
-    fn kill(&self, child: &mut Child) -> Result<()> {
+    fn cpu_time(&self) -> Option<u64> {
+        None
+    }
+
+    pub(crate) fn kill(&self, child: &mut Child) -> Result<()> {
         Ok(child.kill()?)
     }
 }
@@ -854,6 +1010,10 @@ mod tests {
             exe: None,
             out: root.join("smoke-out"),
             seconds: 1,
+            world_lines: None,
+            quiet_wait: 0,
+            quiet_commit_gb: 0,
+            quiet_ram_gb: 0,
             data_dir: None,
             data_from: None,
             accept_terms: false,
@@ -870,6 +1030,67 @@ mod tests {
         assert!(!args.out.exists());
     }
 
+    /// A world line `at` seconds in.
+    fn world_line(at: u32) -> String {
+        format!(
+            "2026-01-01T00:{:02}:{:02}Z  INFO victory_gpu::host: 1.0 fps, 1000.0 ms/frame (1.0 \
+             preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; 2.0 on the GPU; 0.1 copying \
+             back 0.0 MB), 900 draws/frame, dropped 0 without a host pipeline (0 being made) and \
+             0 indirect\n",
+            at / 60,
+            at % 60
+        )
+    }
+
+    #[test]
+    fn a_growing_log_is_enough_one_look_after_its_last_line_asked_for() {
+        let path = std::env::temp_dir().join(format!("xtask-watch-{}", std::process::id()));
+        let mut watch = Watch::new(&path, 2);
+        assert!(!watch.enough(), "no log yet");
+        let append = |text: &str| {
+            use std::io::Write as _;
+            let mut file =
+                std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        std::fs::write(&path, world_line(0)).unwrap();
+        append(&world_line(50));
+        append(&world_line(95)); // The first steady one.
+        assert!(!watch.enough());
+        assert!(!watch.enough(), "one steady line of two");
+        // Half a line counts for nothing.
+        let second = world_line(100);
+        let (head, tail) = second.split_at(60);
+        append(head);
+        assert!(!watch.enough());
+        assert!(!watch.enough());
+        append(tail);
+        assert!(!watch.enough(), "the look that sees it: what follows it may not be there");
+        assert!(watch.enough());
+        assert_eq!(watch.log.read().steady_lines(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_run_with_its_lines_is_ended_before_its_time() {
+        let mut command = Command::new("cmd");
+        command.args(["/d", "/c", "ping -n 60 127.0.0.1"]).stdout(Stdio::null());
+        let start = Instant::now();
+        let mut looks = 0;
+        let mut times = Vec::new();
+        let enough = |cpu: Option<u64>| {
+            looks += 1;
+            times.push(cpu.unwrap());
+            looks == 2
+        };
+        let (end, _) = run_for(command, Duration::from_secs(60), |_| {}, enough).unwrap();
+        // The job's processor time only grows.
+        assert!(times[1] >= times[0]);
+        assert_eq!((end, looks), (End::Enough, 2));
+        assert!(start.elapsed() >= LOOK * 2 && start.elapsed() < Duration::from_secs(30));
+    }
+
     #[cfg(windows)]
     #[test]
     fn what_outlives_its_time_is_ended_with_its_children() {
@@ -878,7 +1099,7 @@ mod tests {
             c.args(["/d", "/c", script]).stdout(Stdio::null());
             c
         };
-        let exited = run_for(shell("exit 3"), Duration::from_secs(60), |_| {}).unwrap();
+        let exited = run_for(shell("exit 3"), Duration::from_secs(60), |_| {}, |_| false).unwrap();
         assert_eq!(exited.0, End::Exited(Some(3)));
 
         // The grandchild holds the pipe: reading ends only when it is gone.
@@ -889,7 +1110,8 @@ mod tests {
         // The job lists the shell and what it started.
         let mut seen = 0;
         let watch = |job: &Group| seen = seen.max(job.ids().unwrap().len());
-        assert_eq!(run_for(command, Duration::from_secs(1), watch).unwrap().0, End::TimedOut);
+        let ended = run_for(command, Duration::from_secs(1), watch, |_| false).unwrap();
+        assert_eq!(ended.0, End::TimedOut);
         assert!(seen >= 2, "{seen}");
         std::io::Read::read_to_end(&mut read, &mut Vec::new()).unwrap();
         assert!(start.elapsed() < Duration::from_secs(30));

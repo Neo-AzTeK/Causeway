@@ -421,6 +421,11 @@ pub struct Options {
     /// triangles (module notes, "Mesh shaders as compute"), for hosts
     /// without mesh shaders. Other stages are unchanged.
     pub mesh_as_compute: bool,
+    /// The host runs waves of 64 (`caps::wave64_native`): a console wave of
+    /// 64 is asked for as such. Left off, a program that can be placed runs as
+    /// two waves of 32, which a host without waves of 64 needs and any host
+    /// with 32 runs.
+    pub wave64_native: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -588,6 +593,7 @@ fn emit_once(
         view_marks: options.view_marks,
         min_lod_clamp: options.min_lod_clamp,
         mesh_compute,
+        wave64_native: options.wave64_native,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

@@ -61,6 +61,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         mesh_compute: false,
+        wave64_native: false,
         native: &native,
         p: &p,
         st: &st,

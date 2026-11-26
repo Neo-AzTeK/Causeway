@@ -87,6 +87,9 @@ pub(crate) struct Parts<'a> {
     pub view_marks: bool,
     /// A mesh program is made as compute (`emit`, "Mesh shaders as compute").
     pub mesh_compute: bool,
+    /// The host runs waves of 64 (`Options::wave64_native`): a console wave
+    /// of 64 is not made as two waves of 32.
+    pub wave64_native: bool,
 }
 
 enum Stop {
@@ -98,8 +101,9 @@ enum Stop {
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     // A program of waves of 64 that waves of 32 can stand in for goes to the
-    // host that way; if that fails, it asks for waves of 64 as before.
-    let mut virt = true;
+    // host that way; if that fails, it asks for waves of 64 as before. A host
+    // that runs waves of 64 gets them asked for at once.
+    let mut virt = !parts.wave64_native;
     let mut failed = None;
     loop {
         let l = Lower::new(parts, &bad, virt);
@@ -10560,6 +10564,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             mesh_compute: false,
+            wave64_native: false,
             native: &native,
             p: &p,
             st: &st,
@@ -10613,6 +10618,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             mesh_compute: false,
+            wave64_native: false,
             native: &native,
             p: &p,
             st: &st,
@@ -10830,6 +10836,7 @@ mod tests {
 
         let emitted = lower(&Parts {
             mesh_compute: false,
+            wave64_native: false,
             native: &native,
             p: &p,
             st: &st,

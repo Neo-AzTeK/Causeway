@@ -74,6 +74,7 @@ fn build(body: &[u32]) -> Result<HostShader, String> {
     let io = io::raise(&p, &native).map_err(|x| format!("io: {x:?}"))?;
     let lowered = lower::lower(&lower::Parts {
         mesh_compute: false,
+        wave64_native: false,
         native: &native,
         p: &p,
         st: &st,

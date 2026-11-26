@@ -284,6 +284,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     let io = io::raise(&p, &native).map_err(e)?;
     let lowered = lower::lower(&lower::Parts {
         mesh_compute: false,
+        wave64_native: false,
         native: &native,
         p: &p,
         st: &st,
