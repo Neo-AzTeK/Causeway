@@ -2704,6 +2704,18 @@ impl Meter {
         self.frames += 1;
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
+        {
+            let of = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+            crate::budget::frame([
+                of(&SUBMISSION_US[0]),
+                of(&SUBMISSION_US[1]),
+                of(&PREPARING[0]),
+                of(&PREPARING[2]),
+                of(&COPY_BACK[0]),
+                crate::draw::dispatched(),
+            ]);
+        }
+        #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
         {
@@ -3367,6 +3379,11 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A key going down, not repeating: H switches full drawing.
+    #[cfg(feature = "diagnostics")]
+    if message == 0x100 && wparam.0 == usize::from(b'H') && lparam.0 & (1 << 30) == 0 {
+        crate::budget::toggle_full();
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }

@@ -120,6 +120,22 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// H is no stick click while the draw-budget test mode takes it
+/// (`VICTORY_DRAW_BUDGET_MS`, `victory-gpu`'s `budget`).
+fn kept_by_host(vk: u8) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static TAKEN: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("VICTORY_DRAW_BUDGET_MS").is_some());
+        vk == b'H' && *TAKEN
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = vk;
+        false
+    }
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -131,7 +147,7 @@ fn fallback(keys: &[KeyState]) -> PadState {
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
+            .filter(|(vk, _)| on(*vk) != 0.0 && !kept_by_host(*vk))
             .fold(0, |all, (_, bit)| all | bit),
         left_trigger: on(b'Z'),
         right_trigger: on(b'C'),

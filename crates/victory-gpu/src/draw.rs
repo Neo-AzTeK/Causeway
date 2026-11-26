@@ -1174,6 +1174,10 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        #[cfg(feature = "diagnostics")]
+        if crate::budget::skip_draw(None) {
+            return;
+        }
         let emulated = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.emulated.as_deref());
         let ran = if let Some(e) = emulated {
             let ran = self.dispatch_mesh_emulated(list, e, x);
@@ -1738,6 +1742,10 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        #[cfg(feature = "diagnostics")]
+        if crate::budget::skip_draw(Some(vertices.saturating_mul(instances))) {
+            return;
+        }
         // Rectangles: completed by the pipeline's geometry shader, else
         // expanded into vertex buffers of their own.
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1842,6 +1850,10 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        #[cfg(feature = "diagnostics")]
+        if crate::budget::skip_draw(Some(indices.saturating_mul(instances))) {
+            return;
+        }
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
         if rects {
             once!("indexed rectangles not drawn");
@@ -1884,6 +1896,11 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // As done: nothing is wrong with the call.
+        #[cfg(feature = "diagnostics")]
+        if kind != DISPATCH && crate::budget::skip_draw(None) {
+            return true;
+        }
         // What a dropped call would have written.
         #[cfg(feature = "diagnostics")]
         let bound = if kind == DISPATCH { self.written_text() } else { self.bound_text() };
