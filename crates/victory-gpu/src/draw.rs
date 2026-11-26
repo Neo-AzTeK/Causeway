@@ -1405,7 +1405,9 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn probe_window(&self, list: &HostList) {
         use std::fmt::Write as _;
-        let Ok(spec) = std::env::var("VICTORY_PROBE_WINDOW") else { return };
+        // Read once: this runs before every dispatch.
+        static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let Some(spec) = SPEC.get_or_init(|| std::env::var("VICTORY_PROBE_WINDOW").ok()) else { return };
         let mut parts = spec.split(':');
         let (Some(hash), Some(index)) = (parts.next(), parts.next()) else { return };
         let big = parts.next() == Some("big");
