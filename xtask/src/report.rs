@@ -81,6 +81,8 @@ pub enum End {
     TimedOut,
     /// Still running when we ended it, with the world lines asked for.
     Enough,
+    /// Ended by us: no world line long after the story pack opened.
+    NoWorld,
     Exited(Option<i32>),
 }
 
@@ -319,6 +321,12 @@ impl Log {
         self.starve.pack_opened()
     }
 
+    /// Whether the log shows a crash or a removed device: such a run is a
+    /// failure to read, whatever else it lacks.
+    pub fn broke(&self) -> bool {
+        !self.crashes.is_empty() || !self.removed.is_empty()
+    }
+
     /// When the first world line was logged (Unix time).
     pub fn world_start(&self) -> Option<f64> {
         self.world().find_map(|r| unix_time(&r.time))
@@ -360,6 +368,7 @@ impl Log {
             _ if got >= asked => (Status::Pass, ""),
             Some(End::TimedOut) => (Status::Fail, ": the --seconds cap came first"),
             Some(End::Exited(_)) => (Status::Fail, ": the title ended first"),
+            Some(End::NoWorld) => (Status::Fail, ": stopped early for want of a world"),
             _ => (Status::Fail, ""),
         };
         let detail = format!(
@@ -552,7 +561,9 @@ impl Log {
                 Status::Pass,
                 format!("at {}, {} lines (inferred from draw counts)", r.time, world.len()),
             ),
-            None if self.rates.is_empty() => (Status::Unknown, "no frame-rate lines".into()),
+            None if self.rates.is_empty() && end != Some(End::NoWorld) => {
+                (Status::Unknown, "no frame-rate lines".into())
+            }
             None => {
                 // A starved run never reached the world for want of memory,
                 // not for what the code does: it is run again, not debugged.
@@ -574,10 +585,10 @@ impl Log {
 
         add("crash", match (self.crashes.first(), end) {
             (Some(first), _) => (Status::Fail, clip(first)),
-            (None, Some(End::TimedOut | End::Enough)) if silence.is_none() => {
+            (None, Some(End::TimedOut | End::Enough | End::NoWorld)) if silence.is_none() => {
                 (Status::Unknown, "no crash line, but no frame-rate line either".into())
             }
-            (None, Some(End::TimedOut | End::Enough)) if hung => {
+            (None, Some(End::TimedOut | End::Enough | End::NoWorld)) if hung => {
                 (Status::Unknown, "no crash line, but it hung".into())
             }
             (None, Some(End::TimedOut)) => {
@@ -585,6 +596,9 @@ impl Log {
             }
             (None, Some(End::Enough)) => {
                 (Status::Pass, "running until it had the world lines asked for".into())
+            }
+            (None, Some(End::NoWorld)) => {
+                (Status::Unknown, "no crash line; stopped early, no world after the story pack".into())
             }
             (None, Some(End::Exited(code))) => {
                 let code = code.map_or("no code".into(), |c| format!("{c:#x}"));
@@ -1174,6 +1188,16 @@ mod tests {
         // A world of which nothing is drawn is still the world.
         let undrawn = judge(&rate(2.0, 0, 0, 900), None);
         assert_eq!(status(&undrawn, "drawn vs dropped"), Status::Fail);
+    }
+
+    #[test]
+    fn a_no_world_stop_fails_the_world_and_a_removal_is_no_rerun() {
+        let areas = judge("", Some(End::NoWorld));
+        assert_eq!(status(&areas, "world reached"), Status::Fail);
+        assert_eq!(status(&areas, "crash"), Status::Unknown);
+        assert!(!Log::parse("").broke());
+        let removed = gpu("ERROR", "host: host GPU device removed after a submission");
+        assert!(Log::parse(&removed).broke());
     }
 
     #[test]

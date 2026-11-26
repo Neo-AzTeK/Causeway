@@ -1036,6 +1036,10 @@ fn status(dirs: &Dirs) -> Result<()> {
             let table: toml::Table = done.parse().unwrap_or_default();
             let code = table.get("exit").and_then(toml::Value::as_integer).unwrap_or(-1);
             let state = match table.get("error").and_then(toml::Value::as_str) {
+                // A stopped-early run did launch: its `error` says "rerun: ...".
+                Some(e) if e.starts_with("rerun: ") => {
+                    format!("exit {code}, {}", e.chars().take(80).collect::<String>())
+                }
                 Some(e) => format!("refused: {}", e.chars().take(80).collect::<String>()),
                 None => format!("done, exit {code}"),
             };

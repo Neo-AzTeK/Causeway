@@ -111,8 +111,6 @@ const INHERITED: &[&str] =
 
 pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     victory_core::ensure_outside_repo(&args.out)?;
-    // A marker from an earlier run in this folder is not this run's.
-    let _ = std::fs::remove_file(args.out.join(RERUN_FILE));
     let (log, end) = match &args.log {
         Some(log) => (log.clone(), None),
         None => {
@@ -124,6 +122,11 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     let log_path = log;
     let mut log = Log::parse(&String::from_utf8_lossy(&bytes));
     log.ended = end.map(|(_, at)| at);
+    // We end a run early for its world lines, or for want of any.
+    let end = end.map(|(end, at)| match end {
+        End::Enough if log.world_start().is_none() => (End::NoWorld, at),
+        end => (end, at),
+    });
     let mut areas = log.judge(end.map(|(end, _)| end), |png| flat_png(&std::fs::read(png).ok()?));
     if let Some(asked) = args.world_lines {
         areas.push(log.steady_area(asked as usize, end.map(|(end, _)| end)));
@@ -133,10 +136,13 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     }
     let text = log.text(&areas);
     create(&args.out)?;
-    // Only the no-world stop ends a run with lines to come and none there: the
-    // queue runner reads this file and marks the request `rerun`.
-    if matches!(end, Some((End::Enough, _))) && log.world_start().is_none() {
-        let note = format!("no world line {NO_WORLD_CAP:.0} s after the story000 pack opened: stopped early, rerun\n");
+    // The queue runner reads this file and marks the request `rerun`. A crash
+    // or a removed device is a failure, not a run to repeat.
+    if matches!(end, Some((End::NoWorld, _))) && !log.broke() {
+        let note = format!(
+            "no world line {NO_WORLD_CAP:.0} s after the story000 pack opened: stopped early; \
+             rerun if the digest says STARVED, else read the log\n"
+        );
         std::fs::write(args.out.join(RERUN_FILE), &note).context("writing rerun.txt")?;
         println!("smoke: {}", note.trim_end());
     }
@@ -344,6 +350,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .stdout(file.try_clone()?)
         .stderr(file);
     let mut watch = Watch::new(&log, args.world_lines.map(|asked| asked as usize));
+    // A run played by hand, or through the first-start screens, may sit in the
+    // menus for long: only a run on the default keys is stopped for no world.
+    watch.no_world_stop = args.keys.is_none() && !args.accept_terms;
     let mut meter = load::Meter::default();
     let mut beside = Load::default();
     beside.sample(at_start);
@@ -638,11 +647,12 @@ struct Watch {
     log: Follow,
     asked: Option<usize>,
     reached: bool,
+    no_world_stop: bool,
 }
 
 impl Watch {
     fn new(log_file: &Path, asked: Option<usize>) -> Watch {
-        Watch { log: Follow::new(log_file), asked, reached: false }
+        Watch { log: Follow::new(log_file), asked, reached: false, no_world_stop: true }
     }
 
     /// Whether the run is over early: the lines asked for were there at the
@@ -658,7 +668,7 @@ impl Watch {
         };
         let reached = self.asked.is_some_and(|asked| steady >= asked);
         let was = std::mem::replace(&mut self.reached, reached);
-        (self.asked.is_some() && was) || no_world_stalled(pack, world, now)
+        (self.asked.is_some() && was) || (self.no_world_stop && no_world_stalled(pack, world, now))
     }
 }
 
@@ -1132,6 +1142,8 @@ mod tests {
         let mut watch = Watch::new(&path, None);
         assert!(!watch.enough(JAN_1_2026 + 30.0 + 149.0));
         assert!(watch.enough(JAN_1_2026 + 30.0 + 150.0));
+        watch.no_world_stop = false;
+        assert!(!watch.enough(JAN_1_2026 + 30.0 + 150.0), "a run played by hand goes on");
         std::fs::remove_file(&path).unwrap();
     }
 

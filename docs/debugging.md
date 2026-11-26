@@ -110,11 +110,13 @@ by default; the runner refuses a worktree at another commit, with uncommitted
 tracked changes, or that `git worktree list` does not show), `seconds`, `world_lines`
 (`--world-lines`; the worktree's own `xtask` must know it), `env`
 (`VICTORY_*` only), `baseline` (a run's name, or an absolute `report.json`),
-`requester`, and `data_dir`, `data_from`, `keys`. Every run also stops early when
+`requester`, and `data_dir`, `data_from`, `keys`. A smoke run on the default keys
+(no `--keys`, no `--accept-terms`) also stops early when
 no world line comes 150 s after the story000 pack opened (the log line
 `dstorage: file opened ... story000`; a starved boot gets those 150 s): smoke writes
-`rerun.txt` into the run's folder and the `.done` gets `error = "rerun: ..."`, so
-the run reads as "run again", not as a failure. A baseline named by run must
+`rerun.txt` into the run's folder and the `.done` gets `error = "rerun: ..."`,
+unless the log has a crash or a removed device. Run it again if the digest says
+STARVED; otherwise read the log (a hang while loading looks the same). A baseline named by run must
 have a report, or be queued or running (`add` refuses it otherwise); if it still
 has none when this run's turn comes, the run goes on and its `.done` has a
 `warning`. Any other field, or a switch
