@@ -1663,8 +1663,8 @@ mod tests {
 
     /// Bit counts past the end of a frame's data, up to `usize::MAX`: the
     /// decoding ends, with a frame of samples. A stereo tile header that ran
-    /// out of data used to loop on the zeros past it for good (found by
-    /// this test).
+    /// out of data must end the decode, not loop on the zeros past it (a
+    /// decode that never ends is the failure this test guards against).
     #[test]
     fn noise_frames_with_bit_counts_past_the_data() {
         let mut noise = Noise(0xd1b5_4a32_d192_ed03);
