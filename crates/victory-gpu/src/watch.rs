@@ -107,6 +107,9 @@ struct Guards {
     written: BTreeSet<usize>,
     #[cfg(feature = "diagnostics")]
     written_before: BTreeSet<usize>,
+    /// Pages [`Tracked::take`] gave to copy this frame (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    copied: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -118,6 +121,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
     written_before: BTreeSet::new(),
+    #[cfg(feature = "diagnostics")]
+    copied: BTreeSet::new(),
 });
 
 #[cfg(not(feature = "diagnostics"))]
@@ -328,11 +333,25 @@ impl Tracked {
         guard_aliases(&mut g, &others);
         #[cfg(feature = "diagnostics")]
         drop(asked);
+        #[cfg(feature = "diagnostics")]
+        let mut guarded = 0;
         for page in protect(&mut g, &whole) {
             changed.remove(&page);
             self.changed.taken(page);
+            #[cfg(feature = "diagnostics")]
+            {
+                guarded += 1;
+            }
         }
         drop(changed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::TakenPages, pages.len() as u64);
+            add(C::PartPages, (pages.len() - whole.len()) as u64);
+            add(C::UnguardedPages, (whole.len() - guarded) as u64);
+            g.copied.extend(&pages);
+        }
         drop(g);
         let mut runs: Vec<(usize, usize)> = Vec::new();
         for p in pages {
@@ -605,6 +624,8 @@ pub(crate) fn frame_done() {
     crate::copystat::add(crate::copystat::C::WrittenPages, written.len() as u64);
     crate::copystat::add(crate::copystat::C::WrittenAgain, again as u64);
     g.written_before = written;
+    let copied = std::mem::take(&mut g.copied);
+    crate::copystat::add(crate::copystat::C::DistinctTakenPages, copied.len() as u64);
 }
 
 /// A write into title memory the guards do not see, under way: its pages

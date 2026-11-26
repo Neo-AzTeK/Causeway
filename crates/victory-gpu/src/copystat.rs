@@ -132,8 +132,16 @@ pub(crate) enum C {
     /// finding those over the range.
     PendingScanned,
     PendingUs,
+    /// Pages given to copy by change checks (a page counts each time), those
+    /// of them covered only in part by the range asked (they stay changed,
+    /// so the next check copies them again), whole ones that could not be
+    /// guarded (they stay changed too), and the distinct pages of each frame.
+    TakenPages,
+    PartPages,
+    UnguardedPages,
+    DistinctTakenPages,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -366,6 +374,13 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    tracing::info!(
+        "change checks per frame: {:.0} pages given to copy, {:.0} distinct in their frame; stay changed: {:.0} covered in part, {:.0} not guarded",
+        c[C::TakenPages as usize],
+        c[C::DistinctTakenPages as usize],
+        c[C::PartPages as usize],
+        c[C::UnguardedPages as usize],
     );
     tracing::info!(
         "copy-back per frame: {:.1} MB in pieces the GPU changed; compare {:.1} ms, title reads \
