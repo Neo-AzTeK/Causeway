@@ -222,6 +222,7 @@ fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
         container,
         crate::host::host().is_some_and(|h| crate::caps::min_lod_clamp(&h.caps)),
         crate::host::host().is_some_and(|h| !crate::caps::mesh_shaders(&h.caps)),
+        crate::host::host().is_some_and(|h| crate::caps::wave64_native(&h.caps)),
     );
     (host.and_then(|host| with_resources(container, host)), cached)
 }

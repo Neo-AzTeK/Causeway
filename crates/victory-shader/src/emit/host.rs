@@ -938,6 +938,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         mesh_stride: 0,
         min_lod_clamp: false,
         mesh_compute: false,
+        wave64_native: false,
         view_marks: false,
     })?;
     Ok(HostShader {
