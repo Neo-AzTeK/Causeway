@@ -166,6 +166,23 @@ fn a_better_device_never_gets_a_worse_plan() {
 }
 
 #[test]
+fn the_reference_set_lists_each_profile_once_with_a_usable_source() {
+    let names: Vec<String> = reference::all().into_iter().map(|c| c.adapter.name).collect();
+    for (at, name) in names.iter().enumerate() {
+        assert!(!names[..at].contains(name), "{name} twice");
+    }
+    for c in reference::nvidia_generations() {
+        assert!(names.contains(&c.adapter.name), "{} has no source", c.adapter.name);
+    }
+    for p in reference::PROFILES {
+        if let reference::Source::Logged { adapter, date } = p.source {
+            let shape: String = date.chars().map(|c| if c.is_ascii_digit() { '0' } else { c }).collect();
+            assert!(!adapter.is_empty() && shape == "0000-00-00", "{}: {adapter:?} {date:?}", (p.caps)().adapter.name);
+        }
+    }
+}
+
+#[test]
 fn plans_do_not_depend_on_vendor_or_driver() {
     for base in reference::all() {
         let mut other = base.clone();

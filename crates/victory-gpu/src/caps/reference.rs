@@ -1,17 +1,55 @@
-//! The reference adapter set: invented caps of each class of device the
+//! The reference adapter set: fake caps of each class of device the
 //! planners must serve, for tests that need no GPU.
 //!
-//! Figures are the classes' typical reports written from public vendor and
-//! D3D12 documentation, NOT dumps from those devices (except `nvidia_pascal`,
-//! which holds the figures a GTX 1070 logged); only the class traits
-//! that matter to a planner (wave range, tiers, UMA, memory) are set. When
-//! someone owns a device, replace its entry with that device's `{:#?}` of
-//! `Caps` and say so in the commit. Names say what class, not what card.
+//! A profile stands for a class, not a card, and sets the traits that matter
+//! to a planner (wave range, tiers, UMA, memory). So that nobody takes a
+//! figure for more than it is, each is listed in [`PROFILES`] with the
+//! [`Source`] of its figures. When a device of a class can be read, prefer
+//! what it reports and update the source with it; the profile's own comment
+//! says which figures that reading did not cover.
 
 use super::{AdapterInfo, Caps, MemoryCaps, ShaderModel, WaveLanes};
 use std::collections::BTreeMap;
 
 const GIB: u64 = 1 << 30;
+
+/// Where a profile's figures come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Public vendor and D3D12 documentation, and inference from it: not a
+    /// dump of a device.
+    Documented,
+    /// What a real device wrote to a log; `date` (`YYYY-MM-DD`) is that of
+    /// the log. Figures the log lacks are filled in by other means.
+    Logged { adapter: &'static str, date: &'static str },
+}
+
+/// One entry of the reference set.
+pub struct Profile {
+    pub caps: fn() -> Caps,
+    pub source: Source,
+}
+
+const fn documented(caps: fn() -> Caps) -> Profile {
+    Profile { caps, source: Source::Documented }
+}
+
+/// Every profile and the source of its figures.
+pub const PROFILES: &[Profile] = &[
+    documented(nvidia_modern),
+    documented(nvidia_maxwell1),
+    documented(amd_rdna),
+    documented(amd_gcn),
+    documented(intel_arc),
+    documented(intel_igpu),
+    documented(warp),
+    documented(nvidia_maxwell),
+    Profile { caps: nvidia_pascal, source: Source::Logged { adapter: "NVIDIA GeForce GTX 1070", date: "2026-11-25" } },
+    documented(nvidia_turing),
+    documented(nvidia_ampere),
+    documented(nvidia_ada),
+    documented(nvidia_blackwell),
+];
 
 fn base(name: &str, vendor_id: u32, wave: (u32, u32), tiers: (u8, u8, u8)) -> Caps {
     Caps {
@@ -42,13 +80,12 @@ pub fn nvidia_modern() -> Caps {
 // waves of 64). What the planners read and what they rest on:
 // - mesh shader tier 1 comes with feature level 12_2 (Turing and on; the
 //   GTX 16 cards are listed at 12_1 and are not profiled here);
-// - Pascal's figures are the GTX 1070's own start log (below);
-// - 64-bit typed atomics: on, as that log says, for every later generation
-//   (inferred); off for Maxwell (a guess, the conservative side);
-// - shader model: what a current driver reports (Pascal 6.8 seen, later ones
-//   inferred, Maxwell 6.7 from Wikipedia's GeForce 700/900 pages). The
+// - 64-bit typed atomics: on in the Pascal log, on for every later
+//   generation (inferred); off for Maxwell (a guess, the conservative side);
+// - shader model: what a current driver reports (6.8 in the Pascal log, later
+//   ones inferred, Maxwell 6.7 from Wikipedia's GeForce 700/900 pages). The
 //   planners compare only against 6.6;
-// - binding tier 3 is a 12_2 requirement and seen on Pascal; on Maxwell 2 it
+// - binding tier 3 is a 12_2 requirement and in the Pascal log; on Maxwell 2 it
 //   is from driver reports (unverified);
 // - tiled tier 3 is a 12_2 requirement; Maxwell's is a guess;
 // - memory is a typical card of the generation; anisotropic filtering with
@@ -75,9 +112,9 @@ pub fn nvidia_maxwell() -> Caps {
     }
 }
 
-/// NVIDIA Pascal: the owner's GTX 1070 as its start log reports it
-/// (2026-11, `caps::probe` summary and the host's path lines). `shared`,
-/// the driver version and `aniso_point_mip` are not in the log.
+/// NVIDIA Pascal, read from a start log (the `caps::probe` summary and the
+/// host's path lines). `shared`, the driver version and `aniso_point_mip` are
+/// not in that log.
 pub fn nvidia_pascal() -> Caps {
     Caps {
         shader_model: Some(ShaderModel(0x68)),
@@ -129,9 +166,8 @@ fn nvidia_adapter(name: &str) -> AdapterInfo {
     AdapterInfo { name: name.into(), vendor_id: 0x10de, ..AdapterInfo::default() }
 }
 
-/// The NVIDIA generations, oldest first (`nvidia_pascal` is the owner's
-/// GTX 1070, `nvidia_modern` the class name older tests use,
-/// `nvidia_maxwell1` a side case of Maxwell).
+/// The NVIDIA generations, oldest first (`nvidia_modern` is the class name
+/// older tests use, `nvidia_maxwell1` a side case of Maxwell).
 pub fn nvidia_generations() -> Vec<Caps> {
     vec![nvidia_maxwell(), nvidia_pascal(), nvidia_turing(), nvidia_ampere(), nvidia_ada(), nvidia_blackwell()]
 }
@@ -171,7 +207,5 @@ pub fn warp() -> Caps {
 
 /// Every class above, by name.
 pub fn all() -> Vec<Caps> {
-    let mut all = vec![nvidia_modern(), nvidia_maxwell1(), amd_rdna(), amd_gcn(), intel_arc(), intel_igpu(), warp()];
-    all.extend(nvidia_generations());
-    all
+    PROFILES.iter().map(|p| (p.caps)()).collect()
 }

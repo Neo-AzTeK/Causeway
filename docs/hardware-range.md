@@ -68,7 +68,8 @@ budget.
   hardware fails and the reverse. It shows the probe works, not that a plan is
   right.
 - A new device you own: log line `host caps (generation N): ...` at start
-  shows the summary; paste its `{:#?}` into `reference.rs` as a new class.
+  shows the summary; paste its `{:#?}` into `reference.rs` as a new class,
+  with its `Source` in `PROFILES`.
 
 ## The reference adapter set
 
@@ -77,9 +78,10 @@ budget.
 `nvidia_blackwell`; the side case `nvidia_maxwell1`, first-generation Maxwell
 at binding tier 2; `nvidia_modern` is the class name older tests use), `amd_rdna` (waves 32 to 64), `amd_gcn` (wave64 only),
 `intel_arc` (8 to 32), `intel_igpu` (UMA, 128 MiB "dedicated"), `warp`.
-`nvidia_pascal` takes its figures from the GTX 1070's start log; the others
-are class profiles written from public documentation and inference, not dumps;
-the code says which is which. A change is verified on a class only through its fake or WARP.
+Each entry of `reference::PROFILES` carries the `Source` of its figures
+(documentation and inference, or a real device's log with its date); check it
+before relying on a figure. A change is verified on a class only through its
+fake or WARP.
 Every brief and report says which adapters ran for real, which only as fakes.
 
 ## Vendor and driver
@@ -151,7 +153,7 @@ here; add it when a second person has a device to dump.
 
 ## NVIDIA: each path the GTX 1070 takes, and the other side
 
-The owner's card is Pascal (`nvidia_pascal`, figures from its start log):
+The owner's card is Pascal (`nvidia_pascal`):
 waves of 32, SM 6.8, binding tier 3, tiled tier 4, mesh tier 0, 64-bit heap
 atomics. Each row is a decision made from `Caps` (or its creation failure,
 where marked); the generations differ only in the fields shown, and no code
