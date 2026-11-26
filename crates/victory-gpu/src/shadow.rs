@@ -371,6 +371,8 @@ impl Shadow {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
+        #[cfg(feature = "diagnostics")]
+        let mut first_written = None;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
@@ -432,6 +434,8 @@ impl Shadow {
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
                         written += n;
+                        #[cfg(feature = "diagnostics")]
+                        first_written.get_or_insert((start + at) as u64);
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -461,6 +465,14 @@ impl Shadow {
             }
             if let Some(t) = &self.tracked {
                 t.disarm();
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            drop(pending);
+            drop(snapshot);
+            if let Some(at) = first_written {
+                note_write_back(self, at);
             }
         }
         written
@@ -521,6 +533,8 @@ impl Shadow {
         if let Some(bytes) = written {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
+            #[cfg(feature = "diagnostics")]
+            note_write_back(self, from as u64);
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
@@ -1020,6 +1034,65 @@ pub(crate) fn log_views(frames: f64) {
     }
 }
 
+/// The (start, length) of the copy a root view at `address` reads, where
+/// that is not the copy at `copy` covering `own` (start, length): what
+/// [`find`] of one byte there picks, nothing made.
+#[cfg(feature = "diagnostics")]
+fn root_copy_elsewhere(copy: *const Shadow, own: (u64, u64), address: u64) -> Option<(u64, u64)> {
+    let map = buffers();
+    let buffer = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end > address);
+    if let Some((&(start, _), e)) = buffer {
+        let same = e.shadow.as_ref().is_some_and(|s| std::ptr::eq(Arc::as_ptr(s), copy));
+        return (!same).then_some((start, e.end - start));
+    }
+    drop(map);
+    let start = address & !(WINDOW - 1);
+    let window = (start, (address + 1).next_multiple_of(WINDOW) - start);
+    (own != window).then_some(window)
+}
+
+/// Write-backs into title memory, and those among them through a copy a
+/// root view of the same bytes would not read.
+#[cfg(feature = "diagnostics")]
+static WRITE_BACKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Counts shaders' bytes at `address` going back to title memory through
+/// `copy`. Through another copy than a root view's, such a view reads the
+/// older bytes until a later submission. Both counts are logged as either
+/// reaches a power of two, so a run's log also shows that there were none.
+// shortcut: judged at the first byte written back; a range spanning several
+// buffers is not split.
+#[cfg(feature = "diagnostics")]
+fn note_write_back(copy: &Shadow, address: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let all = WRITE_BACKS[0].fetch_add(1, Relaxed) + 1;
+    match root_copy_elsewhere(copy, (copy.start, copy.len), address) {
+        Some((start, len)) => {
+            let other = WRITE_BACKS[1].fetch_add(1, Relaxed) + 1;
+            if other.is_power_of_two() {
+                tracing::info!(
+                    other,
+                    all,
+                    at = format_args!("{address:#x}"),
+                    through = format_args!("{:#x}+{:#x}", copy.start, copy.len),
+                    root_view_copy = format_args!("{start:#x}+{len:#x}"),
+                    "shader write-back through a copy a root view there does not read"
+                );
+            }
+        }
+        None => {
+            if all.is_power_of_two() {
+                let other = WRITE_BACKS[1].load(Relaxed);
+                tracing::info!(other, all, "shader write-backs so far");
+            }
+        }
+    }
+}
+
 /// Copies of single views' bytes ([`for_view`]), by (start, length), held
 /// by the heap slots made from them and the lists that use them: a copy is
 /// found again for as long as a slot shows it, so draws refresh the copy
@@ -1397,6 +1470,24 @@ pub(crate) mod tests {
     /// reads zeros as far as its views reach (its length rounded up to 256)
     /// and all of its own bytes after its first refresh; longer ones still
     /// get a buffer of their own.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_view_copy_of_its_own_is_not_a_root_views() {
+        let _placing = PLACING.lock().unwrap_or_else(|e| e.into_inner());
+        let p = crate::watch::tests::pool(3);
+        register(p, p as u64, 3 * PAGE as u64);
+        let Some((own, true)) = for_view(p as u64 + 4, 4000, 16) else {
+            unregister(p, p as u64);
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let whole = find(p as u64 + 4, 1).unwrap();
+        let elsewhere = |copy: &Arc<Shadow>| root_copy_elsewhere(Arc::as_ptr(copy), (copy.start, copy.len), p as u64 + 4);
+        assert_eq!(elsewhere(&whole), None);
+        assert_eq!(elsewhere(&own), Some((p as u64, 3 * PAGE as u64)));
+        unregister(p, p as u64);
+    }
+
     #[test]
     fn view_copies_are_placed_on_heap_blocks() {
         let _placing = PLACING.lock().unwrap_or_else(|e| e.into_inner());

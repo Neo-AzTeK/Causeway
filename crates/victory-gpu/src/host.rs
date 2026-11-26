@@ -1186,7 +1186,7 @@ impl Host {
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
         // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+        if let Err(reason) = unsafe { self.device.GetDeviceRemovedReason() } {
             let what = format!(
                 "host GPU device removed after a submission of {} lists{}{}{}{}",
                 runs.len(),
@@ -1201,7 +1201,9 @@ impl Host {
             if !survive_removal() {
                 fail(format_args!("{what}"));
             }
-            tracing::error!("{what}; VICTORY_SURVIVE_REMOVAL=1: the run goes on without the GPU");
+            // `fail` adds the reason itself; without it a hang and a fault
+            // read alike.
+            tracing::error!("{what}; device removed: {reason}; VICTORY_SURVIVE_REMOVAL=1: the run goes on without the GPU");
             REMOVAL_SURVIVED.store(true, Ordering::Relaxed);
             Self::finish_without_gpu(runs);
             return;
@@ -1339,6 +1341,13 @@ impl Host {
                 }
                 text.push_str(&crate::shadow::near(va));
                 text.push_str(&crate::descriptor::host::near_heaps(va));
+            }
+            // Silence would read as "no fault" where the query failed.
+            if fault_va.is_none() {
+                match dred.GetPageFaultAllocationOutput1() {
+                    Ok(_) => text.push_str("; no page fault reported"),
+                    Err(e) => text.push_str(&format!("; no page fault data ({e})")),
+                }
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
