@@ -170,6 +170,22 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// The `vs+ps,...` pairs of `VICTORY_PAIRS`. Their pipelines are made on the
+/// GPU, so they need `--pipelines`: without it this command opens no GPU,
+/// which `cargo xtask smoke` and `alone` judge by its command line.
+fn wanted_pairs(setting: &str, pipelines: bool) -> Result<Vec<(String, String)>> {
+    let pairs: Vec<(String, String)> = setting
+        .split(',')
+        .filter_map(|p| p.split_once('+'))
+        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+        .collect();
+    anyhow::ensure!(
+        pipelines || pairs.is_empty(),
+        "VICTORY_PAIRS makes pipelines on the GPU: pass --pipelines"
+    );
+    Ok(pairs)
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -194,12 +210,7 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
-    let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
-        .collect();
+    let pairs = wanted_pairs(&std::env::var("VICTORY_PAIRS").unwrap_or_default(), pipelines)?;
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -926,6 +937,14 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pairs_without_pipelines_are_refused() {
+        assert!(super::wanted_pairs("a+b", false).is_err());
+        assert_eq!(super::wanted_pairs("a + b,c", true).unwrap(), [("a".into(), "b".into())]);
+        assert!(super::wanted_pairs("", false).unwrap().is_empty());
+        assert!(super::wanted_pairs("no-pair", false).unwrap().is_empty());
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {

@@ -80,9 +80,10 @@ area failed; what a log does not show is "unknown".
 
 On a real GPU this can reset the display driver, so only one smoke run at a
 time starts on a machine, and none while another `victory.exe`, the testbed or
-any cargo test binary runs (it may be on the GPU). `cargo xtask alone --
+any cargo test binary runs (it may be on the GPU; `victory census` and
+`victory translate` without `--pipelines` are not). `cargo xtask alone --
 <command>` holds the same lock around GPU tests. `--quiet` also refuses to start
-beside a compiler or linker: use it when timings matter. Each launched run
+beside a compiler, a linker or such a scan: use it when timings matter. Each launched run
 is sampled every 5 s; `run.txt` and the digest header say `machine: quiet`,
 `NOT QUIET: ...` or `unknown` (by process name: other load is not seen).
 `--problem <id>` writes the run into that problem's log

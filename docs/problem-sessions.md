@@ -122,8 +122,9 @@ chain and the proof run.
 
 **The GPU.** One title or GPU test at a time on the machine. `cargo xtask smoke`
 and `cargo xtask alone -- <command>` take the same machine-wide lock, and both
-refuse to start while a `victory.exe`, the testbed or any cargo test binary
-runs. Run every test that may use the GPU through `alone` (`victory-gpu`,
+refuse to start while a `victory.exe` (`census`, or `translate` without
+`--pipelines`, apart), the testbed or any cargo test binary runs. Run every test that may use the GPU
+through `alone` (`victory-gpu`,
 `victory-shader`, `victory-hle`, the whole workspace, testbed `--hardware`):
 
 ```powershell
@@ -142,10 +143,12 @@ Get-CimInstance Win32_Process -Filter "Name='victory.exe'" | Where-Object Comman
 It lists every `victory.exe` except the offline scans (`translate`, `census`),
 so a title, or one whose command line cannot be read, still makes you wait. An
 offline scan alone does not hold up a build. It does take CPU, and a build in
-the scan's own worktree cannot replace the `victory.exe` it runs. The lock is
-unchanged: `smoke` and `alone` still refuse beside any `victory.exe`, so GPU
-tests wait for a scan too, and a scan that uses the GPU (`translate
---pipelines`) runs through `alone`.
+the scan's own worktree cannot replace the `victory.exe` it runs. `smoke` and
+`alone` start beside `census` and `translate` too, unless it has
+`--pipelines`: that one uses the GPU, makes them wait and runs through
+`alone`. `--quiet` refuses beside any scan. This is the `xtask` of the
+worktree you run them from: a branch without this rule still waits for every
+`victory.exe`.
 
 A branch made before `alone` existed has no such command: merge `main` into it
 first.
