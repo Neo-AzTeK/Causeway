@@ -209,6 +209,35 @@ impl GraphicsState {
         )
     }
 
+    /// The blend state the host takes. The title's states leave blending on
+    /// for integer targets, which D3D12 refuses on every adapter (the whole
+    /// pipeline, E_INVALIDARG); the console writes those unblended, so the
+    /// host turns it off for them.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let count = self.targets.NumRenderTargets.min(8) as usize;
+        let integer = |i: usize| i < count && crate::twin::integer(self.targets.RTFormats[i].0 as u32);
+        if !(0..count).any(integer) {
+            return blend;
+        }
+        if !blend.IndependentBlendEnable.as_bool() {
+            // The first entry speaks for every target. Without blending
+            // there is nothing to turn off (and it may hold a logic op,
+            // which independent blending forbids).
+            if !blend.RenderTarget[0].BlendEnable.as_bool() {
+                return blend;
+            }
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for (i, target) in blend.RenderTarget.iter_mut().enumerate() {
+            if integer(i) {
+                target.BlendEnable = false.into();
+            }
+        }
+        blend
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -781,7 +810,7 @@ impl HostPipeline {
                 pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -890,7 +919,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -1005,6 +1034,89 @@ mod tests {
         c[info + 16..info + 20].copy_from_slice(&min.to_le_bytes());
         c[info + 20..info + 24].copy_from_slice(&max.to_le_bytes());
         c
+    }
+
+    /// A state as the title's streams can hold it: blending on (`ONE`, `ONE`,
+    /// `MAX`) for a float, a 4-bit and an integer target.
+    #[allow(clippy::field_reassign_with_default)]
+    fn blending_with_an_integer_target() -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[..3].copy_from_slice(&[
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_B4G4R4A4_UNORM,
+            DXGI_FORMAT_R8_UINT,
+        ]);
+        g.blend.IndependentBlendEnable = true.into();
+        for target in &mut g.blend.RenderTarget[..3] {
+            target.BlendEnable = true.into();
+            target.DestBlend = D3D12_BLEND_ONE;
+            target.BlendOp = D3D12_BLEND_OP_MAX;
+        }
+        g
+    }
+
+    fn blending(blend: &D3D12_BLEND_DESC) -> [bool; 4] {
+        std::array::from_fn(|i| blend.RenderTarget[i].BlendEnable.as_bool())
+    }
+
+    #[test]
+    fn only_integer_targets_lose_blending() {
+        let mut g = blending_with_an_integer_target();
+        assert_eq!(blending(&g.host_blend()), [true, true, false, false]);
+
+        // One entry for every target: written out so one can differ.
+        g.blend.IndependentBlendEnable = false.into();
+        let host = g.host_blend();
+        assert!(host.IndependentBlendEnable.as_bool());
+        assert_eq!(blending(&host), [true, true, false, true]);
+        assert_eq!(host.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
+
+        // Without blending that entry is left as it is (a logic op needs it).
+        g.blend.RenderTarget[0].BlendEnable = false.into();
+        assert!(!g.host_blend().IndependentBlendEnable.as_bool());
+
+        // No integer target in use: the title's state, unchanged.
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.targets.NumRenderTargets = 2;
+        assert!(!g.host_blend().IndependentBlendEnable.as_bool());
+    }
+
+    /// D3D12 refuses blending on an integer target with E_INVALIDARG: a
+    /// title state that asks for it still makes its mesh and vertex
+    /// pipelines. On the adapter `host()` takes; the mesh half needs a mesh
+    /// tier.
+    #[cfg(windows)]
+    #[test]
+    fn an_integer_target_with_blending_makes_its_pipelines() {
+        let Some(host) = host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let made = |stage, shader: victory_shader::emit::HostShader| {
+            let s = Arc::new(Shader::new(stage, stage.as_bytes()));
+            s.translated
+                .set(Some(Translated { host: shader, used: Vec::new() }))
+                .ok()
+                .unwrap();
+            s
+        };
+        let ps = victory_shader::emit::host::stub_ps();
+        let g = blending_with_an_integer_target();
+
+        let vs = victory_shader::emit::host::stub_vs(&ps).unwrap();
+        let shaders = [made("vertex", vs), made("pixel", ps.clone())];
+        assert!(HostPipeline::new(&shaders, Some(&g)).is_some(), "vertex pipeline");
+
+        if !crate::caps::mesh_shaders(&host.caps) {
+            eprintln!("skipped: no mesh tier");
+            return;
+        }
+        let (_, ms) = crate::mesh::gpu_tests::program(false);
+        let shaders = [made("mesh", ms), made("pixel", ps)];
+        assert!(HostPipeline::new(&shaders, Some(&g)).is_some(), "mesh pipeline");
     }
 
     /// A pipeline is refused when its shader requires a wave size the host
