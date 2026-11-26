@@ -64,8 +64,9 @@ enum Way {
 
 /// A texture's tiled memory, changed since it was last taken.
 enum Changed<'a> {
-    /// Tracked memory, read through [`crate::host::copy_mapped`].
-    Mapped(*const u8),
+    /// Tracked memory, read through [`crate::host::copy_mapped`], with the
+    /// byte ranges that changed (none: all may have).
+    Mapped(*const u8, Option<Vec<(usize, usize)>>),
     /// Committed memory.
     Bytes(&'a [u8]),
 }
@@ -397,7 +398,7 @@ impl Staging {
         self.timed(|last| {
             self.take(last, |changed, read| {
                 match changed {
-                    Changed::Mapped(memory) => {
+                    Changed::Mapped(memory, _) => {
                         let size = self.layout.size as usize;
                         read.resize(size, 0);
                         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
@@ -421,15 +422,25 @@ impl Staging {
         };
         self.timed(|last| {
             self.take(last, |changed, _| {
-                let size = self.layout.size as usize;
-                plan.record(list, resource, texture, &self.footprints, |to| match changed {
-                    Changed::Mapped(memory) => {
-                        crate::host::copy_mapped(to, memory, size, false);
+                let dirty = match &changed {
+                    Changed::Mapped(_, dirty) => dirty.as_deref(),
+                    Changed::Bytes(_) => None,
+                };
+                plan.record(list, resource, texture, &self.footprints, dirty, |to, ranges| {
+                    for &(a, b) in ranges {
+                        // SAFETY: inside the layout's bytes, which the
+                        // buffer holds.
+                        let to = unsafe { to.add(a) };
+                        match &changed {
+                            Changed::Mapped(memory, _) => {
+                                crate::host::copy_mapped(to, memory.wrapping_add(a), b - a, false);
+                            }
+                            // SAFETY: as above.
+                            Changed::Bytes(tiled) => unsafe {
+                                std::ptr::copy_nonoverlapping(tiled[a..b].as_ptr(), to, b - a);
+                            },
+                        }
                     }
-                    // SAFETY: the buffer holds the layout's bytes.
-                    Changed::Bytes(tiled) => unsafe {
-                        std::ptr::copy_nonoverlapping(tiled.as_ptr(), to, tiled.len());
-                    },
                 })
             })
         })
@@ -456,13 +467,14 @@ impl Staging {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         if let Some(t) = &self.tracked {
-            let clean = t.take(start, start + size).is_empty();
-            if clean && !last.retry {
+            let changed = t.take(start, start + size);
+            if changed.is_empty() && !last.retry {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            let taken = use_it(Changed::Mapped(self.memory), &mut last.read);
+            let dirty = (!last.retry).then(|| changed.iter().map(|&(a, b)| (a - start, b - start)).collect());
+            let taken = use_it(Changed::Mapped(self.memory, dirty), &mut last.read);
             last.retry = !taken;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);

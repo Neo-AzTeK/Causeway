@@ -1,7 +1,9 @@
 //! Detiling on the host GPU (`crate::texture`): the tiled bytes go
 //! unchanged into an upload buffer, a compute shader gathers them into
 //! linear rows in a buffer in video memory, and that buffer is copied into
-//! the texture. Both buffers live until the list that uses them is reset.
+//! the texture. Both buffers are the list's until it is reset, then go back
+//! to a pool. Only the subresources whose tiled bytes may have changed are
+//! converted.
 //!
 //! The shader does no tiling arithmetic: `victory_formats` gives, for each
 //! subresource, a table of row and column offsets
@@ -12,6 +14,8 @@
 //!
 //! shortcut: elements under 4 bytes (the shader moves whole dwords) are
 //! detiled on the CPU, and so is everything if the shader is not made.
+
+use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -47,13 +51,79 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+struct Subresource {
+    constants: [u32; 8],
+    groups: [u32; 3],
+    /// The tiled bytes it reads lie in this range (others may too).
+    span: (usize, usize),
+}
+
+/// Buffers kept for the next conversion, up to this many bytes of each kind.
+const IDLE: u64 = 256 << 20;
+/// Larger buffers are made for one use.
+const POOLED: u64 = 64 << 20;
+
+struct Buffer {
+    resource: ID3D12Resource,
+    /// The mapping of an upload buffer; 0 for one in video memory.
+    data: usize,
+    size: u64,
+}
+
+// SAFETY: D3D12 objects are free-threaded; one list uses a buffer at a time.
+unsafe impl Send for Buffer {}
+
+/// Idle buffers: in video memory, and upload.
+static POOL: Mutex<[Vec<Buffer>; 2]> = Mutex::new([Vec::new(), Vec::new()]);
+
+/// A buffer a list holds; back to the pool when the list is reset.
+pub(crate) struct Pooled(Option<Buffer>);
+
+impl Pooled {
+    fn get(host: &crate::host::Host, size: u64, upload: bool) -> Option<Pooled> {
+        let size = if size > POOLED { size } else { size.max(1 << 16).next_power_of_two() };
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = &mut pool[usize::from(upload)];
+        if let Some(i) = idle.iter().position(|b| b.size == size) {
+            return Some(Pooled(Some(idle.swap_remove(i))));
+        }
+        drop(pool);
+        let (resource, data) = if upload {
+            let (resource, data) = host.upload_buffer(size)?;
+            (resource, data as usize)
+        } else {
+            (host.unordered_buffer(size)?, 0)
+        };
+        Some(Pooled(Some(Buffer { resource, data, size })))
+    }
+
+    fn buffer(&self) -> &Buffer {
+        self.0.as_ref().expect("held until dropped")
+    }
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        let Some(buffer) = self.0.take() else {
+            return;
+        };
+        if buffer.size > POOLED {
+            return;
+        }
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = &mut pool[usize::from(buffer.data != 0)];
+        if idle.iter().map(|b| b.size).sum::<u64>() + buffer.size <= IDLE {
+            idle.push(buffer);
+        }
+    }
+}
+
 /// What a texture's conversion needs, computed once.
 pub(crate) struct Plan {
     /// Bytes of tiled memory; the tables follow them.
     tiled: usize,
     tables: Vec<u32>,
-    /// Per subresource: the shader's constants and the dispatch.
-    subresources: Vec<([u32; 8], [u32; 3])>,
+    subresources: Vec<Subresource>,
     /// Bytes of the linear buffer.
     linear: u64,
 }
@@ -88,13 +158,19 @@ impl Plan {
             if t.height > host_rows || row_bytes > u64::from(f.RowPitch) || end > linear {
                 return None;
             }
+            let low = |v: &[u32]| v.iter().copied().min().unwrap_or(0) as usize;
+            let high = |v: &[u32]| v.iter().copied().max().unwrap_or(0) as usize;
+            let span = (
+                low(&t.rows) + low(&t.columns),
+                (high(&t.rows) + high(&t.columns) + element as usize).min(layout.size as usize),
+            );
             let columns = u32::try_from(tiled + tables.len() * 4).ok()?;
             tables.extend_from_slice(&t.columns);
             let row_table = u32::try_from(tiled + tables.len() * 4).ok()?;
             tables.extend_from_slice(&t.rows);
             let dwords = t.width * (element / 4);
-            subresources.push((
-                [
+            subresources.push(Subresource {
+                constants: [
                     dwords,
                     t.height,
                     element / 4,
@@ -104,36 +180,62 @@ impl Plan {
                     columns,
                     row_table,
                 ],
-                [dwords.div_ceil(64), t.height, t.depth],
-            ));
+                groups: [dwords.div_ceil(64), t.height, t.depth],
+                span,
+            });
         }
         Some(Plan { tiled, tables, subresources, linear })
     }
 
     /// Records the conversion into `list`, one of the runtime's own, and
     /// the copy into `texture` (the host copy of `resource`), which is left
-    /// in the copy destination state. `fill` writes the tiled bytes where it
-    /// is told. False if the host gave no buffers.
+    /// in the copy destination state. Only what reads from the `dirty` byte
+    /// ranges of the tiled memory (none: all of it). `fill(to, ranges)`
+    /// writes those ranges of the tiled bytes at their offsets from `to`.
+    /// False if the host gave no buffers.
     pub(crate) fn record(
         &self,
         list: &HostList,
         resource: This,
         texture: &ID3D12Resource,
         footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
-        fill: impl FnOnce(*mut u8),
+        dirty: Option<&[(usize, usize)]>,
+        fill: impl FnOnce(*mut u8, &[(usize, usize)]),
     ) -> bool {
         const COPY_DEST: u32 = 0x400;
         let (Some(host), Some(converter)) = (host(), converter()) else {
             return false;
         };
+        let chosen: Vec<usize> = (0..self.subresources.len())
+            .filter(|&i| {
+                let (a, b) = self.subresources[i].span;
+                dirty.is_none_or(|d| d.iter().any(|&(from, to)| from < b && a < to))
+            })
+            .collect();
+        if chosen.is_empty() {
+            crate::list::ensure_state(list, resource, COPY_DEST);
+            return true;
+        }
+        // The ranges to read: the chosen spans, merged.
+        let mut ranges: Vec<(usize, usize)> = chosen.iter().map(|&i| self.subresources[i].span).collect();
+        ranges.sort_unstable();
+        ranges.dedup_by(|next, kept| {
+            let joined = next.0 <= kept.1;
+            if joined {
+                kept.1 = kept.1.max(next.1);
+            }
+            joined
+        });
         let size = (self.tiled + self.tables.len() * 4) as u64;
-        let Some((input, data)) = host.upload_buffer(size) else {
+        let (Some(from), Some(to)) = (Pooled::get(host, size, true), Pooled::get(host, self.linear, false)) else {
             return false;
         };
-        let Some(output) = host.unordered_buffer(self.linear) else {
-            return false;
-        };
-        fill(data);
+        let input = from.buffer().resource.clone();
+        let data = from.buffer().data as *mut u8;
+        let output = to.buffer().resource.clone();
+        list.keep_pooled(from);
+        list.keep_pooled(to);
+        fill(data, &ranges);
         // SAFETY: the upload buffer holds the tables after the tiled bytes,
         // at a multiple of 4.
         unsafe {
@@ -143,8 +245,6 @@ impl Plan {
                 self.tables.len(),
             );
         }
-        list.keep(&input);
-        list.keep(&output);
         let l = &list.list;
         // SAFETY: an open list of the runtime's; live buffers, kept by the
         // list; the constants and dispatches stay inside them (`new`).
@@ -153,9 +253,11 @@ impl Plan {
             l.SetPipelineState(&converter.pso);
             l.SetComputeRootShaderResourceView(1, input.GetGPUVirtualAddress());
             l.SetComputeRootUnorderedAccessView(2, output.GetGPUVirtualAddress());
-            for (constants, [x, y, z]) in &self.subresources {
-                l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                l.Dispatch(*x, *y, *z);
+            for &i in &chosen {
+                let s = &self.subresources[i];
+                l.SetComputeRoot32BitConstants(0, 8, s.constants.as_ptr().cast(), 0);
+                let [x, y, z] = s.groups;
+                l.Dispatch(x, y, z);
             }
             l.ResourceBarrier(&[crate::host::transition(
                 &output,
@@ -164,7 +266,8 @@ impl Plan {
             )]);
         }
         crate::list::ensure_state(list, resource, COPY_DEST);
-        for (i, footprint) in footprints.iter().enumerate() {
+        for &i in &chosen {
+            let footprint = &footprints[i];
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },

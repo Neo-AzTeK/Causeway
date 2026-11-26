@@ -914,6 +914,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Conversion buffers (`crate::detile`), pooled again at the reset.
+    pooled: Vec<crate::detile::Pooled>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -2079,6 +2081,10 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn keep_pooled(&self, buffer: crate::detile::Pooled) {
+        self.deferred().pooled.push(buffer);
     }
 
     /// Whether this is the first time since the reset that the list asks
