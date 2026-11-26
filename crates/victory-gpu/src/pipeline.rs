@@ -363,6 +363,17 @@ pub(crate) fn shaders_of(this: This) -> String {
     format!("{:?}", pipeline(this).shaders)
 }
 
+/// The compute shader of `this` with its translation, if one is made already:
+/// also for a pipeline the host refused. Never translates (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn compute_translation<'a>(this: This) -> Option<(&'a str, &'a Translated)> {
+    if this.is_null() {
+        return None;
+    }
+    let shader = pipeline(this).shaders.iter().find(|s| s.stage == "compute")?;
+    Some((&shader.hash, shader.translated.get()?.as_ref()?))
+}
+
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

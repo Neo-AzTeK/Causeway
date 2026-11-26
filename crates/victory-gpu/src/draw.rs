@@ -179,9 +179,9 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host, counts it by why
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
-/// it in the list (diagnostics).
+/// it in the list, with what it would have written (`bound`) (diagnostics).
 #[cfg(feature = "diagnostics")]
-fn dropped(list: &HostList, pipeline: usize, kind: &str) {
+fn dropped(list: &HostList, pipeline: usize, kind: &str, bound: &str) {
     // A skip or a missing host pipeline is the pipeline's own reason.
     let own = crate::pipeline::is_skipped(pipeline as This)
         || crate::pipeline::host_pipeline(pipeline as This).is_none();
@@ -196,7 +196,7 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
     } else {
         crate::pipeline::note_why(format!("{kind}: {why}"));
     }
-    list.note_op(|| format!("DROPPED {kind} ({why}) {}", crate::pipeline::shaders_of(pipeline as This)));
+    list.note_op(|| format!("DROPPED {kind} ({why}) {}{bound}", crate::pipeline::shaders_of(pipeline as This)));
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -1003,6 +1003,8 @@ impl State {
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("clear uav {values:x?} float {float}: {}", describe(Some(&view))));
         // SAFETY: an open list; both slots view the live resource.
         unsafe {
             if float {
@@ -1021,7 +1023,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            dropped(list, self.pipeline, "dispatch");
+            dropped(list, self.pipeline, "dispatch", &self.written_text());
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1031,7 +1033,7 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "dispatch");
+            dropped(list, self.pipeline, "dispatch", &self.written_text());
             return;
         };
         if !p.compute {
@@ -1041,7 +1043,7 @@ impl State {
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "dispatch");
+            dropped(list, self.pipeline, "dispatch", &self.written_text());
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1114,13 +1116,57 @@ impl State {
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         if !compute {
-            let mem = |r: usize| crate::resource::texture_memory(r as This).map_or(0, |(p, _)| p as u64);
-            let targets: Vec<String> = self.targets.iter().map(|&t| format!("{t:#x} mem {:#x}", mem(t))).collect();
-            let _ = write!(text, " targets {targets:?} depth {:#x} mem {:#x}", self.depth, mem(self.depth));
+            text.push_str(&self.bound_text());
         }
         text
     }
 
+    /// The render targets and depth bound now, each with its console memory
+    /// (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn bound_text(&self) -> String {
+        let mem = |r: usize| crate::resource::texture_memory(r as This).map_or(0, |(p, _)| p as u64);
+        let targets: Vec<String> = self.targets.iter().map(|&t| format!("{t:#x} mem {:#x}", mem(t))).collect();
+        format!(" targets {targets:?} depth {:#x} mem {:#x}", self.depth, mem(self.depth))
+    }
+
+    /// In a listed frame, what a compute call that cannot run would have
+    /// written: each unordered-access view its program reads from the bound
+    /// compute roots, and the heap slots its table user data names. Empty in
+    /// other frames; says so if no translation is made (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn written_text(&self) -> String {
+        use std::fmt::Write;
+        if !crate::capture::listed(crate::queue::presented() + 1) {
+            return String::new();
+        }
+        let Some((hash, t)) = crate::pipeline::compute_translation(self.pipeline as This) else {
+            return " writes unknown (no compute translation made)".into();
+        };
+        let mut text = format!(" writes of {hash}:");
+        for u in t.used.iter().filter(|u| u.kind == ResourceType::Uav) {
+            let what = match (u.root, self.roots_ref(true).get(usize::from(u.slot))) {
+                (RootType::Table, Some(Root::Table(table))) => {
+                    describe(crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4).as_ref())
+                }
+                (_, root) => format!("{root:?}"),
+            };
+            let _ = write!(text, " [s{}+{}: {what}]", u.slot, u.table_offset_dwords);
+        }
+        let views = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten();
+        for u in t.host.user_data.iter().filter(|u| u.root == RootType::Table && !is_root_view(u)) {
+            if !matches!(self.roots_ref(true).get(usize::from(u.slot)), Some(Root::Table(_))) {
+                continue;
+            }
+            let index = self.user_value(true, u.slot, u.root, u.dword) / 32;
+            if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
+                let _ = write!(text, " u{} [heap {index}: {slot}]", u.index);
+            }
+        }
+        text
+    }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
@@ -1154,7 +1200,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "mesh");
+            dropped(list, self.pipeline, "mesh", &self.bound_text());
         }
     }
 
@@ -1720,7 +1766,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "draw");
+            dropped(list, self.pipeline, "draw", &self.bound_text());
         }
     }
 
@@ -1814,7 +1860,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "indexed");
+            dropped(list, self.pipeline, "indexed", &self.bound_text());
         }
     }
 }
@@ -1833,23 +1879,26 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
-        // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
-            list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}", crate::pipeline::shaders_of(self.pipeline as This)));
-            return false;
-        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // What a dropped call would have written.
+        #[cfg(feature = "diagnostics")]
+        let bound = if kind == DISPATCH { self.written_text() } else { self.bound_text() };
+        // Skip before the argument clamp can mutate the indirect buffer.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::note_drop(self.pipeline as This);
+            list.note_op(|| format!("DROPPED indirect kind {kind} (skipped) {}{bound}", crate::pipeline::shaders_of(self.pipeline as This)));
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| {
             crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
-            list.note_op(|| format!("DROPPED indirect kind {kind} max {max} ({what}) {}", crate::pipeline::shaders_of(pipeline)));
+            list.note_op(|| format!("DROPPED indirect kind {kind} max {max} ({what}) {}{bound}", crate::pipeline::shaders_of(pipeline)));
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
@@ -1868,7 +1917,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_indirect_drop(kind, self.pipeline as This);
-                list.note_op(|| format!("DROPPED indirect kind {kind} max {max} (no host pipeline) {}", crate::pipeline::shaders_of(self.pipeline as This)));
+                list.note_op(|| format!("DROPPED indirect kind {kind} max {max} (no host pipeline) {}{bound}", crate::pipeline::shaders_of(self.pipeline as This)));
             }
             return false;
         }
@@ -1949,7 +1998,7 @@ impl State {
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
                     crate::pipeline::note_indirect_drop(kind, self.pipeline as This);
-                    list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
+                    list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}{bound}", crate::pipeline::shaders_of(pipeline)));
                 }
                 Some(p) => why(&format!(
                     "prepare failed (compute {}, mesh {}): {}",
@@ -2106,7 +2155,7 @@ fn describe(view: Option<&View>) -> String {
             // Its console memory: another view of it (a placed one) is
             // another host texture.
             let at = crate::resource::texture_memory(r).map_or(0, |(p, _)| p as u64);
-            format!("{}x{} f{} flags {:#x} mem {at:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!("res {:#x} {}x{} f{} flags {:#x} mem {at:#x}", r as usize, d.Width, d.Height, d.Format.0, d.Flags.0)
         })
     };
     // Small buffers (exposure, counters): their title memory now, as floats.
