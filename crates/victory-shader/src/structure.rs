@@ -475,9 +475,28 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: HashMap<(usize, usize), Bool>,
+    /// Built by [`wave_flow`]: lanes follow their wave, not their own
+    /// conditions. `reach` is then all true, `guards` the raw EXEC, and a
+    /// branch's `when` is each lane's say in the wave's decision, which says
+    /// nothing of the lanes that take an edge.
+    pub wave_flow: bool,
+    /// With `wave_flow`: where a lane on its own conditions would need the
+    /// guard ([`Structured::guards`] of [`structure`]).
+    alone: Option<Vec<Vec<bool>>>,
 }
 
 impl Structured {
+    /// Whether the lanes that run instruction `i` of block `b` may find, in
+    /// a VGPR it writes, an old value they still read: its guard, but with
+    /// `wave_flow` the one a lane on its own conditions would have, as only
+    /// the lanes in EXEC read what it computes.
+    pub fn keeps_old(&self, b: usize, i: usize) -> bool {
+        match &self.alone {
+            Some(a) => a[b][i],
+            None => self.guards[b][i].is_some(),
+        }
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -489,7 +508,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -497,11 +516,23 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, false)
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
+/// The form of a compute program whose host lanes follow the whole console
+/// wave through every branch (two waves of 32 deciding together): nothing
+/// is known of a lane from the block it is in (see [`Structured::wave_flow`]).
+pub fn wave_flow(program: &Program) -> Result<Structured, ShaderError> {
+    let alone = structure(program)?.guards;
+    let mut s = structure_as(program, true, true)?;
+    let guarded = |g: Vec<Option<Bool>>| g.iter().map(Option::is_some).collect();
+    s.alone = Some(alone.into_iter().map(guarded).collect());
+    Ok(s)
+}
+
+fn structure_as(program: &Program, helpers: bool, wave: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.wave_flow = wave;
     if !helpers {
         l.kills.clear();
     }
@@ -523,6 +554,8 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// See [`wave_flow`].
+    wave_flow: bool,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -534,6 +567,9 @@ struct Lanes<'a> {
     phis: Map<Value, (usize, usize)>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
     unresolved: HashSet<Value>,
+    /// Incoming masks of the joins left as [`Atom::Phi`]: each is read where
+    /// the join is made, so each is traced, once every block is.
+    open: Vec<Key>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -606,12 +642,14 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            wave_flow: false,
             order,
             index,
             incoming,
             defs,
             phis,
             unresolved: HashSet::new(),
+            open: Vec::new(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
@@ -700,6 +738,7 @@ impl<'a> Lanes<'a> {
         self.when.fill(None);
         self.active.clear();
         self.opaque.clear();
+        self.open.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -784,11 +823,19 @@ impl<'a> Lanes<'a> {
                 self.when[b] = Some(w);
             }
         }
+        // A back edge's mask may be a join nothing else asks for; tracing it
+        // may leave more of them.
+        while let Some(k) = self.open.pop() {
+            self.mask(k);
+        }
         execs
     }
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
+        if self.wave_flow {
+            return c;
+        }
         match self.when[q] {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
@@ -804,7 +851,13 @@ impl<'a> Lanes<'a> {
         let mut wrong = Vec::new();
         let mut j = 0;
         // Checking an argument can resolve another join; it is checked too.
-        while j < self.joins.len() {
+        loop {
+            if j == self.joins.len() {
+                // What that left open is traced, as in `masks_in_order`.
+                let Some(k) = self.open.pop() else { break };
+                self.mask(k);
+                continue;
+            }
             let (block, id, value) = (self.joins[j].block, self.joins[j].id, self.joins[j].value);
             for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
                 let (q, taken) = self.incoming[block][n];
@@ -895,6 +948,8 @@ impl<'a> Lanes<'a> {
                 .iter()
                 .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
                 .collect(),
+            wave_flow: self.wave_flow,
+            alone: None,
             bools: self.b,
             exits,
             guards,
@@ -1039,6 +1094,7 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
+        self.open.extend(args);
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
 

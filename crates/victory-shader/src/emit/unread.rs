@@ -139,6 +139,9 @@ impl Walk<'_, '_> {
             let next = match self.x.st.exits[b] {
                 LaneExit::Jump(t) => vec![t],
                 LaneExit::Branch {
+                    taken, not_taken, ..
+                } if self.x.st.wave_flow => vec![taken, not_taken],
+                LaneExit::Branch {
                     when,
                     taken,
                     not_taken,
@@ -189,6 +192,7 @@ impl Walk<'_, '_> {
                 not_taken,
             } = self.x.st.exits[q]
                 && taken != not_taken
+                && !self.x.st.wave_flow
                 && let Some((Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v), lo, hi)) =
                     self.x.st.bools.node(when)
                 && let Some(value) = match (lo, hi) {

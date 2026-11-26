@@ -474,6 +474,23 @@ pub fn emit(
     emit_with(c, native, p, st, io, res, Options::default())
 }
 
+/// The form in which two host waves follow the console's wave through every
+/// branch ([`structure::wave_flow`]), for a compute program that is otherwise
+/// refused: only where a group is one console wave, which keeps every thread
+/// of the group together. `None` where that does not apply.
+fn together(
+    native: &NativeProgram,
+    p: &ir::Program,
+) -> Option<Result<structure::Structured, ShaderError>> {
+    let crate::native::StageIo::Cs(cs) = &native.io else {
+        return None;
+    };
+    if !native.wave64 || cs.threads.iter().product::<u32>() > 64 {
+        return None;
+    }
+    Some(structure::wave_flow(p))
+}
+
 /// [`emit`] made as `options` say. A program of waves of 64 that still asks
 /// the host for them is made once more with the skips left out that keep a
 /// host wave from exchanging with its partner (module `skips`), and that is
@@ -512,6 +529,21 @@ pub fn emit_with(
                 }
                 Err(_) => {}
             }
+        }
+    }
+    // Last, so that no program the host takes already changes.
+    if !options.wave64_native
+        && first.as_ref().is_ok_and(needs64)
+        && let Some(together) = together(native, p)
+    {
+        let why = match together.and_then(|st| emit_once(c, native, p, &st, io, res, options)) {
+            Ok(s) if !needs64(&s) => return Ok(s),
+            Ok(s) => s.wave64_why,
+            Err(e) => Some(format!("with both halves together: {e}")),
+        };
+        // The last attempt decides the refusal: its reason is the one.
+        if let (Ok(first), Some(why)) = (&mut first, why) {
+            first.wave64_why = Some(why);
         }
     }
     first

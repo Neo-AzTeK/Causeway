@@ -79,15 +79,27 @@ fn reach(p: &Program, from: usize, without: usize) -> Vec<bool> {
 /// Whether the halves of every wave of 64 stay in step: `Err` names why not.
 pub(super) fn check(p: &Program) -> Result<(), &'static str> {
     let set = lane_derived(p);
-    let n = p.blocks.len();
-    // Scalar memory and EXEC are addressed or set by a lane-derived scalar
+    scalars(p, &set, true)?;
+    barriers(p, &set)
+}
+
+/// The part of [`check`] that holds even where both halves take every branch
+/// together. Scalar loads are not part of it: there a mask read as a number
+/// is the ballot of both halves, so an address computed from one is the
+/// console's in each.
+pub(super) fn check_together(p: &Program) -> Result<(), &'static str> {
+    scalars(p, &lane_derived(p), false)
+}
+
+fn scalars(p: &Program, set: &HashSet<Value>, loads: bool) -> Result<(), &'static str> {
+    // With `loads`, scalar memory is addressed, and EXEC is set, by a lane-derived scalar
     // other than a lane-wise mask operation.
     for block in &p.blocks {
         for inst in &block.insts {
-            if !reads_lanes(inst, &set) {
+            if !reads_lanes(inst, set) {
                 continue;
             }
-            if matches!(inst.fields, Fields::Smem { .. }) {
+            if loads && matches!(inst.fields, Fields::Smem { .. }) {
                 return Err("a scalar load addressed by a lane-derived scalar");
             }
             let name = inst.name();
@@ -105,6 +117,11 @@ pub(super) fn check(p: &Program) -> Result<(), &'static str> {
             }
         }
     }
+    Ok(())
+}
+
+fn barriers(p: &Program, set: &HashSet<Value>) -> Result<(), &'static str> {
+    let n = p.blocks.len();
     let barriers: Vec<usize> = (0..n)
         .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
         .collect();
@@ -115,7 +132,7 @@ pub(super) fn check(p: &Program) -> Result<(), &'static str> {
         let Exit::Branch { .. } = p.blocks[c].exit else {
             continue;
         };
-        if !p.blocks[c].insts.last().is_some_and(|i| reads_lanes(i, &set)) {
+        if !p.blocks[c].insts.last().is_some_and(|i| reads_lanes(i, set)) {
             continue;
         }
         for &b in &barriers {

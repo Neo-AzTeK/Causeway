@@ -64,7 +64,39 @@ fn program(whole: bool) -> Vec<u32> {
     w
 }
 
+/// [`program`] as one wave of 64 on 64 threads: only lanes below 40 (all of
+/// the lower half, 8 of the upper) hold EXEC around the level's conversion
+/// and the gathers, behind a skip, with a lane read among them, so the two
+/// host waves must follow the console's wave together. The others store the
+/// zeros set before.
+fn program_wave64() -> Vec<u32> {
+    let w = program(true);
+    let from = w.iter().position(|&x| x == 0x7E1E_0D0F).expect("the cvt");
+    let to = w.iter().rposition(|&x| x == 0xBF8C_3F70).expect("the wait");
+    // v_readlane_b32 s4, v0, 0
+    let inside = [&w[from..to], &[0xD760_0004, 0x100 | 128 << 9]].concat();
+    let mut out = w[..from].to_vec();
+    // v_mov_b32 vN, 0
+    out.extend((4..12).chain(16..20).map(|r| 0x7E00_0280 | r << 17));
+    out.extend([
+        0x7D88_00A8,                       // v_cmp_gt_u32 vcc, 40, v0
+        0xBE9E_246A,                       // s_and_saveexec_b64 s[30:31], vcc
+        0xBF88_0000 | inside.len() as u32, // s_cbranch_execz -> the restore
+    ]);
+    out.extend(&inside);
+    out.extend([
+        0xBEFE_041E, // s_mov_b64 exec, s[30:31]
+        0x4A28_2804, // v_add_nc_u32 v20, s4, v20: lane 0's number, which is 0
+    ]);
+    out.extend(&w[to..]);
+    out
+}
+
 fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    build_waves(words, false, 32)
+}
+
+fn build_waves(words: &[u32], wave64: bool, threads: u32) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -77,7 +109,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -94,7 +126,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -127,12 +159,13 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
+    let lower_as = |st: &structure::Structured| {
     lower::lower(&lower::Parts {
         mesh_compute: false,
         wave64_native: false,
         native,
         p: &p,
-        st: &st,
+        st,
         io: &io,
         res: &res,
         inputs: Vec::new(),
@@ -142,6 +175,19 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         min_lod_clamp: false,
         view_marks: false,
     })
+    };
+    let mut lowered = lower_as(&st)?;
+    // The last retry of `emit_with`.
+    let needs64 = |dxil: &[u8]| super::required_waves(dxil).is_some_and(|(least, _)| least > 32);
+    if needs64(&lowered.dxil)
+        && let Some(together) = super::together(native, &p)
+    {
+        let again = lower_as(&together?)?;
+        if !needs64(&again.dxil) {
+            lowered = again;
+        }
+    }
+    Ok(lowered)
 }
 
 /// The first texel of a footprint (see `Lower::gather_first`).
@@ -152,6 +198,19 @@ fn first(u: f32, size: u32) -> i64 {
 
 #[test]
 fn gathers_at_a_level_match_the_hardware() {
+    gathers_match(&build(&program(true)).expect("lower"), 32, 32);
+}
+
+#[test]
+fn gathers_at_a_level_in_a_skipped_block_of_a_wave64_match_the_hardware() {
+    let shader = build_waves(&program_wave64(), true, 64).expect("lower");
+    assert_eq!(super::required_waves(&shader.dxil), Some((32, 32)));
+    gathers_match(&shader, 64, 40);
+}
+
+/// `shader` dispatches `lanes` threads, of which those below `live` gather;
+/// the others store zeros. Lane `l` reads record `l % 32`.
+fn gathers_match(shader: &HostShader, lanes: usize, live: usize) {
     // 24×16 then 12×8, 6×4, 3×2; red = level × 1000 + y × 32 + x + 1.
     let mut texels = Vec::new();
     for l in 0..4 {
@@ -203,8 +262,7 @@ fn gathers_at_a_level_match_the_hardware() {
         );
         records.push([offset, u.to_bits(), v.to_bits(), level]);
     }
-    let input: Vec<u32> = records.iter().flatten().copied().collect();
-    let shader = build(&program(true)).expect("lower");
+    let input: Vec<u32> = (0..lanes).flat_map(|l| records[l % 32]).collect();
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation failed");
@@ -215,7 +273,7 @@ fn gathers_at_a_level_match_the_hardware() {
             data: &input,
             stride: Stride::Structured(16),
         },
-        View::RawUav(32 * 12),
+        View::RawUav(lanes as u32 * 12),
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -226,7 +284,12 @@ fn gathers_at_a_level_match_the_hardware() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        if lanes > 32 && !host.has_waves_of(32) {
+            eprintln!("{label}: no waves of 32; translated and validated only");
+            ran += 1;
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
             .dispatch(
@@ -241,7 +304,8 @@ fn gathers_at_a_level_match_the_hardware() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         ran += 1;
-        for (lane, r) in records.iter().enumerate() {
+        for lane in 0..lanes {
+            let r = &records[lane % 32];
             let got = |k: usize| -> Vec<f32> {
                 out[0][lane * 12 + 4 * k..][..4]
                     .iter()
@@ -263,6 +327,12 @@ fn gathers_at_a_level_match_the_hardware() {
                     texel(level, x, y),
                 ]
             };
+            if lane >= live {
+                for k in 0..3 {
+                    assert_eq!(got(k), vec![0.0; 4], "{label}: lane {lane}, not run");
+                }
+                continue;
+            }
             let sext = |b: u32| i64::from((b as i32) << 26 >> 26);
             assert_eq!(got(0), at(0, 0), "{label}: lane {lane}");
             assert_eq!(
@@ -271,7 +341,7 @@ fn gathers_at_a_level_match_the_hardware() {
                 "{label}: lane {lane}, offset"
             );
             // WARP's own gather truncates where the hardware rounds.
-            if lane < 16 && !warp {
+            if lane % 32 < 16 && !warp {
                 assert_eq!(got(2), got(0), "{label}: lane {lane} against its gather");
             }
         }

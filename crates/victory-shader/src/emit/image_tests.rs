@@ -68,7 +68,25 @@ pub(super) fn translate_host(
     body: &[u32],
     view: (ResourceType, u8, u32),
     group: (bool, u32, u32),
+    host: (bool, bool),
+) -> Result<HostShader, ShaderError> {
+    translate_form(body, view, group, host, false)
+}
+
+/// A wave64 compute program of `threads` threads in the form whose two host
+/// waves follow the console's wave together ([`structure::wave_flow`]),
+/// whatever the other forms make of it.
+pub(super) fn translate_together(body: &[u32], threads: u32) -> Result<HostShader, ShaderError> {
+    let view = (ResourceType::Srv, 8, 0);
+    translate_form(body, view, (true, threads, 0), (true, false), true)
+}
+
+fn translate_form(
+    body: &[u32],
+    view: (ResourceType, u8, u32),
+    group: (bool, u32, u32),
     (min_lod_clamp, wave64_native): (bool, bool),
+    only_together: bool,
 ) -> Result<HostShader, ShaderError> {
     let (wave64, threads, lds) = group;
     let (image, dwords, stride) = view;
@@ -115,21 +133,41 @@ pub(super) fn translate_host(
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        min_lod_clamp,
-        view_marks: false,
-        mesh_compute: false,
-        wave64_native,
-    })?;
+    let lower_as = |st: &structure::Structured| {
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            min_lod_clamp,
+            view_marks: false,
+            mesh_compute: false,
+            wave64_native,
+        })
+    };
+    let mut lowered = if only_together {
+        lower_as(&super::together(&native, &p).expect("one wave per group")?)?
+    } else {
+        lower_as(&st)?
+    };
+    // The last retry of `emit_with` (its skip retry has its own tests).
+    let needs64 = |dxil: &[u8]| super::required_waves(dxil).is_some_and(|(least, _)| least > 32);
+    if !wave64_native
+        && needs64(&lowered.dxil)
+        && let Some(Ok(together)) = super::together(&native, &p)
+    {
+        let again = lower_as(&together)?;
+        if needs64(&again.dxil) {
+            lowered.wave64_why = again.wave64_why;
+        } else {
+            lowered = again;
+        }
+    }
     Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -145,7 +183,7 @@ pub(super) fn translate_host(
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
-        wave64_why: None,
+        wave64_why: lowered.wave64_why.map(str::to_owned),
     })
 }
 

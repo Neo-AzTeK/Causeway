@@ -263,6 +263,9 @@ struct Lower<'a> {
     /// With `virt`, made in the entry block: whether this host wave is the
     /// console wave's upper half (0 or 1), and its first exchange slot.
     halves: Option<(V, V)>,
+    /// With `halves`, in the entry block: whether the console wave has an
+    /// upper half (a group's last one may have only its lower).
+    has_upper: Option<V>,
     /// Where the exchange slots start in the group-shared memory.
     xbase: u32,
     /// Depth of code only some lanes run (`begin_guarded`).
@@ -600,18 +603,23 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let threads = cs.threads.iter().product::<u32>();
             let one_wave = threads <= wave;
-            console_lanes = local || global;
+            // Where the halves follow the console's wave together
+            // (`structure::wave_flow`), only two halves will do.
+            let together = x.st.wave_flow;
+            console_lanes = local || global || together;
             if console_lanes {
                 // Waves of 32 do where a wave of 64 holds no more lanes, or
                 // where no lane reads beyond its 32 and none needs the
                 // others' LDS accesses in step.
                 let apart = !global && !(one_wave && s.lds_dwords > 0);
-                let enough = threads <= 32 || apart;
+                // A host asked for waves of 64 has none of 32 to give.
+                let enough = !x.wave64_native && !together && (threads <= 32 || apart);
                 s.wave_size = Some(if enough { 32 } else { wave });
                 if !enough && try_virt && wave == 64 && threads <= 1024 {
                     // Two waves of 32 stand in for one of 64 (where its LDS
                     // exchanges can be put in step).
-                    let steps = super::halves::check(p).and_then(|()| {
+                    let apart_steps = || {
+                        super::halves::check(p)?;
                         if one_wave && s.lds_dwords > 0 {
                             super::lockstep::barriers(&p.blocks).ok_or(
                                 "lanes read each other and share LDS no barriers can order",
@@ -619,7 +627,13 @@ impl<'a> Lower<'a> {
                         } else {
                             Ok(Vec::new())
                         }
-                    });
+                    };
+                    let steps = if together {
+                        super::halves::check_together(p)
+                            .map(|()| super::lockstep::every_block(&p.blocks))
+                    } else {
+                        apart_steps()
+                    };
                     wave64_why = steps.as_ref().err().copied();
                     if let Ok(at) = steps {
                         lockstep.extend(at);
@@ -732,8 +746,15 @@ impl<'a> Lower<'a> {
             console_lanes,
             virt,
             wave64_why,
-            common: super::lockstep::common(&p.blocks),
+            // With the halves together, every thread of a group of one
+            // console wave runs every block the same number of times.
+            common: if x.st.wave_flow {
+                vec![true; p.blocks.len()]
+            } else {
+                super::lockstep::common(&p.blocks)
+            },
             halves: None,
+            has_upper: None,
             xbase,
             guarded: 0,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -1248,7 +1269,8 @@ impl<'a> Lower<'a> {
                 // With `virt`, the console wave's sum is the two halves'.
                 let r = if self.virt {
                     let mine = self.as_int(r);
-                    let (a, b) = self.exchange(c, self.cur_ir, mine)?;
+                    let zero = self.s.m.i32(0);
+                    let (a, b) = self.exchange(c, self.cur_ir, mine, zero)?;
                     let (a, b) = (self.as_float(a), self.as_float(b));
                     self.combine(Op::AddF, a, b)
                 } else {
@@ -1277,7 +1299,7 @@ impl<'a> Lower<'a> {
                 let mut top = self.s.m.select(c, there, at, id);
                 if self.virt {
                     // Both halves take it from the half that holds the lane.
-                    let (lower, upper) = self.exchange(c, self.cur_ir, top)?;
+                    let (lower, upper) = self.exchange(c, self.cur_ir, top, id)?;
                     top = if hi < 32 { lower } else { upper };
                 }
                 let high = self.s.m.i32(0xFFFF_0000);
@@ -1379,7 +1401,8 @@ impl<'a> Lower<'a> {
                     &[arg, k0, one],
                 );
                 let total = bits(self, total);
-                let (low, _) = self.exchange(c, ir, total)?;
+                // Only the lower half's total is used.
+                let (low, _) = self.exchange(c, ir, total, total)?;
                 let zero = self.s.m.i32(0);
                 let upper = self.s.m.cmp(c, pred::NE, half, zero);
                 let off = self.s.m.select(c, upper, low, zero);
@@ -1387,7 +1410,8 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Add, r, off)
             } else {
                 let mine = bits(self, r);
-                let (a, b) = self.exchange(c, ir, mine)?;
+                let absent = self.s.m.i32(ident);
+                let (a, b) = self.exchange(c, ir, mine, absent)?;
                 let (a, b) = (value(self, a), value(self, b));
                 self.combine(op, a, b)
             }
@@ -1991,7 +2015,8 @@ impl<'a> Lower<'a> {
                 if self.virt {
                     // The host wave's ballot is half of the console wave's.
                     let ir = self.def_block.get(&lo).copied().unwrap_or(0);
-                    xy = self.exchange(at, ir, xy.0)?;
+                    let none = self.s.m.i32(0);
+                    xy = self.exchange(at, ir, xy.0, none)?;
                 }
                 self.ballots.insert(lo, xy);
                 xy
@@ -3154,18 +3179,30 @@ impl<'a> Lower<'a> {
         let wave = self.s.m.bin(e, Bin::LShr, first, k6);
         let pair = self.s.m.bin(e, Bin::Mul, wave, two);
         let slot0 = self.s.m.bin(e, Bin::Add, pair, base);
+        // The upper half's first flat id, below the group's thread count.
+        let k32 = self.s.m.i32(32);
+        let start = self.s.m.bin(e, Bin::Shl, wave, k6);
+        let upper_first = self.s.m.bin(e, Bin::Add, start, k32);
+        let [x, y, z] = self.s.threads.expect("compute");
+        let count = self.s.m.i32(x * y * z);
+        self.has_upper = Some(self.s.m.cmp(e, pred::IULT, upper_first, count));
         self.s.flags |= flags::WAVE_OPS;
         self.halves = Some((half, slot0));
     }
 
     /// With `virt`: `x`, this host wave's part of a value the console's wave
     /// shares, becomes the parts of both its host waves, by group-shared
-    /// memory and barriers. Every thread of the group must run it, so it is
+    /// memory and barriers (`absent` stands for an upper half that the
+    /// group's thread count leaves out). Every thread of the group must run it, so it is
     /// refused where some skip it.
-    fn exchange(&mut self, at: usize, ir: usize, x: V) -> Result<(V, V), Why> {
+    fn exchange(&mut self, at: usize, ir: usize, x: V, absent: V) -> Result<(V, V), Why> {
         let (half, slot0) = self.halves.ok_or("an exchange between host waves")?;
         if !self.common[ir] {
-            return Err("an exchange between host waves in a block some lanes skip or repeat");
+            return Err(if super::lockstep::looped(&self.x.p.blocks, ir) {
+                "an exchange between host waves in a loop"
+            } else {
+                "an exchange between host waves in a block a branch skips"
+            });
         }
         if at == self.cur && self.guarded > 0 {
             return Err("an exchange between host waves under a lane's guard");
@@ -3184,10 +3221,62 @@ impl<'a> Lower<'a> {
             self.s.m.element(at, lds, next),
         );
         let (a, b) = (self.s.m.load(at, pa), self.s.m.load(at, pb));
+        // No thread wrote the slot of a half that does not exist.
+        let upper = self.has_upper.expect("set with halves");
+        let b = self.s.m.select(at, upper, b, absent);
         // Reads done before the next exchange writes.
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         Ok((a, b))
+    }
+
+    /// Whether the two host waves must decide the branch on `when` together:
+    /// their lanes follow the console's wave, and `when` is not by itself the
+    /// same in every lane.
+    fn wave_decides_branch(&self, when: Bool) -> bool {
+        let st = self.x.st;
+        let atoms = st.bools.support(when);
+        self.virt && st.wave_flow && atoms.iter().any(|a| !matches!(a, Atom::Uniform(_)))
+    }
+
+    /// What the console's wave does at the branch ending IR block `b`, from
+    /// each lane's `cond`: the `z` forms (no lane is left) need every lane of
+    /// both host waves to hold it, the others one lane.
+    fn wave_decision(&mut self, b: usize, cond: V) -> Result<V, Why> {
+        let name = self.x.p.blocks[b].insts.last().map_or("", |i| i.name());
+        let every = match name {
+            "s_cbranch_execz" | "s_cbranch_vccz" | "s_cbranch_scc0" => true,
+            "s_cbranch_execnz" | "s_cbranch_vccnz" | "s_cbranch_scc1" => false,
+            _ => return Err("a branch the two halves cannot take together"),
+        };
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = |l: &mut Self, bit: V| {
+            let r = l
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+            l.s.m.extract(c, r, 0)
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        let holds = ballot(self, cond);
+        // The host wave's own answer: against all its lanes, or against none
+        // (no negation: an `xor` of a compare hung the AMD driver).
+        let (against, test) = if every {
+            let t = self.s.m.bool(true);
+            (ballot(self, t), pred::EQ)
+        } else {
+            (self.s.m.i32(0), pred::NE)
+        };
+        let mine = self.s.m.cmp(c, test, holds, against);
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let mine = self.s.m.select(c, mine, one, zero);
+        // A missing upper half holds no lane: it has no say either way.
+        let absent = if every { one } else { zero };
+        let (low, high) = self.exchange(c, b, mine, absent)?;
+        let op = if every { Bin::And } else { Bin::Or };
+        let both = self.s.m.bin(c, op, low, high);
+        Ok(self.s.m.cmp(c, pred::NE, both, zero))
     }
 
     /// With `virt`: `x` of console lane `lane` (of this console wave), by a
@@ -3195,8 +3284,15 @@ impl<'a> Lower<'a> {
     fn share_lane(&mut self, ir: usize, x: V, lane: V) -> Result<V, Why> {
         let c = self.cur;
         let (half, slot0) = self.halves.ok_or("a lane read across host waves")?;
-        if !self.common[ir] || self.guarded > 0 {
-            return Err("a lane read across host waves where some lanes skip it");
+        if !self.common[ir] {
+            return Err(if super::lockstep::looped(&self.x.p.blocks, ir) {
+                "a lane read across host waves in a loop"
+            } else {
+                "a lane read across host waves in a block a branch skips"
+            });
+        }
+        if self.guarded > 0 {
+            return Err("a lane read across host waves under a lane's guard");
         }
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (base, one, k5, k63) = (k(self, self.xbase), k(self, 1), k(self, 5), k(self, 63));
@@ -5972,6 +6068,7 @@ impl<'a> Lower<'a> {
                     self.vals
                         .entry(w)
                         .or_insert(Val::Missing("a lane mask read as data"));
+                    eprintln!("TMP6069 {:?}", inst.name());
                 }
                 Ok(())
             }
@@ -6585,7 +6682,9 @@ impl<'a> Lower<'a> {
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 if self.virt {
-                    if guard.is_some() {
+                    // The console reads the lane whatever EXEC holds; with
+                    // the halves together every thread gets here.
+                    if guard.is_some() && !self.x.st.wave_flow {
                         return Err("a lane read of some lanes across host waves");
                     }
                     let r = self.share_lane(self.cur_ir, a, lane)?;
@@ -6650,8 +6749,9 @@ impl<'a> Lower<'a> {
                     let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
                     let any = self.s.m.cmp(c, pred::NE, lo, zero);
                     let any = self.s.m.select(c, any, one, zero);
-                    let (m0, m1) = self.exchange(c, self.cur_ir, mine)?;
-                    let (any, _) = self.exchange(c, self.cur_ir, any)?;
+                    // A missing upper half has no first lane: `mine` stands.
+                    let (m0, m1) = self.exchange(c, self.cur_ir, mine, mine)?;
+                    let (any, _) = self.exchange(c, self.cur_ir, any, zero)?;
                     let lower = self.s.m.cmp(c, pred::NE, any, zero);
                     let r = self.s.m.select(c, lower, m0, m1);
                     return int(self, r);
@@ -6667,7 +6767,7 @@ impl<'a> Lower<'a> {
                 if self.virt {
                     // Every lane runs it: the console wave's first lane is
                     // the lower host wave's.
-                    r = self.exchange(c, self.cur_ir, r)?.0;
+                    r = self.exchange(c, self.cur_ir, r, r)?.0;
                 }
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
@@ -8141,6 +8241,7 @@ impl<'a> Lower<'a> {
             not_taken,
         } = st.exits[q]
             && taken != not_taken
+            && !st.wave_flow
         {
             all.push((when, taken == b));
         }
@@ -9146,7 +9247,7 @@ impl<'a> Lower<'a> {
             return None;
         }
         let mut never_nan = true;
-        if self.x.st.guards[b][i].is_some() {
+        if self.x.st.keeps_old(b, i) {
             let Some(Operand::Vector { reg, .. }) = f.dst else {
                 return None;
             };
@@ -9972,6 +10073,13 @@ impl<'a> Lower<'a> {
             } => {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
+                    _ if self.wave_decides_branch(when) => {
+                        let c = self
+                            .boolean(when, self.cur)
+                            .and_then(|c| self.wave_decision(b, c))
+                            .map_err(|w| unsupported(offset, w))?;
+                        (c, taken, not_taken)
+                    }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
@@ -10213,6 +10321,12 @@ impl<'a> Lower<'a> {
                 LaneExit::End => true,
                 LaneExit::Indirect => false,
                 LaneExit::Jump(t) => go(t, env, regs),
+                // A lane goes where its wave goes, whatever its own `when`.
+                LaneExit::Branch {
+                    taken, not_taken, ..
+                } if st.wave_flow => {
+                    go(taken, env.clone(), regs.clone()) && go(not_taken, env, regs)
+                }
                 LaneExit::Branch {
                     when,
                     taken,
@@ -10414,6 +10528,7 @@ impl<'a> Lower<'a> {
                     not_taken,
                 } = st.exits[q]
                     && taken != not_taken
+                    && !st.wave_flow
                     && self.rpo[taken] > self.rpo[q]
                     && self.rpo[not_taken] > self.rpo[q]
                 {
@@ -10436,9 +10551,40 @@ impl<'a> Lower<'a> {
         live
     }
 
+    /// Gives every lane mask that a data join reads along an edge its number
+    /// (the ballot of both halves): with them together every edge may be the
+    /// wave's, one where the register holds a mask too. One that has no
+    /// number stays missing, and the join says why.
+    fn number_joined_masks(&mut self, live: &HashSet<(Value, usize)>) {
+        let p = self.x.p;
+        let st = self.x.st;
+        let mut k = 0;
+        // A ballot may add joins.
+        while let Some(&(_, b, i)) = self.data_phis.get(k) {
+            k += 1;
+            let phi = &p.blocks[b].phis[i];
+            if phi.reg == Reg::Scc {
+                continue;
+            }
+            for (n, &arg) in phi.args.iter().enumerate() {
+                let mask = st.masks.contains_key(&arg) || st.highs.contains_key(&arg);
+                if mask
+                    && live.contains(&(phi.value, n))
+                    && matches!(self.vals.get(&arg), Some(Val::Missing(_)))
+                    && let Ok(x) = self.mask_dword(arg)
+                {
+                    self.vals.insert(arg, Val::I32(x));
+                }
+            }
+        }
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let live = self.live_edges();
+        if self.x.st.wave_flow {
+            self.number_joined_masks(&live);
+        }
         // Mask joins first: their bits may read data joins and vote.
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];

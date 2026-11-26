@@ -2,7 +2,9 @@
 //! synthetic GFX10 programs of 32 lanes, run as in `image_tests`.
 
 use super::host::{Host, Stride, View};
-use super::image_tests::{build, check, run, run_on, translate, translate_group, translate_with};
+use super::image_tests::{
+    build, check, run, run_on, translate, translate_group, translate_together, translate_with,
+};
 use crate::native::ResourceType;
 
 /// Loads the raw UAV's descriptor to s[40:43] and v16 = 4 × lane.
@@ -534,9 +536,35 @@ fn on_waves_of_32(body: &[u32], threads: u32) -> Option<Vec<u32>> {
         return None;
     }
     let dummy = [[0.0f32; 4]];
-    let views = [View::Texture(1, 1, &dummy), View::RawUav(64)];
+    let views = [View::Texture(1, 1, &dummy), View::RawUav(threads.max(64))];
     let mut out = run_on(&shader, &views, &[("hardware", false)]);
     Some(out.remove(0).1.remove(0)[..threads as usize].to_vec())
+}
+
+/// A group whose last console wave has no upper half: that half gives the
+/// operation's identity, not what its exchange slot happens to hold. A minimum
+/// shows it where unwritten group memory reads as zero.
+#[test]
+fn a_wave64_min_ignores_a_host_wave_that_does_not_exist() {
+    let mut body = vec![
+        0xBE96_25C1, // s_or_saveexec_b64 s[22:23], -1
+        0xD501_0001,
+        0x005A_00C1 | 0x100 << 9, // v_cndmask_b32 v1, -1, v0, s[22:23]
+        0x7E10_02C1,              // v_mov_b32 v8, -1
+    ];
+    for k in 0..64 {
+        body.extend([
+            0xD760_0004,
+            0x101 | (128 + k) << 9, // v_readlane_b32 s4, v1, k
+            0x2610_1004,            // v_min_u32 v8, s4, v8
+        ]);
+    }
+    body.push(0xBEFE_0416); // s_mov_b64 exec, s[22:23]
+    // 96: one whole console wave and one with its lower half only.
+    if let Some(got) = on_waves_of_32(&body, 96) {
+        let want: Vec<u32> = (0..96).map(|l| l / 64 * 64).collect();
+        assert_eq!(got, want);
+    }
 }
 
 #[test]
@@ -559,13 +587,22 @@ fn wave64_lane_numbers_and_ballots_run_on_two_waves_of_32() {
         0xD766_0008,
         0x0002_0219, // v_mbcnt_hi_u32_b32 v8, s25, v1
     ];
-    // Lanes 48 and up have their EXEC bit clear.
-    for threads in [64, 48] {
-        let n = threads as usize;
-        let want: [(&[u32], Vec<u32>); 3] = [
-            (&lane, (0..n as u32).collect()),
-            (&[&ballot[..], &count].concat(), vec![40; n]),
-            (&[&ballot[..], &below].concat(), (0..n as u32).map(|l| l.min(40)).collect()),
+    // s[24:25] = the console wave's lanes numbered below 40 (v8, from `lane`).
+    let by_lane = [&lane[..], &[0xD4C4_0018, 0x0002_10A8], &count].concat();
+    // Lanes 48 and up have their EXEC bit clear. 96 threads: the second console
+    // wave has only its lower half.
+    for threads in [64u32, 48, 96] {
+        // `ballot` compares thread ids: none of the second wave's are below 40.
+        let ids = |f: &dyn Fn(u32) -> u32| (0..threads).map(f).collect::<Vec<u32>>();
+        let want: [(&[u32], Vec<u32>); 4] = [
+            (&lane, ids(&|t| t % 64)),
+            (&[&ballot[..], &count].concat(), ids(&|t| if t < 64 { 40 } else { 0 })),
+            (
+                &[&ballot[..], &below].concat(),
+                ids(&|t| if t < 64 { t.min(40) } else { 0 }),
+            ),
+            // 64 lanes exist in wave 0, 32 in the second wave of 96 threads.
+            (&by_lane, ids(&|t| (threads - t / 64 * 64).min(40))),
         ];
         for (body, want) in want {
             if let Some(got) = on_waves_of_32(body, threads) {
@@ -717,16 +754,19 @@ fn a_wave64_skip_over_a_lane_read_is_left_out_for_two_waves_of_32() {
         0x7E10_020A, // v_mov_b32 v8, s10
     ];
     let body = skip(&read);
-    // Lanes decide alone whether to skip: a host wave may leave its partner
-    // waiting in the exchange.
-    assert_eq!(waves_required(&body), Some((64, 64)));
+    // Lanes deciding alone whether to skip would leave a host wave waiting
+    // in the exchange: with the skip kept, both halves decide it together.
+    // Lanes 0 to 7 read the first of the lanes that ran: lane 0's.
+    let want: Vec<u32> = (0..64).map(|l| if l < 8 { 0 } else { l }).collect();
+    assert_eq!(waves_required(&body), Some((32, 32)));
+    if let Some(got) = on_waves_of_32(&body, 64) {
+        assert_eq!(got, want);
+    }
     let left_out = skips_left_out(&body);
     assert_ne!(left_out, body);
     let least = waves_required(&left_out).map(|r| r.0);
     assert!(least.is_none_or(|n| n <= 32), "{least:?}");
     if let Some(got) = on_waves_of_32(&left_out, 64) {
-        // Lanes 0 to 7 read the first of the lanes that ran: lane 0's.
-        let want: Vec<u32> = (0..64).map(|l| if l < 8 { 0 } else { l }).collect();
         assert_eq!(got, want);
     }
     // A scalar the body writes and the code after it reads: a skipped body
@@ -752,13 +792,19 @@ fn a_host_without_waves_of_32_is_asked_for_waves_of_64() {
         0x0002_02C1, // v_mbcnt_hi_u32_b32 v8, -1, v1
     ];
     let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
-    let waves = |native| {
-        let shader = translate_host(&words, (ResourceType::Srv, 8, 0), (true, 64, 0), (true, native)).unwrap();
+    let waves = |threads, native| {
+        let group = (true, threads, 0);
+        let shader = translate_host(&words, (ResourceType::Srv, 8, 0), group, (true, native)).unwrap();
         check(&shader);
         crate::emit::required_waves(&shader.dxil)
     };
-    assert_eq!(waves(false), Some((32, 32)), "two waves of 32 stand in for one");
-    assert_eq!(waves(true), Some((64, 64)), "waves of 64 as the console runs them");
+    assert_eq!(waves(64, false), Some((32, 32)), "two waves of 32 stand in for one");
+    // A group that one wave of 32 holds asks for 32 only where the host has
+    // such waves.
+    assert_eq!(waves(32, false), Some((32, 32)));
+    for threads in [64, 48, 32, 8, 128] {
+        assert_eq!(waves(threads, true), Some((64, 64)), "{threads} threads: as the console");
+    }
 }
 
 #[test]
@@ -792,6 +838,63 @@ fn a_mask_set_to_a_constant_then_a_compare_joins_in_wave64() {
     ];
     let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
     translate_with(&words, ResourceType::Srv, 4, 0, true).unwrap();
+}
+
+/// `body` as one console wave of 64 with `threads` lanes and group-shared
+/// memory: it must ask the host for waves of 32 (two halves), and what each
+/// thread stored, on hardware with such waves.
+fn two_halves_with_lds(body: &[u32], threads: u32) -> Option<Vec<u32>> {
+    let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
+    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, threads, 1).unwrap();
+    check(&shader);
+    assert_eq!(
+        crate::emit::required_waves(&shader.dxil),
+        Some((32, 32)),
+        "{threads} threads: {:?}",
+        shader.wave64_why
+    );
+    // WARP runs no fixed wave size of 32.
+    if !Host::new(false).is_ok_and(|h| h.has_waves_of(32)) {
+        return None;
+    }
+    let dummy = [[0.0f32; 4]];
+    let views = [View::Texture(1, 1, &dummy), View::RawUav(64)];
+    let mut out = run_on(&shader, &views, &[("hardware", false)]);
+    Some(out.remove(0).1.remove(0)[..threads as usize].to_vec())
+}
+
+/// v17 = 4 × the dword of lane `threads - 1 - lane`.
+fn partner(threads: u32) -> [u32; 2] {
+    [
+        0x4C22_0080 | (threads - 1), // v_sub_nc_u32 v17, threads - 1, v0
+        0x3422_2282,                 // v_lshlrev_b32 v17, 2, v17
+    ]
+}
+
+#[test]
+fn a_wave64_branch_only_lower_lanes_hold_takes_both_halves() {
+    // Only lanes below 8 hold VCC, so the console's wave does not take
+    // `s_cbranch_vccz`: every lane writes and reads, the upper half's too.
+    for threads in [64u32, 48] {
+        let body = [
+            &[0x4A02_0081][..], // v_add_nc_u32 v1, 1, v0
+            &partner(threads),
+            &[
+                0x7E10_0280, // v_mov_b32 v8, 0
+                0x7D88_0088, // v_cmp_gt_u32 vcc, 8, v0
+                0xBF86_0004, // s_cbranch_vccz past the exchange
+                0xD834_0000,
+                0x0000_0110, // ds_write_b32 v16, v1
+                0xD8D8_0000,
+                0x0800_0011, // ds_read_b32 v8, v17
+            ],
+        ]
+        .concat();
+        if let Some(got) = two_halves_with_lds(&body, threads) {
+            let want: Vec<u32> = (0..threads).map(|l| threads - l).collect();
+            assert_eq!(got, want, "{threads} threads");
+        }
+    }
 }
 
 /// The shape of the loops of a compute program that ran for seconds on the
@@ -830,6 +933,115 @@ fn a_do_while_to_a_scalar_count_runs_that_many_times() {
     }
 }
 
+/// A loop the console's wave leaves when no lane's counter v2 is below its
+/// limit v4 (1 for lanes below 32, 3 above): all lanes run 3 passes, the
+/// lower half's too. `pass` is one pass's code; v8 starts at 0.
+fn uneven_loop(pass: &[u32]) -> Vec<u32> {
+    let mut body = vec![
+        0x2C08_0085, // v_lshrrev_b32 v4, 5, v0
+        0x3408_0881, // v_lshlrev_b32 v4, 1, v4
+        0x4A08_0881, // v_add_nc_u32 v4, 1, v4
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E10_0280, // v_mov_b32 v8, 0
+    ];
+    body.extend_from_slice(pass);
+    body.extend([
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7D88_0504, // v_cmp_gt_u32 vcc, v4, v2
+    ]);
+    // Back over the pass, the two instructions above and the branch.
+    let back = (pass.len() + 3) as u32;
+    body.push(0xBF87_0000 | (0x1_0000 - back)); // s_cbranch_vccnz
+    body
+}
+
+#[test]
+fn a_wave64_loop_exchanging_through_lds_keeps_both_halves_in_step() {
+    for threads in [64u32, 48] {
+        let pass = [
+            0xD834_0000,
+            0x0000_0110, // ds_write_b32 v16, v1
+            0xD8D8_0000,
+            0x0300_0011, // ds_read_b32 v3, v17
+            0x4A10_1103, // v_add_nc_u32 v8, v3, v8
+            0x4A02_02FF,
+            100, // v_add_nc_u32 v1, 100, v1
+        ];
+        let body = [
+            &[0x7E02_0300][..], // v_mov_b32 v1, v0
+            &partner(threads),
+            &uneven_loop(&pass),
+        ]
+        .concat();
+        if let Some(got) = two_halves_with_lds(&body, threads) {
+            // Three reads of the partner's lane number plus 0, 100, 200.
+            let want: Vec<u32> = (0..threads).map(|l| 3 * (threads - 1 - l) + 300).collect();
+            assert_eq!(got, want, "{threads} threads");
+        }
+    }
+}
+
+#[test]
+fn a_wave64_ballot_in_a_loop_counts_both_halves_every_pass() {
+    for threads in [64u32, 48] {
+        let pass = [
+            0xD4C4_0018,
+            0x0002_00A8, // s[24:25] = lanes below 40
+            0xBE8A_1018, // s_bcnt1_i32_b64 s10, s[24:25]
+            0x4A10_100A, // v_add_nc_u32 v8, s10, v8
+        ];
+        if let Some(got) = on_waves_of_32(&uneven_loop(&pass), threads) {
+            assert_eq!(got, vec![120; threads as usize], "{threads} threads");
+        }
+    }
+}
+
+#[test]
+fn a_wave64_lane_read_under_a_mask_reads_the_other_half() {
+    // Lanes below 8 stay in EXEC; `v_readlane` of lane 40 reads it anyway.
+    let body = [
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0x7D88_0088, // v_cmp_gt_u32 vcc, 8, v0
+        0xBE96_246A, // s_and_saveexec_b64 s[22:23], vcc
+        0xD760_0004,
+        0x100 | (128 + 40) << 9, // v_readlane_b32 s4, v0, 40
+        0x7E10_0204,             // v_mov_b32 v8, s4
+        0xBEFE_0416,             // s_mov_b64 exec, s[22:23]
+    ];
+    for threads in [64u32, 48] {
+        if let Some(got) = on_waves_of_32(&body, threads) {
+            let want: Vec<u32> = (0..threads).map(|l| if l < 8 { 40 } else { 0 }).collect();
+            assert_eq!(got, want, "{threads} threads");
+        }
+    }
+}
+
+#[test]
+fn a_loop_carried_mask_merged_inside_the_loop_is_followed() {
+    // The back edge brings a merge of s12 that nothing in the loop reads: it
+    // is a mask all the same. The branch inside is never taken past.
+    let body = [
+        0x7D88_0088, // v_cmp_gt_u32 vcc, 8, v0
+        0xBE8C_036A, // s_mov_b32 s12, vcc_lo
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xD501_0001,
+        0x0031_0280, // v_cndmask_b32 v1, 0, 1, s12
+        0x4A10_1101, // v_add_nc_u32 v8, v1, v8
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBF06_8106, // s_cmp_eq_u32 s6, 1
+        0xBF84_0001, // s_cbranch_scc0 over the next
+        0x870C_6A0C, // s_and_b32 s12, s12, vcc_lo
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7D88_0483, // v_cmp_gt_u32 vcc, 3, v2
+        0xBF87_FFF6, // s_cbranch_vccnz to the v_cndmask
+    ];
+    for (label, got) in stored(&body) {
+        let want: Vec<u32> = (0..32).map(|l| if l < 8 { 3 } else { 0 }).collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
 #[test]
 fn a_do_while_in_a_lane_mask_runs_that_many_times_in_the_lanes_inside() {
     // exec = lanes below 28 around the loop and its skip.
@@ -857,4 +1069,135 @@ fn a_do_while_runs_that_many_times_in_wave64() {
         return;
     };
     assert_eq!(got, [6; 64]);
+}
+
+/// The loop a console compiler makes over the lanes of a mask: the ballot of
+/// lanes 41 and up, its upper dword walked bit by bit, each bit's number
+/// addressing a scalar load. The address comes from lanes, yet it is one for
+/// the whole wave, as the ballot is.
+#[test]
+fn a_wave64_scalar_load_addressed_by_a_ballots_bits_reads_the_same_in_both_halves() {
+    let body = [
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0x7D82_00A8, // v_cmp_lt_u32 vcc, 40, v0
+        0xBE9A_046A, // s_mov_b64 s[26:27], vcc
+        0xBE9E_031B, // s_mov_b32 s30, s27
+        0xBE8C_131E, // s_ff1_i32_b32 s12, s30
+        0x8F0E_820C, // s_lshl_b32 s14, s12, 2
+        0xF420_0344,
+        0x1C00_0000, // s_buffer_load_dword s13, s[8:11], s14
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A10_100D, // v_add_nc_u32 v8, s13, v8
+        0x8F0F_0C81, // s_lshl_b32 s15, 1, s12
+        0x891E_0F1E, // s_xor_b32 s30, s30, s15
+        0xBF07_801E, // s_cmp_lg_u32 s30, 0
+        0xBF85_FFF6, // s_cbranch_scc1 -> the s_ff1
+    ];
+    let data: Vec<u32> = (0..32).map(|n| 1000 * n).collect();
+    for threads in [64u32, 48] {
+        let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+        let shader =
+            translate_group(&words, (ResourceType::Srv, 4, 0), true, threads, 0).unwrap();
+        check(&shader);
+        assert_eq!(
+            crate::emit::required_waves(&shader.dxil),
+            Some((32, 32)),
+            "{threads} threads: {:?}",
+            shader.wave64_why
+        );
+        // WARP runs no fixed wave size of 32.
+        if !Host::new(false).is_ok_and(|h| h.has_waves_of(32)) {
+            return;
+        }
+        let view = View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        };
+        let views = [view, View::RawUav(64)];
+        let out = run_on(&shader, &views, &[("hardware", false)]).remove(0).1.remove(0);
+        // Bits 9 and up of the upper dword, each reading dword `bit`.
+        let want = (9..threads - 32).map(|bit| 1000 * bit).sum::<u32>();
+        assert_eq!(out[..threads as usize], vec![want; threads as usize], "{threads} threads");
+    }
+}
+
+/// SCC of a mask operation says whether any lane of the console's wave holds
+/// a bit, and a scalar select reads it as such: both halves select alike.
+#[test]
+fn a_wave64_select_on_the_scc_of_a_mask_operation_sees_both_halves() {
+    let body = [
+        0x7D82_00A8, // v_cmp_lt_u32 vcc, 40, v0
+        0x879C_7E6A, // s_and_b64 s[28:29], vcc, exec
+        0x850C_8387, // s_cselect_b32 s12, 7, 3
+        0x7E10_020C, // v_mov_b32 v8, s12
+        0xD760_0004,
+        0x100 | 128 << 9, // v_readlane_b32 s4, v0, 0 (which makes two halves)
+        0x4A10_1004,      // v_add_nc_u32 v8, s4, v8: plus 0
+    ];
+    for threads in [64u32, 48] {
+        if let Some(got) = on_waves_of_32(&body, threads) {
+            assert_eq!(got, vec![7; threads as usize], "{threads} threads");
+        }
+    }
+}
+
+/// A register the compiler reuses holds a lane mask on one path and data on
+/// the other. With both halves following the wave together every edge may be
+/// the wave's, so the join takes the mask's number: the ballot of the
+/// console's whole wave. Only the wave-flow form is lowered here: on their own
+/// conditions lanes do read this join, which that form refuses. Programs get
+/// this far where a longer proof shows each lane that it never does.
+#[test]
+fn a_wave64_join_of_a_mask_and_data_reads_the_ballot_of_both_halves() {
+    let body = [
+        0x7D82_00A8, // v_cmp_lt_u32 vcc, 40, v0
+        0xBE9C_046A, // s_mov_b64 s[28:29], vcc
+        0xBF06_8080, // s_cmp_eq_u32 0, 0
+        0xBF85_0001, // s_cbranch_scc1 -> the read
+        0xBE9D_0385, // s_mov_b32 s29, 5
+        0x7E10_021D, // v_mov_b32 v8, s29
+    ];
+    for threads in [64u32, 48] {
+        let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+        let shader = translate_together(&words, threads).unwrap();
+        check(&shader);
+        assert_eq!(crate::emit::required_waves(&shader.dxil), Some((32, 32)));
+        // WARP runs no fixed wave size of 32.
+        if !Host::new(false).is_ok_and(|h| h.has_waves_of(32)) {
+            return;
+        }
+        let dummy = [[0.0f32; 4]];
+        let views = [View::Texture(1, 1, &dummy), View::RawUav(64)];
+        let out = run_on(&shader, &views, &[("hardware", false)]).remove(0).1.remove(0);
+        // Lanes 41 and up of those the group has, in the upper dword.
+        let want = (41..threads).fold(0, |m, l| m | 1u32 << (l - 32));
+        assert_eq!(out[..threads as usize], vec![want; threads as usize], "{threads} threads");
+    }
+}
+
+/// With both halves, the first lane in EXEC is the console wave's: lane 5,
+/// not each host wave's own first (lane 40 in the upper half).
+#[test]
+fn a_wave64_first_lane_read_is_the_console_waves_first() {
+    let body = [
+        0x7D84_0085, // v_cmp_eq_u32 vcc, 5, v0
+        0xD4C2_001A,
+        0x0002_00A8, // v_cmp_eq_u32 s[26:27], 40, v0
+        0x88EA_1A6A, // s_or_b64 vcc, vcc, s[26:27]
+        0xBE9E_246A, // s_and_saveexec_b64 s[30:31], vcc
+        0x7E08_0500, // v_readfirstlane_b32 s4, v0
+        0xBEFE_041E, // s_mov_b64 exec, s[30:31]
+        0x7E10_0204, // v_mov_b32 v8, s4
+        0xD760_0005,
+        0x100 | 128 << 9, // v_readlane_b32 s5, v0, 0 (which makes two halves)
+        0x4A10_1005,      // v_add_nc_u32 v8, s5, v8: plus 0
+    ];
+    for threads in [64u32, 48] {
+        if let Some(got) = on_waves_of_32(&body, threads) {
+            assert_eq!(got, vec![5; threads as usize], "{threads} threads");
+        }
+    }
 }

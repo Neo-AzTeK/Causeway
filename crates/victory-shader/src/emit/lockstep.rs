@@ -65,6 +65,11 @@ fn reach(blocks: &[Block], from: usize, without: Option<usize>) -> Vec<bool> {
     seen
 }
 
+/// Whether block `b` is on a loop.
+pub(super) fn looped(blocks: &[Block], b: usize) -> bool {
+    reach(blocks, b, None)[b]
+}
+
 /// Blocks every lane runs exactly once: on every path to an end, and on no
 /// loop. A barrier there is reached by every lane.
 pub(super) fn common(blocks: &[Block]) -> Vec<bool> {
@@ -75,15 +80,35 @@ pub(super) fn common(blocks: &[Block]) -> Vec<bool> {
                 let around = reach(blocks, 0, Some(b));
                 !ends(0) && !(0..blocks.len()).any(|e| around[e] && ends(e))
             };
-            on_every_path && !reach(blocks, b, None)[b]
+            on_every_path && !looped(blocks, b)
         })
         .collect()
 }
+/// [`barriers`] where both host waves take every branch together, so a
+/// barrier may stand anywhere: before a block's first LDS access (whatever
+/// ran before it, an earlier pass of a loop included) and between those in
+/// the block that do not commute.
+pub(super) fn every_block(blocks: &[Block]) -> Vec<(usize, usize)> {
+    let mut at = Vec::new();
+    for (b, block) in blocks.iter().enumerate() {
+        let mut since: Vec<Access> = Vec::new();
+        for (i, inst) in block.insts.iter().enumerate() {
+            let Some(a) = access(inst) else { continue };
+            if since.is_empty() || !since.iter().all(|&s| s.commutes(a)) {
+                at.push((b, i));
+                since.clear();
+            }
+            since.push(a);
+        }
+    }
+    at
+}
+
 /// Where barriers go, as (block, the instruction they precede; its count of
 /// instructions: the block's end). None if barriers cannot keep the order.
 pub(super) fn barriers(blocks: &[Block]) -> Option<Vec<(usize, usize)>> {
     let order = ir::reverse_postorder(blocks);
-    let in_loop: Vec<bool> = (0..blocks.len()).map(|b| reach(blocks, b, None)[b]).collect();
+    let in_loop: Vec<bool> = (0..blocks.len()).map(|b| looped(blocks, b)).collect();
     let common = common(blocks);
     let mut at = Vec::new();
     // Accesses since the last barrier, all of which commute.

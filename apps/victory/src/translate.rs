@@ -577,6 +577,20 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
+        // One line per program of waves of 64, to match its outcome by label:
+        // which stages and group sizes the wave-size census is about.
+        if t.list && p.wave64 {
+            let group = match p.io {
+                victory_shader::native::StageIo::Cs(cs) => format!(
+                    " threads={} lds={}",
+                    cs.threads.iter().product::<u32>(),
+                    cs.lds_bytes()
+                ),
+                _ => String::new(),
+            };
+            t.lines
+                .push(format!("{} {:?}  wave64-program{group}", example(), p.stage));
+        }
         match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok((program, structured)) => {
                 t.translated += 1;
