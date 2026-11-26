@@ -279,11 +279,13 @@ pub use shader::{
     VIEW_MARKS, VIEW_STRIDES, VIEW_TABLE_HEADER, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
-/// The loop limit without an override: 2^20.
+/// [`loop_limit`] while none is named: each stage then has a lower limit of
+/// its own (`lower::loop_bound`), under this one.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
-/// The iteration count after which a translated loop is left, per lane and
-/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
+/// The loop limit setting. A named one is the iteration count after which
+/// any stage's loop is left, per lane and per entry into the loop;
+/// [`DEFAULT_LOOP_LIMIT`] stands for the stages' own limits.
 ///
 /// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
 /// `0x` hex, at least 1) sets it instead. A loop that hits the limit in

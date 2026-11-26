@@ -394,6 +394,28 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// What one loop may run of each stage while no limit is named. A count read
+/// from data the host does not have yet keeps every lane in its loop up to
+/// the limit, and at [`LOOP_LIMIT`] one dispatch then runs for seconds. The
+/// numbers are victory-fork's (fxceless, GPL-3.0-or-later).
+// shortcut: a genuine loop of more iterations than its stage's is cut short
+// and the picture is wrong there; raise these once loops read right counts.
+const PIXEL_LOOP_LIMIT: u32 = 1 << 7;
+/// Vertex and mesh loops.
+const GEOMETRY_LOOP_LIMIT: u32 = 1 << 8;
+const COMPUTE_LOOP_LIMIT: u32 = 1 << 12;
+
+/// The limit of a loop at `depth` under `setting` ([`super::loop_limit`]): a
+/// named one is shared by its nest; the default gives the stage's `cap`, or
+/// less where the nest's share of [`LOOP_LIMIT`] is lower.
+fn loop_bound(setting: u32, cap: u32, depth: usize) -> u32 {
+    if setting == LOOP_LIMIT {
+        cap.min(loop_share(LOOP_LIMIT, depth))
+    } else {
+        loop_share(setting, depth)
+    }
+}
+
 /// What a D3D12 compute group may share (32 KiB), on every adapter.
 const HOST_LDS_DWORDS: u32 = 8192;
 
@@ -1505,10 +1527,16 @@ impl<'a> Lower<'a> {
                 (h, body)
             })
             .collect();
+        let cap = if self.s.pixel {
+            PIXEL_LOOP_LIMIT
+        } else if self.s.mesh.is_some() || self.s.threads.is_none() {
+            GEOMETRY_LOOP_LIMIT
+        } else {
+            COMPUTE_LOOP_LIMIT
+        };
         for (h, _) in &bodies {
             let depth = 1 + bodies.iter().filter(|(g, body)| g != h && body.contains(h)).count();
-            let limit = super::loop_limit();
-            self.limits.insert(*h, loop_share(limit, depth));
+            self.limits.insert(*h, loop_bound(super::loop_limit(), cap, depth));
         }
         self.cur = self.s.entry;
         self.find_sections();
@@ -10816,7 +10844,24 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, loop_share, lower, packed_half};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, loop_bound, loop_share, lower, packed_half};
+
+    #[test]
+    fn a_stage_cap_holds_until_a_limit_is_named() {
+        let default = super::LOOP_LIMIT;
+        assert_eq!(loop_bound(default, 4096, 1), 4096);
+        assert_eq!(loop_bound(default, 128, 2), 128);
+        // The nest's share is the lower one: no loop runs longer than it.
+        assert_eq!(loop_bound(default, 4096, 2), 1024);
+        for cap in [128, 256, 4096] {
+            for depth in 1..=5 {
+                assert!(loop_bound(default, cap, depth) <= loop_share(default, depth));
+            }
+        }
+        // A named limit replaces every stage's.
+        assert_eq!(loop_bound(64, 128, 1), 64);
+        assert_eq!(loop_bound(100_000, 128, 1), 100_000);
+    }
 
     #[test]
     fn nested_loops_share_one_limit() {
