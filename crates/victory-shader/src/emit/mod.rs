@@ -1687,6 +1687,100 @@ mod tests {
         assert!(!super::uses_barycentrics(&plain.dxil));
     }
 
+    /// A vertex shader passing `POSITION` through, with its z in every
+    /// component of `TEXCOORD0` (row 0, where the pixel programs here take
+    /// it).
+    #[cfg(windows)]
+    fn corner_values() -> Vec<u8> {
+        use super::bitcode::{Attr, Term};
+        let mut s = super::shader::Shader::new(false);
+        let b = s.entry;
+        let element = |name: &str, kind, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: if row == 0 { 2 } else { 4 },
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xf,
+            half: false,
+        };
+        let mut position = Vec::new();
+        for col in 0..4u8 {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            position.push(s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args));
+        }
+        for col in 0..4u8 {
+            for (id, v) in [(0, position[2]), (1, position[usize::from(col)])] {
+                let args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), v];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+        }
+        let mut input = element("POSITION", 0, 0);
+        input.interp = 0;
+        s.inputs = vec![input];
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    /// The console's i and j, read as numbers, weigh the second and third
+    /// vertex: with them an attribute that differs at each corner comes out
+    /// as the host interpolates it.
+    #[cfg(windows)]
+    #[test]
+    fn direct_barycentrics_weigh_the_second_and_third_vertex() {
+        use super::host::{Draw, Host};
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E06_0300,    // v_mov_b32 v3, v0
+            0x7E08_0301,    // v_mov_b32 v4, v1
+            0xF800_180F,
+            0x0204_0302, // exp mrt0, v2, v3, v4, v2 done vm
+            0xBF81_0000,
+        ];
+        let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let ps = emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap();
+        let mut vs = corner_values();
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut vs).unwrap();
+        }
+        let corner = [0.125f32, 0.25, 0.875];
+        #[rustfmt::skip]
+        let vertices = [
+            -1.0, -1.0, corner[0], 1.0,
+            -1.0, 3.0, corner[1], 1.0,
+            3.0, -1.0, corner[2], 1.0,
+        ];
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_with(&root, &vs, &ps.dxil).unwrap();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &vertices,
+                stride: 16,
+                size: (8, 8),
+                mesh_groups: 0,
+            };
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            for &[value, i, j, _] in &texels {
+                let weighed = corner[0] + i * (corner[1] - corner[0]) + j * (corner[2] - corner[0]);
+                assert!((value - weighed).abs() < 1e-3, "warp {warp}: {value} for i {i}, j {j}");
+            }
+            assert!(texels.iter().any(|t| (t[1] - t[2]).abs() > 0.1), "warp {warp}: {texels:?}");
+        }
+    }
+
     /// A pixel export before the `done` one, both under a lane guard (EXEC
     /// narrowed without a branch): the lanes outside it are discarded at the
     /// `done` export, so the first one stores in every lane. With EXEC
