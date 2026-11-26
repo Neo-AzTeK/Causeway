@@ -1010,7 +1010,8 @@ mod tests {
 
     /// A read block past the end of the ring (6 on a ring of four) is block
     /// 2 of it: a stream that loops forever fills blocks 0 and 1 and the
-    /// pass ends. It used to fill the ring for good, holding the voice.
+    /// pass ends. Without the wrap, such a stream would fill the ring and
+    /// hold the voice; the wrap is what keeps the pass finite.
     #[test]
     fn xma_read_blocks_past_the_ring_end_wrap() {
         let _serial = lock(&CONTEXT_TESTS);
@@ -1089,8 +1090,8 @@ mod tests {
     }
 
     /// A write block past the end of the ring (6 on a ring of four) is block
-    /// 2 of it: blocks 2, 3 and 0 are filled, up to the read block (1). It
-    /// used to write block 6 first, past the ring's end.
+    /// 2 of it: blocks 2, 3 and 0 are filled, up to the read block (1). The
+    /// index must wrap before the write, never reach past the ring's end.
     #[test]
     fn xma_write_blocks_past_the_ring_end_wrap() {
         let _serial = lock(&CONTEXT_TESTS);
@@ -1242,7 +1243,7 @@ mod tests {
 
         // A count near `u32::MAX` wraps the read block like any other
         // (3 + 0xffff_ffff blocks on a ring of four is block 2); the sum
-        // used to overflow.
+        // must not overflow the 32-bit count.
         context.set_field(9, 0, 5, 3);
         submit(ADVANCE_XMA_READ, &[1, u32::MAX]);
         assert_eq!(context.field(9, 0, 5), 2);
