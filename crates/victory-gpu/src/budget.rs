@@ -6,8 +6,9 @@
 //! skipped. Dispatches, copies, clears and synchronization all run, so a
 //! frame can still take longer. Small draws (fullscreen passes, quads)
 //! always run, so a finished picture still reaches the screen. H in the
-//! game window draws the next frames in full, then holds the game at that
-//! picture until H is pressed again.
+//! game window draws the next frames in full, then keeps the last of them in
+//! the window until H is pressed again. The title is not stopped: it goes on
+//! behind that picture, under the limit.
 //!
 //! `VICTORY_PROFILE=<file>`: one CSV line for each presented frame.
 //!
@@ -22,9 +23,12 @@ use std::time::Instant;
 
 /// Draws of up to this many vertices or indices are never skipped.
 const SMALL: u32 = 6;
-/// Frames drawn in full before the game is held: effects that build over
-/// several frames need them.
+/// The fewest frames drawn in full before the picture is held: effects that
+/// build over several frames need them.
 const SETTLE: u64 = 8;
+/// The most: past [`SETTLE`] the picture waits for the pipelines still being
+/// made, whose draws are dropped until then, but a title may always have one.
+const SETTLE_LIMIT: u64 = 64;
 /// The fewest other draws a limited frame may record.
 const FLOOR: u64 = 32;
 
@@ -32,8 +36,10 @@ static BUDGET_MS: LazyLock<Option<f64>> = LazyLock::new(|| {
     std::env::var("VICTORY_DRAW_BUDGET_MS").ok()?.parse().ok().filter(|ms| *ms > 0.0)
 });
 static FULL: AtomicBool = AtomicBool::new(false);
-/// Full frames still to draw before the game is held.
-static TO_HOLD: AtomicU64 = AtomicU64::new(0);
+/// Full frames drawn since H asked for them.
+static SETTLED: AtomicU64 = AtomicU64::new(0);
+/// The window keeps the picture it has.
+static HELD: AtomicBool = AtomicBool::new(false);
 /// The frame had full drawing at some point.
 static WAS_FULL: AtomicBool = AtomicBool::new(false);
 static ALLOWED: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -83,27 +89,37 @@ fn toggle_full() {
     if BUDGET_MS.is_none() {
         return;
     }
+    if HELD.swap(false, Relaxed) {
+        tracing::info!("draw budget: H pressed, picture released");
+        return;
+    }
     let full = !FULL.fetch_xor(true, Relaxed);
     if full {
         WAS_FULL.store(true, Relaxed);
     }
-    TO_HOLD.store(if full { SETTLE } else { 0 }, Relaxed);
+    SETTLED.store(0, Relaxed);
+    HELD.store(false, Relaxed);
     tracing::info!(full, "draw budget: H pressed");
 }
 
-/// At a presented frame: after the last of the full frames H asked for,
-/// keeps the game here until H is pressed again. True if it did.
-fn hold() -> bool {
-    if !FULL.load(Relaxed)
-        || TO_HOLD.fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1)) != Ok(1)
-    {
-        return false;
+/// Whether the window is to keep its picture: frames are not presented.
+pub(crate) fn picture_held() -> bool {
+    HELD.load(Relaxed)
+}
+
+/// After a presented full frame: holds the picture once enough were drawn.
+/// A held picture ends the full drawing, so the title goes on quickly.
+fn settle() {
+    if !FULL.load(Relaxed) || HELD.load(Relaxed) {
+        return;
     }
-    tracing::info!("draw budget: game held at a full frame; H goes on");
-    while FULL.load(Relaxed) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    let drawn = SETTLED.fetch_add(1, Relaxed) + 1;
+    let waiting = crate::pipeline::making();
+    if drawn >= SETTLE_LIMIT || (drawn >= SETTLE && waiting == 0) {
+        HELD.store(true, Relaxed);
+        FULL.store(false, Relaxed);
+        tracing::info!(drawn, waiting, "draw budget: picture held; H goes on");
     }
-    true
 }
 
 struct Frames {
@@ -167,8 +183,8 @@ pub(crate) fn frame(totals: [u64; 6]) {
             spent[5]
         );
     }
-    if hold() {
-        // The time held is no frame's.
-        frames.started = Instant::now();
+    // A full frame is one that reached the window with no limit all along.
+    if full && BUDGET_MS.is_some() {
+        settle();
     }
 }

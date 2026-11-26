@@ -2888,6 +2888,12 @@ impl Host {
                 }
             }
         }
+        // The window keeps what it shows; the frame still counts.
+        #[cfg(feature = "diagnostics")]
+        if crate::budget::picture_held() {
+            p.meter.frame(p.hwnd);
+            return Some(false);
+        }
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {

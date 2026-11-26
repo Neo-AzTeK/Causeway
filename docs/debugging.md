@@ -12,7 +12,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_DRAW_BUDGET_MS=33` | test mode: skips draws past what should fit in that many ms (small draws, compute and copies run); H in the game window draws 8 full frames and holds the game there until H is pressed again |
+| `VICTORY_DRAW_BUDGET_MS=33` | test mode: skips draws past what should fit in that many ms (small draws, compute and copies run); H in the game window draws full frames (8, more while pipelines are being made) and keeps the last one in the window until H is pressed again; the game goes on behind it |
 | `VICTORY_PROFILE=<file>` | writes a CSV line of times and draw counts for each presented frame (outside the repository) |
 | `VICTORY_KEYS=30:Enter,12-280/4:Enter,285-300:W` | presses keys at those seconds, every 4 s in a range, or holds them through one, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
