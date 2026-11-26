@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap.
 //! Overlapping them takes per-submission fences, and must keep the order:
 //! copy-back first, then the bottom-of-pipe writes. Other code relies on the
-//! wait (mesh scratch, eviction, list resets): check it when changing this.
+//! wait too (the mesh scratch, for one): look for it before changing this.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};

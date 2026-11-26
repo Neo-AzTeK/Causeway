@@ -163,9 +163,11 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     }
     crate::fence::signal(fence, value)
 }
-/// A queue wait does not block: each submission has completed when it returns
-/// (`host`), so no work of ours is left to order after. Revise if submissions
-/// overlap.
+/// A queue wait does not block. Earlier submissions have completed when they
+/// return (`host`), so their signals are reached.
+/// shortcut: a value signalled only later (by the CPU, or a submission still
+/// to come) does not hold this queue's later work back. Revise if a title
+/// waits for one, or if submissions overlap.
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
     if fence.is_null() { E_INVALIDARG } else { S_OK }
 }

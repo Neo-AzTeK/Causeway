@@ -10,8 +10,8 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: stream pipelines of vertex or mesh plus pixel stages, and compute
-//! pipelines, get host pipelines (`host` refuses other stages); the plain
+//! shortcut: stream pipelines with only vertex, mesh and pixel stages, and
+//! compute pipelines, get host pipelines (`host` refuses other stages); the plain
 //! graphics description keeps its containers only. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.

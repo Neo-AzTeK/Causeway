@@ -40,9 +40,9 @@ impl Caps {
     /// Ask `device` everything the planners use, once. `formats` are the
     /// formats the caller will choose between (see `format_choice`); a
     /// format left out is reported unsupported. Applies [`WORKAROUNDS`] and
-    /// takes a new generation: call it again for every device made, since the
-    /// device made after a loss may report differently and holders compare
-    /// generations to see it.
+    /// takes a new generation. Probe each device made (one made after a loss
+    /// may report differently) instead of reusing a `Caps`; the generation is
+    /// there for a holder of derived state to tell it is stale.
     pub fn probe(device: &ID3D12Device, formats: &[DXGI_FORMAT]) -> Caps {
         let options = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS>(device, D3D12_FEATURE_D3D12_OPTIONS);
         let waves = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>(device, D3D12_FEATURE_D3D12_OPTIONS1);

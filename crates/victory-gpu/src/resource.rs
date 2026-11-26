@@ -1753,8 +1753,9 @@ impl Drop for Resource {
             .as_ref()
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
-            // Counted, not a fault: the lists hold the host copy, which
-            // keeps it alive (freed while named, it is a GPU page fault).
+            // Counted, not a fault: another holder (a list, or a title
+            // texture sharing the host copy) keeps it alive. Freed while a
+            // list names it, it would be a GPU page fault.
             static OUTLIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = OUTLIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if n.is_power_of_two() {

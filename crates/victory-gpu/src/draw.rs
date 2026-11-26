@@ -868,7 +868,8 @@ impl State {
     /// shader reaches wherever data its root view leads to lie (a vertex
     /// fetch's streams sit at offsets in the root view's own header).
     /// shortcut: what shaders write through a root UAV goes back to title
-    /// memory for 1 MiB from its address only.
+    /// memory as declared here: to the copy's end where its view writes are
+    /// marked, else 1 MiB from the address.
     fn root_view(
         &mut self,
         list: &HostList,
