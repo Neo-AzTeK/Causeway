@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 
+use crate::load::{Record, Summary};
 use crate::report::{Baseline, Log, Series, read_baseline};
 
 #[derive(Args)]
@@ -46,6 +47,9 @@ struct Loaded {
     name: String,
     series: Series,
     metrics: Vec<(&'static str, Option<f64>)>,
+    /// What other processes used over the lines measured; `None` when the run
+    /// has no `load.txt` for them.
+    load: Option<Summary>,
 }
 
 impl Loaded {
@@ -67,12 +71,27 @@ impl Loaded {
             || log.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
-        Ok(Self::from_text(&name, &String::from_utf8_lossy(&bytes), detail))
+        let record = Record::beside(&log);
+        Ok(Self::from_text(&name, &String::from_utf8_lossy(&bytes), detail, record.as_ref()))
     }
 
-    fn from_text(name: &str, text: &str, detail: Option<f64>) -> Loaded {
+    fn from_text(name: &str, text: &str, detail: Option<f64>, record: Option<&Record>) -> Loaded {
         let log = Log::parse(text);
-        Loaded { name: name.to_owned(), series: log.series(), metrics: log.metrics(detail) }
+        let load = record.and_then(|r| r.summary(log.measured_window()));
+        Loaded { name: name.to_owned(), series: log.series(), metrics: log.metrics(detail), load }
+    }
+
+    fn busy(&self) -> bool {
+        self.load.is_some_and(|l| l.busy())
+    }
+
+    /// What the table's header says of the load.
+    fn load_note(&self) -> String {
+        match self.load {
+            Some(l) if l.busy() => format!("MACHINE BUSY: {}", l.text()),
+            Some(l) => l.text(),
+            None => "load not recorded".into(),
+        }
     }
 
     fn lines(&self) -> usize {
@@ -324,12 +343,18 @@ struct Outcome {
     /// Why the run cannot be said to be no worse: what it lacks, or too few
     /// world lines to judge.
     unjudged: Vec<String>,
+    /// Why what was measured cannot be believed either way: the machine was
+    /// busy during the run, or during every baseline.
+    busy: Option<String>,
 }
 
 impl Outcome {
     /// What makes the command fail; empty when it passes.
     fn failures(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if let Some(why) = &self.busy {
+            out.push(format!("machine busy ({why}): run again on a quiet machine; as measured"));
+        }
         if !self.regressions.is_empty() {
             out.push(format!("regression in {}", self.regressions.join(", ")));
         }
@@ -338,6 +363,18 @@ impl Outcome {
         }
         out
     }
+}
+
+/// Why the machine's load makes the comparison say nothing, if it does.
+fn busy_reason(run: &Loaded, bases: &[Loaded]) -> Option<String> {
+    let mut why = Vec::new();
+    if run.busy() {
+        why.push(format!("during {}", run.name));
+    }
+    if bases.iter().all(Loaded::busy) {
+        why.push("during every baseline".to_owned());
+    }
+    (!why.is_empty()).then(|| why.join(" and "))
 }
 
 /// What stops any judgement of speed, whatever the rows say.
@@ -362,7 +399,15 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
         let lines = matches!(row.judge, Judge::Spread { .. });
         let verdicts: Vec<Verdict> =
             row.bases.iter().map(|b| verdict(row.judge, row.higher_is_better, &row.run, b)).collect();
-        let overall = combine(&verdicts, any);
+        // A busy baseline has its column, and no say while a quiet one has.
+        let quiet = bases.iter().any(|b| !b.busy());
+        let counted: Vec<Verdict> = verdicts
+            .iter()
+            .zip(bases)
+            .filter(|(_, b)| !(quiet && b.busy()))
+            .map(|(v, _)| *v)
+            .collect();
+        let overall = combine(&counted, any);
         match overall {
             Verdict::Regression => regressions.push(row.name.clone()),
             Verdict::Improvement => improvements.push(row.name.clone()),
@@ -381,9 +426,14 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
         cells.push(line);
     }
 
-    let mut text = format!("{}: {} world lines (median [q1..q3] per line)\n", run.name, run.lines());
+    let mut text = format!(
+        "{}: {} world lines (median [q1..q3] per line); {}\n",
+        run.name,
+        run.lines(),
+        run.load_note()
+    );
     for b in bases {
-        text += &format!("baseline {}: {} world lines\n", b.name, b.lines());
+        text += &format!("baseline {}: {} world lines; {}\n", b.name, b.lines(), b.load_note());
     }
     text += &format!(
         "a metric is judged {} the baselines; spread = larger IQR (floor 5% of the baseline)\n",
@@ -413,7 +463,8 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
     for row in &body {
         line(row);
     }
-    let mut outcome = Outcome { text, regressions, unjudged };
+    let busy = busy_reason(run, bases);
+    let mut outcome = Outcome { text, regressions, unjudged, busy };
     let mut parts = Vec::new();
     if !outcome.regressions.is_empty() {
         parts.push(format!("REGRESSION in {}", outcome.regressions.join(", ")));
@@ -427,13 +478,21 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
     if !improvements.is_empty() {
         parts.push(format!("improvement in {}", improvements.join(", ")));
     }
-    outcome.text += &format!("verdict: {}\n", parts.join("; "));
+    let mut verdict = parts.join("; ");
+    let ignored: Vec<&str> = bases.iter().filter(|b| b.busy()).map(|b| b.name.as_str()).collect();
+    if let Some(why) = &outcome.busy {
+        verdict = format!("MACHINE BUSY {why}: run again on a quiet machine. As measured: {verdict}");
+    } else if !ignored.is_empty() {
+        verdict += &format!(" (not counted, MACHINE BUSY during them: {})", ignored.join(", "));
+    }
+    outcome.text += &format!("verdict: {verdict}\n");
     outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::load::Sample;
 
     const SPREAD: Judge = Judge::Spread { abs: 1.0, rel: 0.05 };
 
@@ -555,7 +614,7 @@ mod tests {
     #[test]
     fn what_the_run_lacks_fails() {
         // No report beside the run: no non-flat share.
-        let run = Loaded::from_text("r", &same_log(20), None);
+        let run = Loaded::from_text("r", &same_log(20), None, None);
         let out = compare(&run, &[loaded("a", &same_log(20))], true);
         assert_eq!(out.unjudged, ["detail_pct missing"], "{}", out.text);
         // Not a diagnostics build's log: black frames are unknown.
@@ -570,6 +629,53 @@ mod tests {
             .collect();
         let out = compare(&loaded("r", &silent), &[loaded("a", &same_log(20))], true);
         assert!(out.unjudged.contains(&"dropped_refused missing".to_owned()), "{}", out.text);
+    }
+
+    /// A run whose every look found other processes at `other` percent. The
+    /// synthetic log's times wrap each minute, so looks cover all of one.
+    fn measured(name: &str, text: &str, other: f64) -> Loaded {
+        let start = 1_767_225_600.0;
+        let samples = (0..30)
+            .map(|i| Sample { at: start + f64::from(i) * 2.0, total: other + 30.0, other })
+            .collect();
+        let record = Record { wait: None, samples };
+        Loaded::from_text(name, text, Some(3.0), Some(&record))
+    }
+
+    #[test]
+    fn a_busy_run_says_so_instead_of_a_bare_regression() {
+        let base = || [measured("a", &same_log(20), 5.0)];
+        let slow = log(20, 0.5, 2000.0, 600.0, 650.0, 100.0);
+        let out = compare(&measured("r", &slow, 60.0), &base(), true);
+        assert!(out.text.contains("verdict: MACHINE BUSY during r"), "{}", out.text);
+        assert!(out.text.contains("As measured: REGRESSION in"), "{}", out.text);
+        assert!(out.failures()[0].starts_with("machine busy (during r)"));
+        // Busy and no worse is no pass either: load widens the spread.
+        let out = compare(&measured("r", &same_log(20), 60.0), &base(), true);
+        assert!(!out.failures().is_empty(), "{}", out.text);
+        assert!(out.text.contains("As measured: no regression"), "{}", out.text);
+        // The same slow run on a quiet machine is a regression, plainly.
+        let out = compare(&measured("r", &slow, 5.0), &base(), true);
+        assert!(out.text.contains("verdict: REGRESSION in"), "{}", out.text);
+        assert!(!out.text.contains("BUSY"), "{}", out.text);
+        // A run with no record is not called busy.
+        let out = compare(&loaded("r", &same_log(20)), &base(), true);
+        assert!(out.failures().is_empty(), "{}", out.text);
+        assert!(out.text.contains("load not recorded"), "{}", out.text);
+    }
+
+    #[test]
+    fn a_busy_baseline_has_no_say_beside_a_quiet_one() {
+        let run = || measured("r", &same_log(20), 5.0);
+        // The busy baseline drew with far fewer drops: it would fail the run.
+        let busy = || measured("b", &log(20, 1.0, 1000.0, 230.0, 650.0, 10.0), 60.0);
+        let out = compare(&run(), &[measured("a", &same_log(20), 5.0), busy()], true);
+        assert!(out.failures().is_empty(), "{}", out.text);
+        assert!(out.text.contains("not counted, MACHINE BUSY during them: b"), "{}", out.text);
+        // Alone, it makes the comparison say nothing.
+        let out = compare(&run(), &[busy()], true);
+        assert!(out.text.contains("MACHINE BUSY during every baseline"), "{}", out.text);
+        assert!(!out.failures().is_empty());
     }
 
     #[test]
@@ -609,7 +715,7 @@ mod tests {
     }
 
     fn loaded(name: &str, text: &str) -> Loaded {
-        Loaded::from_text(name, text, Some(3.0))
+        Loaded::from_text(name, text, Some(3.0), None)
     }
 
     #[test]

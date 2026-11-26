@@ -3,6 +3,7 @@
 mod capability;
 mod comments;
 mod compare;
+mod load;
 mod policy;
 mod queue;
 mod report;

@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 
+use crate::load;
 use crate::report::sheet;
 use crate::report::{Baseline, Context as Inputs, End, Log, Status, flat_png, read_baseline};
 
@@ -32,6 +33,11 @@ pub struct Smoke {
     /// the "steady world lines" area.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=100000))]
     world_lines: Option<u64>,
+    /// Before the title starts, waits at most this long for a quiet machine
+    /// (no compiler running and under 30% of the CPU for 20 s); 0 starts at
+    /// once. What other processes use while it plays goes to `load.txt`.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=86400))]
+    quiet_wait: u64,
     /// The title's saves and settings; a folder in --out by default, so
     /// every run goes through the first-start menus (see --accept-terms).
     #[arg(long)]
@@ -101,6 +107,9 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     let mut areas = log.judge(end.map(|(end, _)| end), |png| flat_png(&std::fs::read(png).ok()?));
     if let Some(asked) = args.world_lines {
         areas.push(log.steady_area(asked as usize, end.map(|(end, _)| end)));
+    }
+    if let Some(record) = load::Record::beside(&log_path) {
+        areas.push(record.area(log.measured_window()));
     }
     let text = log.text(&areas);
     create(&args.out)?;
@@ -230,6 +239,24 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         copy_dir(from, &data)?;
     }
 
+    // After the build and the copies, so that nothing of ours is going on when
+    // the title starts. `log.txt` is made after it: it says the title started.
+    let wait = match args.quiet_wait {
+        0 => None,
+        cap => {
+            println!("waiting for a quiet machine ({cap} s at most)");
+            let wait = load::wait_quiet(Duration::from_secs(cap), LOOK);
+            if let Some(w) = wait {
+                let how = if w.quiet { "quiet" } else { "never quiet, starting anyway" };
+                println!("{how} after {} s", w.seconds);
+            }
+            wait
+        }
+    };
+    let record_path = out.join(load::FILE);
+    std::fs::write(&record_path, load::Record::header(wait)).context("writing load.txt")?;
+    let mut record = std::fs::OpenOptions::new().append(true).open(&record_path)?;
+
     let log = out.join("log.txt");
     let file = File::create(&log).context("creating log.txt")?;
     let mut command = Command::new(&victory);
@@ -265,8 +292,18 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .stdout(file.try_clone()?)
         .stderr(file);
     let mut watch = args.world_lines.map(|asked| Watch::new(&log, asked as usize));
-    let enough = || watch.as_mut().is_some_and(Watch::enough);
-    let end = run_for(command, Duration::from_secs(args.seconds), enough)
+    let mut meter = load::Meter::default();
+    let look = |title: Option<u64>| {
+        let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
+        if let (Ok(at), Some(now), Some(title)) = (at, load::system_times(), title)
+            && let Some(sample) = meter.sample(at, now, title)
+        {
+            // A look that cannot be written is one less.
+            let _ = record.write_all(load::Record::line(sample).as_bytes());
+        }
+        watch.as_mut().is_some_and(Watch::enough)
+    };
+    let end = run_for(command, Duration::from_secs(args.seconds), look)
         .with_context(|| format!("running {}", victory.display()))?;
     Ok((log, end))
 }
@@ -422,13 +459,14 @@ impl Watch {
     }
 }
 
-/// Runs a process for at most `time`, or until `enough` (asked every `LOOK`)
-/// says so, then ends it and what it started. Also when it ended, or was ended
+/// Runs a process for at most `time`, or until `enough` says so, then ends it
+/// and what it started. `enough` is asked every `LOOK`, and given the processor
+/// time its processes have had (100 ns). Also when it ended, or was ended
 /// (Unix time).
 fn run_for(
     mut command: Command,
     time: Duration,
-    mut enough: impl FnMut() -> bool,
+    mut enough: impl FnMut(Option<u64>) -> bool,
 ) -> Result<(End, f64)> {
     let now = || SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
     let group = Group::new()?;
@@ -450,7 +488,7 @@ fn run_for(
         }
         if looked.elapsed() >= LOOK {
             looked = Instant::now();
-            if enough() {
+            if enough(group.cpu_time()) {
                 end = End::Enough;
                 break;
             }
@@ -467,11 +505,11 @@ fn run_for(
 /// A job: the process and what it starts, and nothing else. They end with
 /// this process too.
 #[cfg(windows)]
-struct Group(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct Group(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl Group {
-    fn new() -> Result<Group> {
+    pub(crate) fn new() -> Result<Group> {
         use windows_sys::Win32::System::JobObjects::*;
         // SAFETY: plain creation, no name or security attributes.
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -494,7 +532,7 @@ impl Group {
 
     // shortcut: what the process starts before this is not in the job; it
     // is still loading its DLLs.
-    fn add(&self, child: &Child) -> Result<()> {
+    pub(crate) fn add(&self, child: &Child) -> Result<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
         // SAFETY: both handles are live.
@@ -504,6 +542,19 @@ impl Group {
     }
 
     fn running(&self) -> Result<bool> {
+        Ok(self.accounting()?.ActiveProcesses > 0)
+    }
+
+    /// The processor time of everything that is or was in the job, in 100 ns.
+    fn cpu_time(&self) -> Option<u64> {
+        let info = self.accounting().ok()?;
+        u64::try_from(info.TotalUserTime + info.TotalKernelTime).ok()
+    }
+
+    fn accounting(
+        &self,
+    ) -> Result<windows_sys::Win32::System::JobObjects::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>
+    {
         use windows_sys::Win32::System::JobObjects::*;
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: the structure of this class, with its size.
@@ -517,10 +568,10 @@ impl Group {
             )
         };
         ensure!(read != 0, std::io::Error::last_os_error());
-        Ok(info.ActiveProcesses > 0)
+        Ok(info)
     }
 
-    fn kill(&self, _: &mut Child) -> Result<()> {
+    pub(crate) fn kill(&self, _: &mut Child) -> Result<()> {
         // SAFETY: a live job.
         let ended =
             unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) };
@@ -540,15 +591,15 @@ impl Drop for Group {
 // shortcut: elsewhere only the process itself is watched and ended; titles
 // run on Windows only.
 #[cfg(not(windows))]
-struct Group;
+pub(crate) struct Group;
 
 #[cfg(not(windows))]
 impl Group {
-    fn new() -> Result<Group> {
+    pub(crate) fn new() -> Result<Group> {
         Ok(Group)
     }
 
-    fn add(&self, _: &Child) -> Result<()> {
+    pub(crate) fn add(&self, _: &Child) -> Result<()> {
         Ok(())
     }
 
@@ -556,7 +607,11 @@ impl Group {
         Ok(false)
     }
 
-    fn kill(&self, child: &mut Child) -> Result<()> {
+    fn cpu_time(&self) -> Option<u64> {
+        None
+    }
+
+    pub(crate) fn kill(&self, child: &mut Child) -> Result<()> {
         Ok(child.kill()?)
     }
 }
@@ -702,6 +757,7 @@ mod tests {
             out: root.join("smoke-out"),
             seconds: 1,
             world_lines: None,
+            quiet_wait: 0,
             data_dir: None,
             data_from: None,
             accept_terms: false,
@@ -764,11 +820,15 @@ mod tests {
         command.args(["/d", "/c", "ping -n 60 127.0.0.1"]).stdout(Stdio::null());
         let start = Instant::now();
         let mut looks = 0;
-        let enough = || {
+        let mut times = Vec::new();
+        let enough = |cpu: Option<u64>| {
             looks += 1;
+            times.push(cpu.unwrap());
             looks == 2
         };
         let (end, _) = run_for(command, Duration::from_secs(60), enough).unwrap();
+        // The job's processor time only grows.
+        assert!(times[1] >= times[0]);
         assert_eq!((end, looks), (End::Enough, 2));
         assert!(start.elapsed() >= LOOK * 2 && start.elapsed() < Duration::from_secs(30));
     }
@@ -781,7 +841,7 @@ mod tests {
             c.args(["/d", "/c", script]).stdout(Stdio::null());
             c
         };
-        let exited = run_for(shell("exit 3"), Duration::from_secs(60), || false).unwrap();
+        let exited = run_for(shell("exit 3"), Duration::from_secs(60), |_| false).unwrap();
         assert_eq!(exited.0, End::Exited(Some(3)));
 
         // The grandchild holds the pipe: reading ends only when it is gone.
@@ -789,7 +849,7 @@ mod tests {
         let mut command = shell("ping -n 60 127.0.0.1");
         command.stdout(write);
         let start = Instant::now();
-        assert_eq!(run_for(command, Duration::from_secs(1), || false).unwrap().0, End::TimedOut);
+        assert_eq!(run_for(command, Duration::from_secs(1), |_| false).unwrap().0, End::TimedOut);
         std::io::Read::read_to_end(&mut read, &mut Vec::new()).unwrap();
         assert!(start.elapsed() < Duration::from_secs(30));
     }

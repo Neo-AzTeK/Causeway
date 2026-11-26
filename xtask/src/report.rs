@@ -18,6 +18,8 @@ const STEADY_AREA: &str = "steady world lines";
 /// a minute of 0.2 to 0.8 fps, then preparing times still falling. A fixed
 /// time, so a slower build cannot make its own warm-up longer.
 pub const WARM_UP: f64 = 90.0;
+/// The seconds a frame-rate line measures, about.
+const LINE_SPAN: f64 = 5.0;
 
 /// Draws and dispatches asked for per frame that mean the menus draw. The
 /// title's first screens ask for 3 to 7.
@@ -301,11 +303,30 @@ impl Log {
         }
     }
 
+    /// When each world line was logged (Unix time), and from where on they
+    /// are steady.
+    fn world_times(&self) -> (Vec<f64>, usize) {
+        let times: Vec<f64> = self.world().filter_map(|r| unix_time(&r.time)).collect();
+        let steady = times.first().map_or(0, |first| {
+            times.iter().position(|at| at - first >= WARM_UP).unwrap_or(times.len())
+        });
+        (times, steady)
+    }
+
     /// World lines logged `WARM_UP` seconds or more after the first one.
     pub fn steady_lines(&self) -> usize {
-        let mut times = self.world().filter_map(|r| unix_time(&r.time));
-        let Some(first) = times.next() else { return 0 };
-        times.filter(|at| at - first >= WARM_UP).count()
+        let (times, steady) = self.world_times();
+        times.len() - steady
+    }
+
+    /// The Unix times a run's numbers are measured over: its steady lines, or
+    /// all its world lines when fewer than `WORLD_LINES` are steady. `None`:
+    /// no world line.
+    pub fn measured_window(&self) -> Option<(f64, f64)> {
+        let (times, steady) = self.world_times();
+        let from = if times.len() - steady >= WORLD_LINES { steady } else { 0 };
+        // A line measures the seconds before it.
+        Some((times.get(from)? - LINE_SPAN, *times.last()?))
     }
 
     /// Whether the run logged the steady world lines it was asked for.
@@ -991,6 +1012,19 @@ mod tests {
         pieces.feed(&menu);
         pieces.feed(&world);
         assert_eq!(pieces.steady_lines(), 7);
+    }
+
+    #[test]
+    fn the_measured_window_is_the_steady_lines() {
+        let world: String = (6..=30).map(|i| rate_at(i * 5, 900)).collect();
+        // World from 30 s: steady from 120 s to 150 s.
+        let (from, to) = Log::parse(&world).measured_window().unwrap();
+        assert_eq!((from - THEN, to - THEN), (115.0, 150.0));
+        // Two steady lines: every world line.
+        let short: String = (6..=25).map(|i| rate_at(i * 5, 900)).collect();
+        let (from, to) = Log::parse(&short).measured_window().unwrap();
+        assert_eq!((from - THEN, to - THEN), (25.0, 125.0));
+        assert_eq!(Log::parse(&rate_at(5, 40)).measured_window(), None);
     }
 
     #[test]
