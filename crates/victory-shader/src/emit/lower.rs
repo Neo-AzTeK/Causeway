@@ -433,6 +433,23 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// DXIL's semantic kind of `SV_Barycentrics`.
+const BARYCENTRICS: u8 = 28;
+
+/// The DXIL interpolation mode that weighs vertices as `kind` does; the pull
+/// model has none.
+fn interp_mode(kind: Barycentric) -> Option<u8> {
+    match kind {
+        Barycentric::PerspectiveCenter => Some(2),
+        Barycentric::PerspectiveCentroid => Some(3),
+        Barycentric::PerspectiveSample => Some(6),
+        Barycentric::LinearCenter => Some(4),
+        Barycentric::LinearCentroid => Some(5),
+        Barycentric::LinearSample => Some(7),
+        Barycentric::PerspectivePullModel => None,
+    }
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1565,7 +1582,12 @@ impl<'a> Lower<'a> {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(n) => match io_inputs.get(&v) {
-                    Some(&input) => self.input(input),
+                    Some(&input) => match input {
+                        Input::Barycentric { kind, index } if self.x.io.barycentrics.contains(&v) => {
+                            self.barycentric(kind, index)
+                        }
+                        _ => self.input(input),
+                    },
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch
@@ -1600,6 +1622,37 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
         }
         Ok(())
+    }
+
+    /// A barycentric register as the host has it. The console's i and j are
+    /// the weights of the second and third vertex, the second and third
+    /// components of `SV_Barycentrics`.
+    fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = interp_mode(kind).filter(|_| index < 2) else {
+            return Val::Missing("pull-model barycentrics read directly");
+        };
+        let mine = |e: &SigElement| e.kind == BARYCENTRICS;
+        let found = self.s.inputs.iter().position(|e| mine(e) && e.interp == mode);
+        let id = found.unwrap_or_else(|| {
+            let rows = self.s.inputs.iter().filter_map(|e| e.row);
+            let row = rows.map(|r| r + 1).max().unwrap_or(0);
+            let index = self.s.inputs.iter().filter(|e| mine(e)).count() as u32;
+            self.s.flags |= flags::BARYCENTRICS;
+            self.s.inputs.push(SigElement {
+                name: "SV_Barycentrics".into(),
+                index,
+                kind: BARYCENTRICS,
+                comp: 9,
+                interp: mode,
+                row: Some(row),
+                col: 0,
+                cols: 3,
+                usage: 0,
+                half: false,
+            });
+            self.s.inputs.len() - 1
+        });
+        self.load_any_input(id, index + 1)
     }
 
     fn input(&mut self, input: Input) -> Val {
@@ -8061,15 +8114,7 @@ impl<'a> Lower<'a> {
                 ..
             } => (
                 attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
+                interp_mode(barycentric).ok_or("pull-model interpolation")?,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {

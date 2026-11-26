@@ -294,9 +294,11 @@ fn generations_increase_and_refusals_read_cleanly() {
 }
 
 #[test]
-fn doubles_need_the_device_to_say_so() {
+fn doubles_and_barycentrics_need_the_device_to_say_so() {
     for (said, want) in [(Some(true), true), (Some(false), false), (None, false)] {
         let c = Caps { doubles: said, ..Caps::unknown() };
         assert_eq!(doubles(&c), want, "{said:?}");
+        let c = Caps { barycentrics: said, ..Caps::unknown() };
+        assert_eq!(barycentrics(&c), want, "{said:?}");
     }
 }

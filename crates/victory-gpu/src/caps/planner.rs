@@ -78,6 +78,12 @@ pub fn wave_plan(caps: &Caps, need: WaveNeed) -> WavePlan {
     }
 }
 
+/// Whether pixel shaders may read `SV_Barycentrics`: a translated program
+/// that does is refused where they may not.
+pub fn barycentrics(caps: &Caps) -> bool {
+    caps.barycentrics == Some(true)
+}
+
 /// Whether shaders may compute in double precision: a translated program
 /// that does is refused where they may not.
 pub fn doubles(caps: &Caps) -> bool {

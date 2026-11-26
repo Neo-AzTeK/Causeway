@@ -222,7 +222,10 @@ fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
         container,
         crate::host::host().is_some_and(|h| crate::caps::min_lod_clamp(&h.caps)),
         crate::host::host().is_some_and(|h| !crate::caps::mesh_shaders(&h.caps)),
-        crate::host::host().is_some_and(|h| !crate::caps::doubles(&h.caps)),
+        crate::host::host().map_or_else(Default::default, |h| crate::shader_cache::Lacks {
+            doubles: !crate::caps::doubles(&h.caps),
+            barycentrics: !crate::caps::barycentrics(&h.caps),
+        }),
     );
     (host.and_then(|host| with_resources(container, host)), cached)
 }

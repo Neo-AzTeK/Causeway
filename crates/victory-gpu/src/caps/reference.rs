@@ -25,6 +25,7 @@ fn base(name: &str, vendor_id: u32, wave: (u32, u32), tiers: (u8, u8, u8)) -> Ca
         heap_atomics64: Some(false),
         aniso_point_mip: Some(false),
         doubles: Some(true),
+        barycentrics: Some(true),
         uma: Some(false),
         memory: MemoryCaps { budget: Some(7 * GIB), dedicated: 8 * GIB, shared: 16 * GIB },
         formats: BTreeMap::new(),
@@ -41,7 +42,7 @@ pub fn nvidia_modern() -> Caps {
 /// NVIDIA Pascal class: wave32, no mesh shaders, no 64-bit typed atomics,
 /// older shader model.
 pub fn nvidia_pascal() -> Caps {
-    Caps { shader_model: Some(ShaderModel(0x66)), ..base("nvidia-pascal", 0x10de, (32, 32), (3, 3, 0)) }
+    Caps { shader_model: Some(ShaderModel(0x66)), barycentrics: Some(false), ..base("nvidia-pascal", 0x10de, (32, 32), (3, 3, 0)) }
 }
 
 /// AMD RDNA2/3 class: wave32 or wave64 at the driver's choice.

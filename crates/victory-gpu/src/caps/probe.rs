@@ -45,6 +45,7 @@ impl Caps {
     pub fn probe(device: &ID3D12Device, formats: &[DXGI_FORMAT]) -> Caps {
         let options = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS>(device, D3D12_FEATURE_D3D12_OPTIONS);
         let waves = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>(device, D3D12_FEATURE_D3D12_OPTIONS1);
+        let o3 = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS3>(device, D3D12_FEATURE_D3D12_OPTIONS3);
         let o7 = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS7>(device, D3D12_FEATURE_D3D12_OPTIONS7);
         let o9 = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS9>(device, D3D12_FEATURE_D3D12_OPTIONS9);
         let o11 = query::<D3D12_FEATURE_DATA_D3D12_OPTIONS11>(device, D3D12_FEATURE_D3D12_OPTIONS11);
@@ -66,6 +67,7 @@ impl Caps {
             heap_atomics64: o11.map(|o| o.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()),
             aniso_point_mip: o19.map(|o| o.AnisoFilterWithPointMipSupported.as_bool()),
             doubles: options.map(|o| o.DoublePrecisionFloatShaderOps.as_bool()),
+            barycentrics: o3.map(|o| o.BarycentricsSupported.as_bool()),
             uma: arch.map(|a| a.UMA.as_bool()),
             memory,
             formats: formats

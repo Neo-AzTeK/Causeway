@@ -423,12 +423,24 @@ pub struct Options {
     pub mesh_as_compute: bool,
 }
 
-/// Whether the host shader `dxil` computes in double precision (its feature
-/// part says so), which a host without `Caps::doubles` cannot run.
+/// Whether the host shader `dxil` computes in double precision, which a host
+/// without `Caps::doubles` cannot run.
 pub fn uses_doubles(dxil: &[u8]) -> bool {
-    let features = Container::parse(dxil).ok();
-    let features = features.as_ref().and_then(|c| c.part(FourCC(*b"SFI0")));
-    features.is_some_and(|p| p.data.first().is_some_and(|b| b & 1 != 0))
+    features(dxil) & 1 != 0
+}
+
+/// Whether the host shader `dxil` reads `SV_Barycentrics`, which a host
+/// without `Caps::barycentrics` cannot run.
+pub fn uses_barycentrics(dxil: &[u8]) -> bool {
+    features(dxil) & 0x2_0000 != 0
+}
+
+/// The feature bits a container asks of its host (`SFI0`).
+fn features(dxil: &[u8]) -> u64 {
+    let container = Container::parse(dxil).ok();
+    let part = container.as_ref().and_then(|c| c.part(FourCC(*b"SFI0")));
+    let bytes = part.and_then(|p| p.data.get(..8)?.try_into().ok());
+    bytes.map_or(0, u64::from_le_bytes)
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -583,28 +595,42 @@ fn emit_once(
         }
         _ => 0,
     };
-    let parts = |st, res| lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs: inputs.clone(),
-        outputs: outputs.clone(),
-        prims: prims.clone(),
-        mesh_stride,
-        view_marks: options.view_marks,
-        min_lod_clamp: options.min_lod_clamp,
-        mesh_compute,
+    let lowered = |io: &io::Io| {
+        let with = |st: &structure::Structured, res: &resource::Resources| {
+            lower::lower(&lower::Parts {
+                native,
+                p,
+                st,
+                io,
+                res,
+                inputs: inputs.clone(),
+                outputs: outputs.clone(),
+                prims: prims.clone(),
+                mesh_stride,
+                view_marks: options.view_marks,
+                min_lod_clamp: options.min_lod_clamp,
+                mesh_compute,
+            })
+        };
+        match with(st, res) {
+            // Discarded lanes kept on as helpers can read what no surviving
+            // lane does (a register only killed lanes skipped writing); such a
+            // program kills them as the console does (`structure::killing`).
+            Err(_) if !st.discards.is_empty() => {
+                let st = structure::killing(p)?;
+                let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+                with(&st, &res)
+            }
+            l => l,
+        }
     };
-    let l = match lower::lower(&parts(st, res)) {
-        // Discarded lanes kept on as helpers can read what no surviving
-        // lane does (a register only killed lanes skipped writing); such a
-        // program kills them as the console does (`structure::killing`).
-        Err(_) if !st.discards.is_empty() => {
-            let st = structure::killing(p)?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+    let l = match lowered(io) {
+        // A register that holds barycentrics reaches more than an
+        // interpolation: only then is the host asked for them.
+        Err(ShaderError::Unsupported { what: "barycentrics read directly", .. }) => {
+            let mut io = io.clone();
+            io.barycentrics = io::direct_barycentrics(p, &io);
+            lowered(&io)?
         }
         l => l?,
     };
@@ -1635,6 +1661,30 @@ mod tests {
         assert!(whole.to_string().contains("first half"), "{whole}");
         let part = program(0x3408_0488).unwrap_err(); // v_lshlrev_b32 v4, 8, v2
         assert!(part.to_string().contains("first half"), "{part}");
+    }
+
+    /// A barycentric register read as a number comes from the host's
+    /// `SV_Barycentrics`; a program that only interpolates with them asks
+    /// the host for none.
+    #[test]
+    fn barycentrics_read_directly_come_from_the_host() {
+        let program = |read: u32| {
+            let words = [
+                0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+                read,           // v3 from j or from the attribute
+                0xF800_180F,
+                0x0303_0302, // exp mrt0, v2, v3, v3, v3 done vm
+                0xBF81_0000,
+            ];
+            let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+            let osg1 = rows(&[("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap()
+        };
+        let direct = program(0x7E06_0301); // v_mov_b32 v3, v1
+        assert!(super::uses_barycentrics(&direct.dxil));
+        let plain = program(0x7E06_0302); // v_mov_b32 v3, v2
+        assert!(!super::uses_barycentrics(&plain.dxil));
     }
 
     /// A pixel export before the `done` one, both under a lane guard (EXEC
