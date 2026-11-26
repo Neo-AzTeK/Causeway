@@ -1395,19 +1395,23 @@ impl State {
         }
     }
 
-    /// With `VICTORY_PROBE_WINDOW=<hash>:<user data index>`, in a listed
+    /// With `VICTORY_PROBE_WINDOW=<hash>:<user data index>[:big]`, in a listed
     /// frame: for a dispatch of that program, each table buffer over 64 bytes
     /// as title memory and as its host copy at the submission, at the byte
     /// offset the user data holds (the loop counts of `a1f6cdf8874960a9`
-    /// live there). Words in hex.
+    /// live there). Words in hex. With `:big`, in every frame, and only for
+    /// a dispatch whose loop counts (the dwords at +4 and +0x374) are over
+    /// 4096 in the title or the copy, or whose window lies past the view.
     #[cfg(feature = "diagnostics")]
     fn probe_window(&self, list: &HostList) {
         use std::fmt::Write as _;
-        if !crate::capture::listed(crate::queue::presented() + 1) {
+        let Ok(spec) = std::env::var("VICTORY_PROBE_WINDOW") else { return };
+        let mut parts = spec.split(':');
+        let (Some(hash), Some(index)) = (parts.next(), parts.next()) else { return };
+        let big = parts.next() == Some("big");
+        if !big && !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
-        let Ok(spec) = std::env::var("VICTORY_PROBE_WINDOW") else { return };
-        let Some((hash, index)) = spec.split_once(':') else { return };
         let Ok(index) = index.trim().parse::<u32>() else { return };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
         for stage in &p.stages {
@@ -1430,11 +1434,18 @@ impl State {
                     View::Constant(address, size) => Some((address, u64::from(size))),
                     ref v => crate::descriptor::host::buffer_range(v),
                 };
-                let Some((at, len)) = range.filter(|r| r.1 > 64 && off + 0x3d0 <= r.1) else { continue };
+                let Some((at, len)) = range.filter(|r| r.1 > 64) else { continue };
+                let past = off + 0x3d0 > len;
+                if past && !big {
+                    continue;
+                }
                 let Some(shadow) = crate::shadow::find(at, len) else { continue };
                 let who = format!(
-                    "{hash} {:?} s{}+{} {at:#x}+{len:#x} u{index}={off:#x}",
-                    used.kind, used.slot, used.table_offset_dwords
+                    "{hash} {:?} s{}+{} {at:#x}+{len:#x} u{index}={off:#x} frame {} past={past}",
+                    used.kind,
+                    used.slot,
+                    used.table_offset_dwords,
+                    crate::queue::presented() + 1
                 );
                 let words = |bytes: &[u8]| -> String {
                     bytes.chunks(4).fold(String::new(), |mut s, c| {
@@ -1444,24 +1455,31 @@ impl State {
                 };
                 // The loop counts: +4 (loop 1) and +0x374 (loop 2).
                 let ranges = [(0u64, 0x20u64), (0x370, 0x40)];
-                let title: Vec<String> = ranges
+                let counts = |r: &[Vec<u8>]| -> [u32; 2] {
+                    let at = |v: &Vec<u8>| u32::from_le_bytes([v[4], v[5], v[6], v[7]]);
+                    [at(&r[0]), at(&r[1])]
+                };
+                let title: Vec<Vec<u8>> = ranges
                     .iter()
                     .map(|&(o, n)| {
                         let mut b = vec![0u8; n as usize];
-                        if crate::host::read_into((at + off + o) as *const u8, &mut b) {
-                            format!("+{o:#x}:{}", words(&b))
-                        } else {
-                            format!("+{o:#x}: unreadable")
-                        }
+                        let _ = crate::host::read_into((at + off + o) as *const u8, &mut b);
+                        b
                     })
                     .collect();
-                let (s, w, t2) = (shadow.clone(), who.clone(), title.join(" "));
+                let title_big = counts(&title).iter().any(|&c| c > 4096);
+                let t2: Vec<String> =
+                    ranges.iter().zip(&title).map(|(&(o, _), b)| format!("+{o:#x}:{}", words(b))).collect();
+                let (s, w, t2) = (shadow.clone(), who.clone(), t2.join(" "));
                 list.defer_host(move || {
-                    let copy: Vec<String> = ranges
-                        .iter()
-                        .map(|&(o, n)| format!("+{o:#x}:{}", words(&s.peek_bytes(at + off + o, n))))
-                        .collect();
-                    tracing::info!(target: "victory_gpu::trace", "window {w} title [{t2}] copy [{}]", copy.join(" "));
+                    let copy: Vec<Vec<u8>> =
+                        ranges.iter().map(|&(o, n)| s.peek_bytes(at + off + o, n)).collect();
+                    if big && !past && !title_big && !counts(&copy).iter().any(|&c| c > 4096) {
+                        return;
+                    }
+                    let c2: Vec<String> =
+                        ranges.iter().zip(&copy).map(|(&(o, _), b)| format!("+{o:#x}:{}", words(b))).collect();
+                    tracing::info!(target: "victory_gpu::trace", "window {w} title [{t2}] copy [{}]", c2.join(" "));
                 });
             }
         }

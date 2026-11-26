@@ -731,3 +731,64 @@ fn a_mask_set_to_a_constant_then_a_compare_joins_in_wave64() {
     let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
     translate_with(&words, ResourceType::Srv, 4, 0, true).unwrap();
 }
+
+/// The shape of the loops of a compute program that ran for seconds on the
+/// host: a scalar count, a skip when it is zero, then a do-while that adds to
+/// a vector register, bumps a scalar counter and leaves when the counter
+/// equals the count (`s_cmp_eq_u32`, `s_cbranch_scc0`). `count` is set by
+/// `set_count` (one instruction), `narrow` wraps it in a lane-mask region.
+fn counted_loop(set_count: u32) -> Vec<u32> {
+    let body = [
+        0xBF06_800C, // s_cmp_eq_u32 s12, 0
+        0xBF85_0005, // s_cbranch_scc1 -> after the loop
+        0xBE8E_0380, // s_mov_b32 s14, 0
+        0x4A10_1081, // v_add_nc_u32 v8, 1, v8
+        0x810E_810E, // s_add_i32 s14, s14, 1
+        0xBF06_0C0E, // s_cmp_eq_u32 s14, s12
+        0xBF84_FFFC, // s_cbranch_scc0 -> the add to v8
+    ];
+    [&[0x7E10_0280, set_count][..], &body].concat() // v_mov_b32 v8, 0
+}
+
+#[test]
+fn a_do_while_to_a_scalar_count_runs_that_many_times() {
+    for (count, want) in [(6u32, 6u32), (1, 1), (0, 0), (64, 64), (200, 200)] {
+        let set = 0xBE8C_0380 | (0x80 + count.min(64)); // s_mov_b32 s12, inline 0..64
+        let body = if count <= 64 {
+            counted_loop(set)
+        } else {
+            // A literal.
+            let mut b = counted_loop(0xBE8C_03FF);
+            b.insert(2, count);
+            b
+        };
+        for (label, got) in stored(&body) {
+            assert_eq!(got, [want; 32], "{label} count {count}");
+        }
+    }
+}
+
+#[test]
+fn a_do_while_in_a_lane_mask_runs_that_many_times_in_the_lanes_inside() {
+    // exec = lanes below 28 around the loop and its skip.
+    let inner = counted_loop(0xBE8C_0386); // s_mov_b32 s12, 6
+    let mut body = vec![
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0x7DA8_009C, // v_cmpx_gt_u32 exec_lo, 28, v0
+        0xBF88_0000 | inner.len() as u32, // s_cbranch_execz -> the restore
+    ];
+    body.extend(&inner);
+    body.push(0xBEFE_0317); // s_mov_b32 exec_lo, s23
+    for (label, got) in stored(&body) {
+        let want: Vec<u32> = (0..32).map(|l| if l < 28 { 6 } else { 0 }).collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn a_do_while_runs_that_many_times_in_wave64() {
+    let body = counted_loop(0xBE8C_0386); // s_mov_b32 s12, 6
+    if let Some(got) = on_waves_of_32(&body, 64) {
+        assert_eq!(got, [6; 64]);
+    }
+}
