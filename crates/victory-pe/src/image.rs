@@ -502,7 +502,8 @@ mod tests {
             .unwrap()
             .rva_to_file_offset(import_rva)
             .unwrap() as usize;
-        // First descriptor's FirstThunk, at the 4 GiB limit: used to overflow.
+        // First descriptor's FirstThunk, at the 4 GiB limit: the offset
+        // arithmetic must not overflow there.
         data[desc + 16..desc + 20].copy_from_slice(&0xFFFF_FFF8u32.to_le_bytes());
         assert!(matches!(
             ImageInfo::parse(&data),

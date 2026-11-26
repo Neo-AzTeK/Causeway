@@ -20,7 +20,8 @@ pub struct Config {
     /// What titles write and must keep (persistent local storage). Never
     /// inside the cache, which may be deleted at any time.
     pub data_dir: PathBuf,
-    /// Other titles used to exercise platform-level code.
+    /// Other titles, to exercise platform-level code: the platform crates are
+    /// not tied to one title.
     pub test_titles: Vec<PathBuf>,
     /// The user's copy of AMD FidelityFX for PC (the folder with its
     /// upscaler DLL), which replaces a title's console build.
