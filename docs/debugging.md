@@ -81,7 +81,12 @@ takes the oldest request and runs exactly `cargo xtask smoke --exe <its --exe> -
 runner from starting; `--replace-lock` if the first is gone, `--once` to stop when
 the queue is empty). The console goes to `<runs>\<name>.console.txt`. It then writes
 `<name>.done` (`exit`, `out`, `digest`, `console`, and `error` for a refused
-request, `exit = -1`) beside the request: wait for that file, or pass `--wait`.
+request, `exit = -1`, and the `requester`) beside the request: wait for that file, or
+pass `--wait`. There is one runner and it owns the order (oldest request first); never
+start a waiter per request. While the smoke lock is held (a run by hand) the head waits;
+a run that still stops at the lock goes back to the head (its request is untouched), and
+after 60 such tries it is given up on in its `.done`. `status` prints what runs (and for
+how long), then the queue in the order it runs, then the last finished.
 
 ```powershell
 cargo xtask compare E:\Causeway-tools\runs\mesh-9 --baseline E:\Causeway-tools\runs\smoke-16 --baseline E:\Causeway-tools\runs\smoke-15

@@ -263,6 +263,14 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
 /// The lock one smoke run at a time holds on this machine: free once dropped
 /// or once the process is gone.
 // shortcut: a title started by hand (`victory run`) does not take it.
+/// What `one_run` says when it fails: the queue runner puts a run back for it.
+pub(crate) const LOCK_BUSY: &str = "is not free";
+
+/// Whether no smoke run holds the machine's lock now.
+pub(crate) fn lock_free() -> bool {
+    one_run(&std::env::temp_dir().join("causeway-smoke.lock")).is_ok()
+}
+
 fn one_run(path: &Path) -> Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
@@ -272,7 +280,7 @@ fn one_run(path: &Path) -> Result<File> {
     std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0);
     options
         .open(path)
-        .with_context(|| format!("is another smoke run on? {} is not free", path.display()))
+        .with_context(|| format!("is another smoke run on? {} {LOCK_BUSY}", path.display()))
 }
 
 /// Refuses scripted keys where they could tick the title's legal terms: on a

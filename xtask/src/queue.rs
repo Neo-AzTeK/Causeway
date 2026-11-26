@@ -19,10 +19,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand};
 
+use crate::smoke;
+
 const DEFAULT_QUEUE: &str = r"E:\Causeway-tools\queue";
 const DEFAULT_RUNS: &str = r"E:\Causeway-tools\runs";
 const LOCK: &str = "runner.lock";
 const POLL: Duration = Duration::from_secs(5);
+/// A request whose run stops at the smoke lock this many times is given up on.
+const MAX_BUSY: u32 = 60;
 
 #[derive(Args)]
 pub struct Queue {
@@ -401,6 +405,9 @@ fn add_request(root: &Path, dirs: &Dirs, add: &Add) -> Result<()> {
 fn write_done(dirs: &Dirs, name: &str, exit: i64, digest: Option<&Path>, error: Option<&str>) -> Result<()> {
     let mut table = toml::Table::new();
     table.insert("name".into(), name.to_owned().into());
+    if let Some(who) = requester_of(dirs, name) {
+        table.insert("requester".into(), who.into());
+    }
     table.insert("exit".into(), exit.into());
     table.insert("finished_unix".into(), (unix_now() as i64).into());
     table.insert("out".into(), dirs.runs.join(name).display().to_string().into());
@@ -476,6 +483,8 @@ fn runner(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
 }
 
 fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
+    let mut busy: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut said = false;
     loop {
         let Some(name) = waiting(dirs).into_iter().next() else {
             if args.once {
@@ -484,6 +493,17 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
             std::thread::sleep(POLL);
             continue;
         };
+        // A run started by hand, or one that has not let go, holds the smoke
+        // lock: the head of the queue waits, it is not lost.
+        if !smoke::lock_free() {
+            if !said {
+                println!("runner: the smoke lock is held; {name} waits at the head of the queue");
+                said = true;
+            }
+            std::thread::sleep(POLL);
+            continue;
+        }
+        said = false;
         fs::write(dirs.file(&name, "running"), format!("started_unix {}\n", unix_now()))?;
         let outcome = fs::read_to_string(dirs.file(&name, "toml"))
             .context("reading the request")
@@ -495,10 +515,25 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
                 launch(dirs, &request, &args.exe)
             });
         match outcome {
-            Ok(code) => {
+            Ok(Ran::Exit(code)) => {
                 let digest = dirs.runs.join(&name).join("digest.md");
                 write_done(dirs, &name, code.into(), digest.is_file().then_some(digest.as_path()), None)?;
                 println!("runner: done {name} exit={code}");
+            }
+            Ok(Ran::LockBusy) => {
+                // The smoke run did not start: back to the head, its request
+                // untouched (it is still the oldest).
+                let tries = busy.entry(name.clone()).or_default();
+                *tries += 1;
+                if *tries >= MAX_BUSY {
+                    let why = format!("the smoke lock was busy {MAX_BUSY} times in a row");
+                    write_done(dirs, &name, -1, None, Some(&why))?;
+                    println!("runner: gave up on {name}: {why}");
+                } else {
+                    let _ = fs::remove_file(dirs.file(&name, "running"));
+                    println!("runner: {name} did not start (smoke lock busy); it stays at the head");
+                    std::thread::sleep(POLL);
+                }
             }
             Err(e) => {
                 write_done(dirs, &name, -1, None, Some(&format!("{e:#}")))?;
@@ -508,9 +543,21 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
     }
 }
 
+/// How a launch ended.
+enum Ran {
+    Exit(i32),
+    /// `cargo xtask smoke` stopped at the smoke lock, before making anything.
+    LockBusy,
+}
+
+/// Whether a smoke run failed only because another holds the lock.
+fn stopped_at_the_lock(code: i32, console: &str, out_exists: bool) -> bool {
+    code != 0 && !out_exists && console.contains(smoke::LOCK_BUSY)
+}
+
 /// Runs `cargo xtask smoke` for a checked request; its console goes to
-/// `<runs>/<name>.console.txt`. The exit code, or -1 when it was a signal.
-fn launch(dirs: &Dirs, request: &Request, exe: &Path) -> Result<i32> {
+/// `<runs>/<name>.console.txt`.
+fn launch(dirs: &Dirs, request: &Request, exe: &Path) -> Result<Ran> {
     let console = dirs.runs.join(format!("{}.console.txt", request.name));
     let out = fs::File::create(&console).with_context(|| format!("creating {}", console.display()))?;
     let err = out.try_clone()?;
@@ -522,7 +569,18 @@ fn launch(dirs: &Dirs, request: &Request, exe: &Path) -> Result<i32> {
         .stderr(err)
         .status()
         .context("starting cargo")?;
-    Ok(status.code().unwrap_or(-1))
+    let code = status.code().unwrap_or(-1);
+    let text = fs::read(&console).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    if stopped_at_the_lock(code, &text, dirs.runs.join(&request.name).exists()) {
+        return Ok(Ran::LockBusy);
+    }
+    Ok(Ran::Exit(code))
+}
+
+/// The session a request names, if its file reads.
+fn requester_of(dirs: &Dirs, name: &str) -> Option<String> {
+    let text = fs::read_to_string(dirs.file(name, "toml")).ok()?;
+    Request::parse(&text).ok()?.requester
 }
 
 fn status(dirs: &Dirs) -> Result<()> {
@@ -535,41 +593,53 @@ fn status(dirs: &Dirs) -> Result<()> {
         println!("no queue folder yet ({})", dirs.queue.display());
         return Ok(());
     };
-    let mut rows: Vec<(SystemTime, String, String)> = Vec::new();
-    for e in entries.filter_map(Result::ok) {
-        let path = e.path();
-        if path.extension().is_none_or(|x| x != "toml") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|n| n.to_str()).map(str::to_owned) else { continue };
-        let modified = e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
-        let who = fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| Request::parse(&t).ok())
-            .map(|r| format!("{} s, {}{}", r.seconds, &r.commit[..r.commit.len().min(8)], r.requester.map_or(String::new(), |q| format!(", {q}"))))
-            .unwrap_or_else(|| "unreadable".into());
-        let state = if let Ok(done) = fs::read_to_string(dirs.file(&name, "done")) {
+    let mut names: Vec<(SystemTime, String)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "toml"))
+        .filter_map(|e| {
+            let name = e.path().file_stem()?.to_str()?.to_owned();
+            Some((e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH), name))
+        })
+        .collect();
+    names.sort();
+    let (mut running, mut queued, mut finished) = (Vec::new(), Vec::new(), Vec::new());
+    for (_, name) in names {
+        let parsed = fs::read_to_string(dirs.file(&name, "toml")).ok().and_then(|t| Request::parse(&t).ok());
+        let what = parsed.as_ref().map_or("unreadable".to_owned(), |r| {
+            let who = r.requester.as_deref().map_or(String::new(), |q| format!(", {q}"));
+            format!("{} s, {}{who}", r.seconds, &r.commit[..r.commit.len().min(8)])
+        });
+        if let Ok(done) = fs::read_to_string(dirs.file(&name, "done")) {
             let table: toml::Table = done.parse().unwrap_or_default();
             let code = table.get("exit").and_then(toml::Value::as_integer).unwrap_or(-1);
-            match table.get("error").and_then(toml::Value::as_str) {
+            let state = match table.get("error").and_then(toml::Value::as_str) {
                 Some(e) => format!("refused: {}", e.chars().take(80).collect::<String>()),
                 None => format!("done, exit {code}"),
-            }
-        } else if dirs.file(&name, "running").exists() {
-            "RUNNING".to_owned()
+            };
+            finished.push(format!("{name:<26} {state}; {what}"));
+        } else if let Ok(started) = fs::read_to_string(dirs.file(&name, "running")) {
+            let at = started.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok());
+            let for_s = at.map_or(0, |at| unix_now().saturating_sub(at));
+            running.push(format!("{name:<26} RUNNING for {for_s} s; {what}"));
         } else {
-            "queued".to_owned()
-        };
-        rows.push((modified, name, format!("{state}; {who}")));
+            queued.push(format!("{name:<26} {what}"));
+        }
     }
-    rows.sort();
-    // Waiting and running first, then the latest finished.
-    let (open, done): (Vec<_>, Vec<_>) =
-        rows.into_iter().partition(|(_, _, s)| s.starts_with("queued") || s.starts_with("RUNNING"));
-    for (_, name, state) in open.iter().chain(done.iter().rev().take(10)) {
-        println!("{name:<28} {state}");
+    for line in &running {
+        println!("{line}");
     }
-    println!("{} open, {} finished", open.len(), done.len());
+    for (i, line) in queued.iter().enumerate() {
+        println!("#{} {line}", i + 1);
+    }
+    for line in finished.iter().rev().take(10) {
+        println!("{line}");
+    }
+    println!(
+        "{} running, {} queued (in the order they run), {} finished",
+        running.len(),
+        queued.len(),
+        finished.len()
+    );
     Ok(())
 }
 
@@ -678,6 +748,29 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
         fs::write(dirs.file("a", "done"), "x").unwrap();
         fs::write(dirs.file("c", "running"), "x").unwrap();
         assert_eq!(waiting(&dirs), ["b"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_start_stopped_at_the_lock_is_put_back() {
+        let busy = format!("Error: is another smoke run on? C:/t/x.lock {}", smoke::LOCK_BUSY);
+        assert!(stopped_at_the_lock(1, &busy, false));
+        assert!(!stopped_at_the_lock(0, &busy, false));
+        // A run that made its folder started, whatever it printed.
+        assert!(!stopped_at_the_lock(1, &busy, true));
+        assert!(!stopped_at_the_lock(1, "Error: 3 areas failed", false));
+    }
+
+    #[test]
+    fn a_done_file_names_the_requester() {
+        let dir = std::env::temp_dir().join(format!("xtask-done-{}", std::process::id()));
+        let dirs = Dirs { queue: dir.clone(), runs: dir.join("runs") };
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dirs.file("mesh-emu-8", "toml"), GOOD).unwrap();
+        write_done(&dirs, "mesh-emu-8", 0, None, None).unwrap();
+        let done: toml::Table = fs::read_to_string(dirs.file("mesh-emu-8", "done")).unwrap().parse().unwrap();
+        assert_eq!(done["requester"].as_str(), Some("local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"));
+        assert_eq!(done["exit"].as_integer(), Some(0));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
