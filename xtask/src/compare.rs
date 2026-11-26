@@ -21,10 +21,11 @@ pub struct Compare {
     /// An earlier run to compare with, same form; several are allowed.
     #[arg(long = "baseline", required = true)]
     baselines: Vec<PathBuf>,
-    /// A metric is a regression when it is one against any baseline (the
-    /// default: against every baseline).
+    /// A metric is a regression only when it is one against every baseline
+    /// that has it (the default: against any of them), for a noisy baseline
+    /// that must not decide alone.
     #[arg(long)]
-    any: bool,
+    all: bool,
 }
 
 /// Fewer world lines than this say nothing about a spread.
@@ -33,13 +34,10 @@ const MIN_LINES: usize = 3;
 pub fn run(args: &Compare) -> Result<()> {
     let run = Loaded::read(&args.run)?;
     let bases = args.baselines.iter().map(|b| Loaded::read(b)).collect::<Result<Vec<_>>>()?;
-    let outcome = compare(&run, &bases, args.any);
+    let outcome = compare(&run, &bases, !args.all);
     print!("{}", outcome.text);
-    ensure!(
-        outcome.regressions.is_empty(),
-        "regression in {}",
-        outcome.regressions.join(", ")
-    );
+    let failures = outcome.failures();
+    ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
@@ -155,8 +153,13 @@ enum Verdict {
     Regression,
     Improvement,
     Noise,
-    /// Too few world lines for a spread.
+    /// The baseline has too few world lines for a spread: it says nothing.
     Few,
+    /// The run has too few where the baseline has enough: nothing says it is
+    /// no worse, so it fails.
+    Short,
+    /// The run has no value where the baseline has one: it fails too.
+    Missing,
     NoData,
 }
 
@@ -167,6 +170,8 @@ impl Verdict {
             Verdict::Improvement => "improvement",
             Verdict::Noise => "within noise",
             Verdict::Few => "too few lines",
+            Verdict::Short => "FAIL: run too short",
+            Verdict::Missing => "FAIL: missing in run",
             Verdict::NoData => "n/a",
         }
     }
@@ -205,15 +210,21 @@ fn verdict(judge: Judge, higher_is_better: bool, run: &Dist, base: &Dist) -> Ver
             _ => Verdict::Noise,
         };
     }
-    if run.n == 0 || base.n == 0 {
+    if base.n == 0 {
         return Verdict::NoData;
+    }
+    if run.n == 0 {
+        return Verdict::Missing;
     }
     let delta = run.median - base.median;
     let worse = if higher_is_better { -delta } else { delta };
     let noise = match judge {
         Judge::Spread { abs, rel } => {
-            if run.n < MIN_LINES || base.n < MIN_LINES {
+            if base.n < MIN_LINES {
                 return Verdict::Few;
+            }
+            if run.n < MIN_LINES {
+                return Verdict::Short;
             }
             run.iqr().max(base.iqr()).max(rel * base.median.abs()).max(abs)
         }
@@ -229,21 +240,29 @@ fn verdict(judge: Judge, higher_is_better: bool, run: &Dist, base: &Dist) -> Ver
     }
 }
 
-/// One verdict over several baselines: by default a regression or an
-/// improvement only when every baseline with data agrees.
+/// One verdict over several baselines. What the run lacks fails whatever the
+/// others say. A regression against `any` baseline is one (else against every
+/// baseline that judged it); an improvement is one only against every one.
 fn combine(verdicts: &[Verdict], any: bool) -> Verdict {
-    let data: Vec<Verdict> = verdicts.iter().copied().filter(|v| *v != Verdict::NoData).collect();
-    if data.is_empty() {
-        return Verdict::NoData;
-    }
-    let has = |v| data.contains(&v);
-    let every = |v| data.iter().all(|d| *d == v);
-    for v in [Verdict::Regression, Verdict::Improvement] {
-        if (any && has(v)) || every(v) {
+    for v in [Verdict::Missing, Verdict::Short] {
+        if verdicts.contains(&v) {
             return v;
         }
     }
-    if every(Verdict::Few) { Verdict::Few } else { Verdict::Noise }
+    // Baselines that say nothing about this metric do not outvote the others.
+    let data: Vec<Verdict> = verdicts
+        .iter()
+        .copied()
+        .filter(|v| !matches!(v, Verdict::NoData | Verdict::Few))
+        .collect();
+    if data.is_empty() {
+        return if verdicts.contains(&Verdict::Few) { Verdict::Few } else { Verdict::NoData };
+    }
+    let every = |v| data.iter().all(|d| *d == v);
+    if (any && data.contains(&Verdict::Regression)) || every(Verdict::Regression) {
+        return Verdict::Regression;
+    }
+    if every(Verdict::Improvement) { Verdict::Improvement } else { Verdict::Noise }
 }
 
 fn rows(run: &Loaded, bases: &[Loaded]) -> Vec<Row> {
@@ -257,8 +276,10 @@ fn rows(run: &Loaded, bases: &[Loaded]) -> Vec<Row> {
     let mut push = |name: &str, higher_is_better, judge, get: &dyn Fn(&Loaded) -> Dist| {
         let run = get(run);
         let bases: Vec<Dist> = bases.iter().map(get).collect();
-        // Drops that no run has are not worth a line.
-        let silent = run.max == 0.0 && bases.iter().all(|b| b.max == 0.0);
+        // Drops that no run has are not worth a line; drops the run does not
+        // report, where a baseline does, are.
+        let lacks = run.n == 0 && bases.iter().any(|b| b.n > 0);
+        let silent = !lacks && run.max == 0.0 && bases.iter().all(|b| b.max == 0.0);
         let dropped = name.starts_with("dropped_") || name.starts_with("kind_");
         if !(dropped && silent) {
             out.push(Row { name: name.to_owned(), higher_is_better, judge, run, bases });
@@ -300,6 +321,35 @@ fn rows(run: &Loaded, bases: &[Loaded]) -> Vec<Row> {
 struct Outcome {
     text: String,
     regressions: Vec<String>,
+    /// Why the run cannot be said to be no worse: what it lacks, or too few
+    /// world lines to judge.
+    unjudged: Vec<String>,
+}
+
+impl Outcome {
+    /// What makes the command fail; empty when it passes.
+    fn failures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.regressions.is_empty() {
+            out.push(format!("regression in {}", self.regressions.join(", ")));
+        }
+        if !self.unjudged.is_empty() {
+            out.push(format!("cannot judge: {}", self.unjudged.join(", ")));
+        }
+        out
+    }
+}
+
+/// What stops any judgement of speed, whatever the rows say.
+fn too_short(run: &Loaded, bases: &[Loaded]) -> Vec<String> {
+    let mut out = Vec::new();
+    if run.lines() < MIN_LINES {
+        out.push(format!("the run has {} world lines (needs {MIN_LINES})", run.lines()));
+    }
+    if bases.iter().all(|b| b.lines() < MIN_LINES) {
+        out.push(format!("no baseline has {MIN_LINES} world lines"));
+    }
+    out
 }
 
 fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
@@ -307,6 +357,7 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
     let mut table: Vec<[String; 2]> = Vec::new();
     let mut cells: Vec<Vec<String>> = Vec::new();
     let (mut regressions, mut improvements) = (Vec::new(), Vec::new());
+    let mut unjudged = too_short(run, bases);
     for row in &rows {
         let lines = matches!(row.judge, Judge::Spread { .. });
         let verdicts: Vec<Verdict> =
@@ -315,6 +366,8 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
         match overall {
             Verdict::Regression => regressions.push(row.name.clone()),
             Verdict::Improvement => improvements.push(row.name.clone()),
+            Verdict::Missing => unjudged.push(format!("{} missing", row.name)),
+            Verdict::Short => unjudged.push(format!("{} has too few lines", row.name)),
             _ => {}
         }
         table.push([row.name.clone(), row.run.text(lines)]);
@@ -360,27 +413,22 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
     for row in &body {
         line(row);
     }
-    text += &if regressions.is_empty() {
-        format!(
-            "verdict: no regression{}\n",
-            if improvements.is_empty() {
-                String::new()
-            } else {
-                format!("; improvement in {}", improvements.join(", "))
-            }
-        )
-    } else {
-        format!(
-            "verdict: REGRESSION in {}{}\n",
-            regressions.join(", "),
-            if improvements.is_empty() {
-                String::new()
-            } else {
-                format!("; improvement in {}", improvements.join(", "))
-            }
-        )
-    };
-    Outcome { text, regressions }
+    let mut outcome = Outcome { text, regressions, unjudged };
+    let mut parts = Vec::new();
+    if !outcome.regressions.is_empty() {
+        parts.push(format!("REGRESSION in {}", outcome.regressions.join(", ")));
+    }
+    if !outcome.unjudged.is_empty() {
+        parts.push(format!("CANNOT JUDGE ({})", outcome.unjudged.join(", ")));
+    }
+    if parts.is_empty() {
+        parts.push("no regression".to_owned());
+    }
+    if !improvements.is_empty() {
+        parts.push(format!("improvement in {}", improvements.join(", ")));
+    }
+    outcome.text += &format!("verdict: {}\n", parts.join("; "));
+    outcome
 }
 
 #[cfg(test)]
@@ -425,8 +473,11 @@ mod tests {
     fn few_lines_and_missing_data() {
         let few = dist(&[1.0, 2.0]);
         let many = dist(&[1.0, 2.0, 3.0]);
-        assert_eq!(verdict(SPREAD, false, &few, &many), Verdict::Few);
-        assert_eq!(verdict(SPREAD, false, &dist(&[]), &many), Verdict::NoData);
+        assert_eq!(verdict(SPREAD, false, &few, &many), Verdict::Short);
+        assert_eq!(verdict(SPREAD, false, &many, &few), Verdict::Few);
+        assert_eq!(verdict(SPREAD, false, &dist(&[]), &many), Verdict::Missing);
+        assert_eq!(verdict(SPREAD, false, &many, &dist(&[])), Verdict::NoData);
+        assert_eq!(verdict(SPREAD, false, &dist(&[]), &dist(&[])), Verdict::NoData);
     }
 
     #[test]
@@ -435,7 +486,10 @@ mod tests {
         assert_eq!(verdict(Judge::Count, false, &three, &two), Verdict::Regression);
         assert_eq!(verdict(Judge::Count, false, &two, &three), Verdict::Improvement);
         assert_eq!(verdict(Judge::Count, false, &two, &two), Verdict::Noise);
-        assert_eq!(verdict(Judge::Count, false, &Dist::scalar(None), &two), Verdict::NoData);
+        assert_eq!(verdict(Judge::Count, false, &Dist::scalar(None), &two), Verdict::Missing);
+        assert_eq!(verdict(Judge::Count, false, &two, &Dist::scalar(None)), Verdict::NoData);
+        let share = Judge::Share { rel: 0.2 };
+        assert_eq!(verdict(share, true, &Dist::scalar(None), &two), Verdict::Missing);
         let share = Judge::Share { rel: 0.2 };
         let (base, small, big) =
             (Dist::scalar(Some(3.8)), Dist::scalar(Some(3.3)), Dist::scalar(Some(1.9)));
@@ -461,6 +515,71 @@ mod tests {
         assert_eq!(combine(&[Improvement, NoData], false), Improvement);
         assert_eq!(combine(&[NoData], false), NoData);
         assert_eq!(combine(&[Few, Few], false), Few);
+        assert_eq!(combine(&[Few, Regression], false), Regression);
+        assert_eq!(combine(&[Improvement, Noise], true), Noise);
+        assert_eq!(combine(&[Noise, Missing], true), Missing);
+        assert_eq!(combine(&[Improvement, Short], false), Short);
+    }
+
+    fn same_log(n: usize) -> String {
+        log(n, 1.0, 1000.0, 230.0, 650.0, 100.0)
+    }
+
+    #[test]
+    fn a_run_with_under_three_world_lines_fails() {
+        // A tenth of the baseline's frame rate, in two lines.
+        let run = loaded("r", &log(2, 0.1, 10_000.0, 2300.0, 6500.0, 100.0));
+        let out = compare(&run, &[loaded("a", &same_log(20))], true);
+        assert!(!out.failures().is_empty(), "{}", out.text);
+        assert!(out.text.contains("CANNOT JUDGE"), "{}", out.text);
+        assert!(out.text.contains("FAIL: run too short"), "{}", out.text);
+        // Nor may a run that looks the same pass on two lines.
+        let out = compare(&loaded("r", &same_log(2)), &[loaded("a", &same_log(20))], true);
+        assert!(!out.failures().is_empty(), "{}", out.text);
+    }
+
+    #[test]
+    fn zero_world_lines_on_both_sides_is_not_no_regression() {
+        let out = compare(&loaded("r", &same_log(0)), &[loaded("a", &same_log(0))], true);
+        assert!(!out.failures().is_empty(), "{}", out.text);
+        assert!(!out.text.contains("no regression"), "{}", out.text);
+        // A good run against baselines too short to say anything: the same.
+        let out = compare(&loaded("r", &same_log(20)), &[loaded("a", &same_log(2))], true);
+        assert!(!out.failures().is_empty(), "{}", out.text);
+        // One short baseline beside a good one does not matter.
+        let bases = [loaded("a", &same_log(2)), loaded("b", &same_log(20))];
+        let out = compare(&loaded("r", &same_log(20)), &bases, true);
+        assert!(out.failures().is_empty(), "{}", out.text);
+    }
+
+    #[test]
+    fn what_the_run_lacks_fails() {
+        // No report beside the run: no non-flat share.
+        let run = Loaded::from_text("r", &same_log(20), None);
+        let out = compare(&run, &[loaded("a", &same_log(20))], true);
+        assert_eq!(out.unjudged, ["detail_pct missing"], "{}", out.text);
+        // Not a diagnostics build's log: black frames are unknown.
+        let release = same_log(20).replace("copies per frame: ", "");
+        let out = compare(&loaded("r", &release), &[loaded("a", &same_log(20))], true);
+        assert_eq!(out.unjudged, ["black_frames missing"], "{}", out.text);
+        // No cause lines, where the baseline has drops.
+        let silent: String = same_log(20)
+            .lines()
+            .filter(|l| !l.contains("dropped by cause"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let out = compare(&loaded("r", &silent), &[loaded("a", &same_log(20))], true);
+        assert!(out.unjudged.contains(&"dropped_refused missing".to_owned()), "{}", out.text);
+    }
+
+    #[test]
+    fn by_default_one_baseline_is_enough_for_a_regression() {
+        let bases = || {
+            [loaded("a", &same_log(20)), loaded("b", &log(20, 1.0, 1000.0, 600.0, 650.0, 100.0))]
+        };
+        let run = loaded("r", &log(20, 1.0, 1000.0, 400.0, 650.0, 100.0));
+        assert_eq!(compare(&run, &bases(), true).regressions, ["preparing_ms"]);
+        assert!(compare(&run, &bases(), false).regressions.is_empty());
     }
 
     /// A log of `n` world lines (900 draws each) and one cause line per line.

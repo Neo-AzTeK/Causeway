@@ -260,9 +260,6 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     Ok((log, end))
 }
 
-/// The lock one smoke run at a time holds on this machine: free once dropped
-/// or once the process is gone.
-// shortcut: a title started by hand (`victory run`) does not take it.
 /// What `one_run` says when it fails: the queue runner puts a run back for it.
 pub(crate) const LOCK_BUSY: &str = "is not free";
 
@@ -271,6 +268,9 @@ pub(crate) fn lock_free() -> bool {
     one_run(&std::env::temp_dir().join("causeway-smoke.lock")).is_ok()
 }
 
+/// The lock one smoke run at a time holds on this machine: free once dropped
+/// or once the process is gone.
+// shortcut: a title started by hand (`victory run`) does not take it.
 fn one_run(path: &Path) -> Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);

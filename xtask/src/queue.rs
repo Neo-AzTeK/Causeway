@@ -12,6 +12,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -97,9 +98,6 @@ struct RunArgs {
     /// Run what is queued and exit, instead of waiting for more.
     #[arg(long)]
     once: bool,
-    /// Start although `runner.lock` exists (its runner is gone).
-    #[arg(long)]
-    replace_lock: bool,
 }
 
 pub fn run(root: &Path, args: &Queue) -> Result<()> {
@@ -381,12 +379,7 @@ fn add_request(root: &Path, dirs: &Dirs, add: &Add) -> Result<()> {
     let request = Request::parse(&text)?;
     request.check(root, dirs)?;
     fs::create_dir_all(&dirs.queue).with_context(|| format!("creating {}", dirs.queue.display()))?;
-    for ext in ["toml", "done", "running"] {
-        ensure!(!dirs.file(&request.name, ext).exists(), "{} exists: pick another name", dirs.file(&request.name, ext).display());
-    }
-    let tmp = dirs.file(&request.name, "tmp");
-    fs::write(&tmp, &text)?;
-    fs::rename(&tmp, dirs.file(&request.name, "toml"))?;
+    publish(dirs, &request.name, &text)?;
     let done = dirs.file(&request.name, "done");
     println!("queued {} ({} s); wait for {}", request.name, request.seconds, done.display());
     if add.wait {
@@ -399,6 +392,29 @@ fn add_request(root: &Path, dirs: &Dirs, add: &Add) -> Result<()> {
         let code = table.get("exit").and_then(toml::Value::as_integer);
         ensure!(code == Some(0), "the run did not exit 0 (exit = {code:?})");
     }
+    Ok(())
+}
+
+/// Puts a request in the queue under a name nobody has. Of two adds of one
+/// name only one can: the `.tmp` is the claim (`create_new`), held until the
+/// whole `.toml` is in place, so the runner never reads half a file.
+fn publish(dirs: &Dirs, name: &str, text: &str) -> Result<()> {
+    let tmp = dirs.file(name, "tmp");
+    let mut claim = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).with_context(|| {
+        format!(
+            "{}: pick another name (another add has it; delete it if that one died)",
+            tmp.display()
+        )
+    })?;
+    let taken = ["toml", "done", "running"].map(|ext| dirs.file(name, ext));
+    if let Some(path) = taken.iter().find(|p| p.exists()) {
+        drop(claim);
+        fs::remove_file(&tmp)?;
+        bail!("{} exists: pick another name", path.display());
+    }
+    claim.write_all(text.as_bytes())?;
+    drop(claim);
+    fs::rename(&tmp, dirs.file(name, "toml"))?;
     Ok(())
 }
 
@@ -450,36 +466,61 @@ fn runner(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
     ensure!(args.exe.is_file(), "{} is not a file", args.exe.display());
     fs::create_dir_all(&dirs.queue)?;
     fs::create_dir_all(&dirs.runs)?;
-    let lock = dirs.queue.join(LOCK);
-    if args.replace_lock {
-        let _ = fs::remove_file(&lock);
+    // Held until this process ends.
+    let _only = runner_lock(&dirs.queue.join(LOCK))?;
+    recover(dirs)?;
+    println!("runner: queue {}, runs {}", dirs.queue.display(), dirs.runs.display());
+    serve(root, dirs, args)
+}
+
+/// The lock one runner at a time holds, with its process id. Others may only
+/// read it, and the system frees it when the process is gone: a file a dead
+/// runner left blocks nobody, and a live runner cannot be replaced.
+fn runner_lock(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    // invariant(one_queue_runner_at_a_time): only reading is shared
+    // (`FILE_SHARE_READ`), so a second writer fails while the first lives.
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 1);
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "another runner is running (two would run two real-GPU runs at once): {} is not free",
+            path.display()
+        )
+    })?;
+    file.set_len(0)?;
+    writeln!(file, "pid {}\nstarted_unix {}", std::process::id(), unix_now())?;
+    Ok(file)
+}
+
+/// What `status` says of the runner: its first lock line while one holds it.
+fn runner_state(lock: &Path) -> String {
+    let Ok(text) = fs::read_to_string(lock) else { return "not running".to_owned() };
+    // Opening it for writing fails while a runner holds it.
+    if fs::OpenOptions::new().write(true).open(lock).is_ok() {
+        return "not running".to_owned();
     }
-    match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
-        Ok(mut f) => {
-            use std::io::Write as _;
-            writeln!(f, "pid {}\nstarted_unix {}", std::process::id(), unix_now())?;
-        }
-        Err(_) => bail!(
-            "{} exists: a runner is running (two would run two real-GPU runs at once). \
-             If it is gone, start with --replace-lock",
-            lock.display()
-        ),
-    }
-    // A run a dead runner left running will not finish.
-    if let Ok(entries) = fs::read_dir(&dirs.queue) {
-        for path in entries.filter_map(|e| Some(e.ok()?.path())) {
-            if path.extension().is_some_and(|e| e == "running")
-                && let Some(name) = path.file_stem().and_then(|n| n.to_str())
-                && !dirs.file(name, "done").exists()
-            {
+    format!("running, {}", text.lines().next().unwrap_or("?"))
+}
+
+/// Ends the runs a dead runner left `.running`: they will not finish. Only
+/// the holder of the runner lock may call it.
+fn recover(dirs: &Dirs) -> Result<()> {
+    let entries = fs::read_dir(&dirs.queue)
+        .with_context(|| format!("reading {}", dirs.queue.display()))?;
+    for path in entries.filter_map(|e| Some(e.ok()?.path())) {
+        if path.extension().is_some_and(|e| e == "running")
+            && let Some(name) = path.file_stem().and_then(|n| n.to_str())
+        {
+            if dirs.file(name, "done").exists() {
+                fs::remove_file(&path)?;
+            } else {
                 write_done(dirs, name, -1, None, Some("the runner stopped while it ran"))?;
             }
         }
     }
-    println!("runner: queue {}, runs {}", dirs.queue.display(), dirs.runs.display());
-    let result = serve(root, dirs, args);
-    let _ = fs::remove_file(&lock);
-    result
+    Ok(())
 }
 
 fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
@@ -584,11 +625,7 @@ fn requester_of(dirs: &Dirs, name: &str) -> Option<String> {
 }
 
 fn status(dirs: &Dirs) -> Result<()> {
-    let lock = fs::read_to_string(dirs.queue.join(LOCK)).ok();
-    println!(
-        "runner: {}",
-        lock.map_or("not running".to_owned(), |l| l.lines().next().unwrap_or("running").to_owned())
-    );
+    println!("runner: {}", runner_state(&dirs.queue.join(LOCK)));
     let Ok(entries) = fs::read_dir(&dirs.queue) else {
         println!("no queue folder yet ({})", dirs.queue.display());
         return Ok(());
@@ -772,5 +809,72 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
         assert_eq!(done["requester"].as_str(), Some("local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"));
         assert_eq!(done["exit"].as_integer(), Some(0));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A queue folder of its own for one test.
+    fn scratch(name: &str) -> Dirs {
+        let dir = std::env::temp_dir().join(format!("xtask-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Dirs { queue: dir.clone(), runs: dir.join("runs") }
+    }
+
+    fn done(dirs: &Dirs, name: &str) -> toml::Table {
+        fs::read_to_string(dirs.file(name, "done")).unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn a_run_left_running_is_ended_by_the_next_runner() {
+        let dirs = scratch("recover");
+        fs::write(dirs.file("mesh-emu-8", "toml"), GOOD).unwrap();
+        fs::write(dirs.file("mesh-emu-8", "running"), "started_unix 1\n").unwrap();
+        // One that finished but kept its marker: its result stays.
+        fs::write(dirs.file("old", "done"), "exit = 0\n").unwrap();
+        fs::write(dirs.file("old", "running"), "started_unix 1\n").unwrap();
+        recover(&dirs).unwrap();
+        let ended = done(&dirs, "mesh-emu-8");
+        assert_eq!(ended["exit"].as_integer(), Some(-1));
+        assert!(ended["error"].as_str().unwrap().contains("runner stopped"));
+        assert!(ended.contains_key("requester"));
+        assert_eq!(done(&dirs, "old")["exit"].as_integer(), Some(0));
+        for name in ["mesh-emu-8", "old"] {
+            assert!(!dirs.file(name, "running").exists());
+        }
+        assert!(waiting(&dirs).is_empty());
+        fs::remove_dir_all(&dirs.queue).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn one_queue_runner_at_a_time() {
+        let dirs = scratch("lock");
+        let lock = dirs.queue.join(LOCK);
+        // A file a dead runner left blocks nobody.
+        fs::write(&lock, "pid 1\nstarted_unix 1\nleft over\n").unwrap();
+        assert_eq!(runner_state(&lock), "not running");
+        let first = runner_lock(&lock).unwrap();
+        assert!(runner_lock(&lock).is_err(), "a live runner was replaced");
+        let pid = format!("pid {}", std::process::id());
+        assert_eq!(runner_state(&lock), format!("running, {pid}"));
+        assert!(!fs::read_to_string(&lock).unwrap().contains("left over"));
+        drop(first);
+        assert_eq!(runner_state(&lock), "not running");
+        drop(runner_lock(&lock).unwrap());
+        fs::remove_dir_all(&dirs.queue).unwrap();
+    }
+
+    #[test]
+    fn a_name_is_queued_once() {
+        let dirs = scratch("publish");
+        publish(&dirs, "a", "first").unwrap();
+        assert!(publish(&dirs, "a", "second").is_err());
+        assert_eq!(fs::read_to_string(dirs.file("a", "toml")).unwrap(), "first");
+        assert!(!dirs.file("a", "tmp").exists());
+        // Another add that holds the claim.
+        fs::write(dirs.file("b", "tmp"), "theirs").unwrap();
+        assert!(publish(&dirs, "b", "ours").is_err());
+        assert!(!dirs.file("b", "toml").exists());
+        assert_eq!(fs::read_to_string(dirs.file("b", "tmp")).unwrap(), "theirs");
+        fs::remove_dir_all(&dirs.queue).unwrap();
     }
 }

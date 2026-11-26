@@ -77,9 +77,10 @@ tracked changes, or that `git worktree list` does not show), `seconds`, `env`
 `requester`, and `data_dir`, `data_from`, `keys`. Any other field, or a switch
 that is not `VICTORY_*`, refuses the request; `--accept-terms` is not one. `run`
 takes the oldest request and runs exactly `cargo xtask smoke --exe <its --exe> --out
-<runs>\<name> ...` in that worktree, one at a time (`runner.lock` keeps a second
-runner from starting; `--replace-lock` if the first is gone, `--once` to stop when
-the queue is empty). The console goes to `<runs>\<name>.console.txt`. It then writes
+<runs>\<name> ...` in that worktree, one at a time (a runner holds `runner.lock`
+open, so a second cannot start while it lives, and the file a dead one left blocks
+nobody; the next runner ends what it left running; `--once` to stop when the queue
+is empty). The console goes to `<runs>\<name>.console.txt`. It then writes
 `<name>.done` (`exit`, `out`, `digest`, `console`, and `error` for a refused
 request, `exit = -1`, and the `requester`) beside the request: wait for that file, or
 pass `--wait`. There is one runner and it owns the order (oldest request first); never
@@ -102,9 +103,12 @@ range of the two runs (floor: 5% of the baseline, and 0.05 fps, 1 ms or 1 draw);
 fewer than 3 world lines say nothing. Counts of the whole run (refused
 pipelines, untranslated shaders, black frames) regress on any rise; the non-flat
 share, on a drop of more than 20%; a run that never reached the world regresses.
-By default a metric regresses only if it does against every baseline (a noisy
-baseline cannot decide alone); `--any` makes one enough. It exits with an error
-on any regression. A drop reason renamed between builds moves its draws between
+A regression against any baseline is one (`--all` asks for every baseline, for a
+noisy one that must not decide alone); an improvement counts only against every
+one. It exits with an error on any regression, and when it cannot judge: the run
+has fewer than 3 world lines, no baseline has 3, or the run lacks a value a
+baseline has (no `report.json` for the non-flat share, no black-frame count, no
+drop lines). A drop reason renamed between builds moves its draws between
 `kind_*` rows: read those against the `dropped_*` rows, which are by cause.
 
 ## Testbed (no game, no title run)
