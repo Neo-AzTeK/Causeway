@@ -122,15 +122,24 @@ after 150 such tries (five minutes) it is given up on in its `.done`. `status` p
 how long), then the queue in the order it runs, then the last finished.
 
 The runner gets its own target directory (the command above), or a request for the
-worktree it was built from could not rebuild `xtask` while it runs. While a run
-boots and warms up, the runner builds the next request's worktree (`xtask`, then the
-`diag` title build; output in `<runs>\<name>.build.txt`), below normal priority on
-half the cores. It starts once the title has (before, the run is waiting for a quiet
-machine). No build reaches the lines measured: 75 s after the first world line, 15 s
-before the first steady one, a build still going is ended, and it is taken up again
-after the run (cargo keeps the crates it finished). The runner waits for it before it
-starts the next run. It skips a request for the playing run's worktree. The queue,
-the smoke lock and the run are looked at every 2 s.
+worktree it was built from could not rebuild `xtask` while it runs. A compile
+beside the booting title starves it (a black screen of minutes, or no world), so while
+a run boots the runner builds nothing. Once the title has reached its world and
+settled (10 s after the first world line) the runner builds the next request's
+worktree (`xtask`, then the `diag` title build; output in `<runs>\<name>.build.txt`),
+at idle priority on a quarter of the cores; it logs `runner: build ahead held while
+<name> boots` once before. No build reaches the lines measured: 75 s after the first
+world line, 15 s before the first steady one, a build still going is ended, and it is
+taken up again after the run (cargo keeps the crates it finished). The runner waits for
+it before it starts the next run. It skips a request for the playing run's worktree. The
+queue, the smoke lock and the run are looked at every 2 s.
+
+Before any cargo build, test or clippy, a session runs `cargo xtask queue wait-idle`
+(`--timeout <s>`, 900 by default): it returns at once when no run is booting, else it
+waits. A run boots from its `.running` file (so through its wait for a quiet machine
+and its own build) until 10 s after its first world line; one 10 minutes old with no
+world is stuck and no longer counts. After the timeout it exits with an error naming the
+run: do not compile then. Already-started compiles are not stopped.
 
 ```powershell
 cargo xtask compare E:\Causeway-tools\runs\mesh-9 --baseline E:\Causeway-tools\runs\smoke-16 --baseline E:\Causeway-tools\runs\smoke-15

@@ -56,6 +56,16 @@ enum Cmd {
     Run(RunArgs),
     /// Requests waiting, running and done lately.
     Status,
+    /// Returns once no run is booting (call it before any cargo build): a
+    /// compile during the title's boot starves it into a long black screen.
+    WaitIdle(WaitIdle),
+}
+
+#[derive(Args)]
+struct WaitIdle {
+    /// Give up, with an error, after this many seconds.
+    #[arg(long, default_value_t = 900)]
+    timeout: u64,
 }
 
 #[derive(Args)]
@@ -119,6 +129,7 @@ pub fn run(root: &Path, args: &Queue) -> Result<()> {
         Cmd::Add(add) => add_request(root, &dirs, add),
         Cmd::Run(run_args) => runner(root, &dirs, run_args),
         Cmd::Status => status(&dirs),
+        Cmd::WaitIdle(wait) => wait_idle(&dirs, Duration::from_secs(wait.timeout), WAIT_EVERY),
     }
 }
 
@@ -603,8 +614,13 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
                     println!("runner: {name}: {warning}");
                 }
                 let mut window = Window::new(dirs.runs.join(&request.name).join("log.txt"));
+                let mut said_held = false;
                 launch(dirs, &request, &args.exe, || {
                     let open = window.open(unix_now() as f64);
+                    if !open && !window.shut && !said_held {
+                        println!("runner: build ahead held while {name} boots");
+                        said_held = true;
+                    }
                     builder.tick(root, dirs, &request.worktree, open);
                 })
             });
@@ -661,11 +677,29 @@ fn length(request: &Request) -> String {
 /// measures the seconds before it, and the runner looks only every `POLL`.
 const BUILD_MARGIN: f64 = 15.0;
 
-/// Whether a build may run beside the title playing: from its start (its log
-/// is there; before, the run waits for a quiet machine) until shortly before
-/// its first line that will be steady. No build is measured.
+/// How long after the first world line the title is still settling (its last
+/// pipelines and shaders): nothing compiles before this has passed.
+const BOOT_SETTLE: f64 = 10.0;
+
+/// A run that has not reached its world this long after it started is stuck,
+/// not booting: it no longer holds anyone back.
+const BOOT_CAP: f64 = 600.0;
+
+/// How often `wait-idle` looks at the runs.
+const WAIT_EVERY: Duration = Duration::from_secs(5);
+
+/// Whether a build may run beside the title playing: only once the boot is
+/// over (the world reached and settled: the title boots slowly, and a compile
+/// then starves it into a black screen of minutes) and until shortly before
+/// the first line that will be steady. Never before; no build is measured.
 fn build_window(started: bool, world_start: Option<f64>, now: f64) -> bool {
-    started && world_start.is_none_or(|at| now < at + WARM_UP - BUILD_MARGIN)
+    started
+        && world_start.is_some_and(|at| now >= at + BOOT_SETTLE && now < at + WARM_UP - BUILD_MARGIN)
+}
+
+/// Whether the window of a run has passed for good.
+fn window_over(world_start: Option<f64>, now: f64) -> bool {
+    world_start.is_some_and(|at| now >= at + WARM_UP - BUILD_MARGIN)
 }
 
 /// `build_window` of the run playing, from its log.
@@ -685,15 +719,67 @@ impl Window {
         if self.shut || !self.log_file.is_file() {
             return false;
         }
-        self.shut = !build_window(true, self.log.read().world_start(), now);
-        !self.shut
+        let world_start = self.log.read().world_start();
+        self.shut = window_over(world_start, now);
+        build_window(true, world_start, now)
     }
 }
 
-/// Builds what the next run will need while the current one boots and warms
-/// up, so that no build sits between two runs. What has not ended when the
-/// lines to be measured come is ended, and taken up again after the run. It
-/// runs below normal priority, on half the cores.
+/// Whether a run is booting: from its `.running` file until its world is
+/// reached and settled. Before its log there is the wait for a quiet machine
+/// and its own build, which a second compile would only lengthen. A run past
+/// `BOOT_CAP` without a world is stuck, not booting.
+fn boot_of(started: Option<f64>, log_exists: bool, world_start: Option<f64>, now: f64) -> bool {
+    if started.is_some_and(|at| now - at >= BOOT_CAP) {
+        return false;
+    }
+    !log_exists || world_start.is_none_or(|at| now < at + BOOT_SETTLE)
+}
+
+/// The name of a run that is booting, if one is: a `.running` request with no
+/// `.done`, its log read as `boot_of` asks.
+fn booting_run(dirs: &Dirs, now: f64) -> Option<String> {
+    let entries = fs::read_dir(&dirs.queue).ok()?;
+    entries.filter_map(|e| Some(e.ok()?.path())).find_map(|path| {
+        if path.extension()? != "running" {
+            return None;
+        }
+        let name = path.file_stem()?.to_str()?.to_owned();
+        if dirs.file(&name, "done").exists() {
+            return None;
+        }
+        let started = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| t.split_whitespace().nth(1).and_then(|s| s.parse::<f64>().ok()));
+        let log = dirs.runs.join(&name).join("log.txt");
+        let world_start = log.is_file().then(|| smoke::Follow::new(&log).read().world_start()).flatten();
+        boot_of(started, log.is_file(), world_start, now).then_some(name)
+    })
+}
+
+/// `queue wait-idle`: returns once no run is booting; an error after `timeout`.
+fn wait_idle(dirs: &Dirs, timeout: Duration, every: Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut said = false;
+    while let Some(name) = booting_run(dirs, unix_now() as f64) {
+        if start.elapsed() >= timeout {
+            bail!("{name} is still booting after {} s: do not compile yet", timeout.as_secs());
+        }
+        if !said {
+            println!("{name} is booting (a compile would starve it): waiting for its world");
+            said = true;
+        }
+        std::thread::sleep(every);
+    }
+    println!("no run is booting: go ahead");
+    Ok(())
+}
+
+/// Builds what the next run will need while the current one warms
+/// up, so that no build sits between two runs. Never during the boot (see
+/// `build_window`). What has not ended when the lines to be measured come is
+/// ended, and taken up again after the run. It runs at idle priority, on a
+/// quarter of the cores.
 #[derive(Default)]
 struct Builder {
     running: Option<Build>,
@@ -831,12 +917,12 @@ fn next_build(dirs: &Dirs, playing: &Path, tried: &HashSet<String>) -> Option<Re
 fn build_command(worktree: &Path, step: &[&str]) -> Command {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let mut command = Command::new("cargo");
-    command.args(step).args(["-j", &(cores / 2).max(1).to_string()]).current_dir(worktree);
+    command.args(step).args(["-j", &(cores / 4).max(1).to_string()]).current_dir(worktree);
     // What it starts (rustc, the linker) takes the same class.
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(
         &mut command,
-        windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS,
+        windows_sys::Win32::System::Threading::IDLE_PRIORITY_CLASS,
     );
     command
 }
@@ -1218,7 +1304,7 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
         assert_eq!(&args[..args.len() - 2], smoke::DIAG_BUILD);
         assert_eq!(args[args.len() - 2], "-j");
         let cores = std::thread::available_parallelism().unwrap().get();
-        assert!(args.last().unwrap().parse::<usize>().unwrap() <= cores.div_ceil(2));
+        assert!(args.last().unwrap().parse::<usize>().unwrap() <= cores.div_ceil(4));
         assert_eq!(command.get_current_dir(), Some(Path::new("w")));
     }
 
@@ -1245,15 +1331,21 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
     }
 
     #[test]
-    fn a_build_runs_only_before_the_lines_measured() {
+    fn a_build_runs_only_between_the_boot_and_the_lines_measured() {
         // The title not started: the run is waiting for a quiet machine.
         assert!(!build_window(false, None, 0.0));
-        // Booting, then warming up.
-        assert!(build_window(true, None, 1000.0));
+        // Booting: no world yet, or it has just come.
+        assert!(!build_window(true, None, 1000.0));
+        assert!(!build_window(true, Some(1000.0), 1000.0 + BOOT_SETTLE - 1.0));
+        // Settled, and warming up.
+        assert!(build_window(true, Some(1000.0), 1000.0 + BOOT_SETTLE));
         assert!(build_window(true, Some(1000.0), 1000.0 + WARM_UP - BUILD_MARGIN - 1.0));
         // Gone before the first steady line starts to be measured.
         assert!(!build_window(true, Some(1000.0), 1000.0 + WARM_UP - BUILD_MARGIN));
+        assert!(window_over(Some(1000.0), 1000.0 + WARM_UP - BUILD_MARGIN));
+        assert!(!window_over(None, 1e9) && !window_over(Some(1000.0), 1000.0));
         assert!(BUILD_MARGIN > 5.0 + POLL.as_secs_f64());
+        const { assert!(BOOT_SETTLE + BUILD_MARGIN < WARM_UP) };
     }
 
     #[test]
@@ -1263,17 +1355,66 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
         let mut window = Window::new(log.clone());
         let then = 1_767_225_600.0; // 2026-01-01T00:00:00Z
         assert!(!window.open(then), "no log: not started");
-        fs::write(&log, "booting\n").unwrap();
-        assert!(window.open(then + 100.0));
-        let world = "2026-01-01T00:00:00Z  INFO victory_gpu::host: 1.0 fps, 1000.0 ms/frame (1.0 \
-                     preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; 2.0 on the GPU; 0.1 \
-                     copying back 0.0 MB), 900 draws/frame, dropped 0 without a host pipeline (0 \
-                     being made) and 0 indirect\n";
-        fs::write(&log, format!("booting\n{world}")).unwrap();
-        assert!(window.open(then + 10.0));
+        fs::write(&log, "booting
+").unwrap();
+        assert!(!window.open(then + 100.0), "booting: held, not shut");
+        assert!(!window.shut);
+        let world = "2026-01-01T00:00:00Z INFO victory_gpu::host: 1.0 fps, 1000.0 ms/frame (1.0 preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; 2.0 on the GPU; 0.1 copying back 0.0 MB), 900 draws/frame, dropped 0 without a host pipeline (0 being made) and 0 indirect
+";
+        fs::write(&log, format!("booting
+{world}")).unwrap();
+        assert!(!window.open(then + 1.0), "the world is just reached");
+        assert!(window.open(then + BOOT_SETTLE + 1.0));
         assert!(!window.open(then + WARM_UP));
-        assert!(!window.open(then), "shut for good");
+        assert!(!window.open(then + BOOT_SETTLE + 1.0), "shut for good");
         fs::remove_dir_all(&dirs.queue).unwrap();
+    }
+
+    #[test]
+    fn a_run_boots_until_its_world_is_reached_and_settled() {
+        // Quiet wait and own build: no log yet.
+        assert!(boot_of(Some(1000.0), false, None, 1010.0));
+        // The log, no world line.
+        assert!(boot_of(Some(1000.0), true, None, 1100.0));
+        // The world, settling; then settled.
+        assert!(boot_of(Some(1000.0), true, Some(1100.0), 1100.0 + BOOT_SETTLE - 1.0));
+        assert!(!boot_of(Some(1000.0), true, Some(1100.0), 1100.0 + BOOT_SETTLE));
+        // A run stuck without a world holds nobody back for ever.
+        assert!(!boot_of(Some(1000.0), true, None, 1000.0 + BOOT_CAP));
+        assert!(!boot_of(Some(1000.0), false, None, 1000.0 + BOOT_CAP));
+        // The world proves it is no longer stuck, whatever its age.
+        assert!(!boot_of(Some(1000.0), true, Some(1100.0), 1000.0 + BOOT_CAP + 500.0));
+    }
+
+    #[test]
+    fn wait_idle_waits_for_the_booting_run_only() {
+        let dirs = scratch("wait-idle");
+        let now = unix_now() as f64;
+        // Nothing runs.
+        assert!(booting_run(&dirs, now).is_none());
+        // Running, no log: booting.
+        fs::write(dirs.file("a", "running"), format!("started_unix {}
+", now as u64)).unwrap();
+        assert_eq!(booting_run(&dirs, now).as_deref(), Some("a"));
+        assert!(wait_idle(&dirs, Duration::from_millis(50), Duration::from_millis(10)).is_err());
+        // A world line of 2026-01-01 (long past): not booting.
+        let run = dirs.runs.join("a");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(
+            run.join("log.txt"),
+            "2026-01-01T00:00:00Z INFO victory_gpu::host: 1.0 fps, 1000.0 ms/frame (1.0 preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; 2.0 on the GPU; 0.1 copying back 0.0 MB), 900 draws/frame, dropped 0 without a host pipeline (0 being made) and 0 indirect
+",
+        )
+        .unwrap();
+        assert!(booting_run(&dirs, now).is_none());
+        wait_idle(&dirs, Duration::from_millis(50), Duration::from_millis(10)).unwrap();
+        // Ended runs hold nobody back.
+        fs::remove_file(run.join("log.txt")).unwrap();
+        fs::write(dirs.file("a", "done"), "exit = 0
+").unwrap();
+        assert!(booting_run(&dirs, now).is_none());
+        fs::remove_dir_all(&dirs.queue).unwrap();
+        let _ = fs::remove_dir_all(&dirs.runs);
     }
 
     #[test]
