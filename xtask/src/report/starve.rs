@@ -10,14 +10,17 @@ use super::{field, unix_time};
 /// The pipeline library loads in ~30 ms from the page cache; read from disk
 /// (396 MB at ~150 MB/s) it takes 2400 ms or more.
 const LIBRARY_MS: f64 = 1000.0;
-/// Cached shader translations take ~0.6 of their CPU time on the clock; a
-/// descheduled process takes 100 times that. Only a sum of 10 s or more is
-/// judged, so that a few slow lines say nothing.
-const TRANSLATE_RATIO: f64 = 20.0;
+/// Cached shader translations take 0.6 to 12 times their CPU time on the
+/// clock (a busy but healthy machine is at 12); a starved one 100 to 440 times.
+/// Only a sum of 10 s or more is judged, so that a few slow lines say nothing.
+const TRANSLATE_RATIO: f64 = 40.0;
 const TRANSLATE_WALL_MS: f64 = 10_000.0;
 /// From the first log line to the first story000 pack opened: ~30 s healthy,
-/// 176 s and 264 s starved.
+/// 176 s and 264 s starved. A cold shader cache (a build that changed the
+/// translator) also boots slowly, on a healthy machine: with this many shaders
+/// translated afresh, the pack's time says nothing.
 const PACK_AFTER_BOOT: f64 = 120.0;
+const COLD_CACHE: usize = 100;
 
 #[derive(Default)]
 pub struct Starve {
@@ -28,6 +31,8 @@ pub struct Starve {
     /// Cached shader translations: how many, the clock time they took, and
     /// the CPU time (user and kernel), in ms.
     translated: usize,
+    /// Shaders translated afresh, not from the cache.
+    afresh: usize,
     wall_ms: f64,
     cpu_ms: f64,
 }
@@ -45,6 +50,8 @@ impl Starve {
         let ms = |key| field(line, key).and_then(|v| v.parse::<f64>().ok());
         if line.contains("host pipeline library loaded") {
             self.library_ms = self.library_ms.or(ms("ms"));
+        } else if line.contains("shader translated") && field(line, "cached") == Some("false") {
+            self.afresh += 1;
         } else if line.contains("shader translated") && field(line, "cached") == Some("true") {
             self.translated += 1;
             self.wall_ms += ms("ms").unwrap_or(0.0);
@@ -57,7 +64,8 @@ impl Starve {
         }
     }
 
-    /// What in the log shows the machine was starved, one sign each.
+    /// What in the log shows the machine was starved, one sign each. A sign
+    /// alone can be a cold disk cache: `Log::starved` weighs them.
     pub fn signs(&self) -> Vec<String> {
         let mut signs = Vec::new();
         if let Some(ms) = self.library_ms.filter(|&ms| ms > LIBRARY_MS) {
@@ -72,6 +80,7 @@ impl Starve {
             ));
         }
         if let Some((first, pack)) = self.first.zip(self.pack)
+            && self.afresh < COLD_CACHE
             && pack - first > PACK_AFTER_BOOT
         {
             signs.push(format!("story000 pack opened {:.0} s after boot (30 s when quiet)", pack - first));
@@ -161,6 +170,24 @@ mod tests {
         let again = quiet().replace("03:12:58.1Z", "03:14:28.1Z")
             + "2026-11-26T03:30:00.0Z  INFO victory_hle::modules::dstorage: dstorage: file opened path=\"story000_bvh4\"\n";
         assert!(starve(&again).is_empty());
+    }
+
+    #[test]
+    fn a_cold_shader_cache_boots_slowly_on_a_healthy_machine() {
+        let late = quiet().replace("03:12:58.1Z", "03:16:00.1Z");
+        assert_eq!(starve(&late).len(), 1);
+        // 1652 shaders translated afresh before the pack opened: not starving.
+        let cold = translated("false", 40, 40, 0).repeat(1652) + &late;
+        assert!(starve(&cold).is_empty(), "{:?}", starve(&cold));
+    }
+
+    #[test]
+    fn a_busy_but_healthy_translation_is_not_starved() {
+        // 12 times the CPU time on the clock, 30 s in all.
+        let busy = translated("true", 1200, 50, 50).repeat(25);
+        assert!(starve(&busy).is_empty());
+        // 100 times is.
+        assert_eq!(starve(&translated("true", 10_000, 50, 50).repeat(3)).len(), 1);
     }
 
     #[test]

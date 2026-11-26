@@ -358,9 +358,12 @@ impl Log {
 
     /// Why the machine looks starved (memory short: the same work takes far
     /// longer on the clock), or `None`. Such a run says nothing about the code.
+    /// A run that never reached the world is called starved on one sign; one
+    /// that did, on two: a cold disk cache alone makes one.
     pub fn starved(&self) -> Option<String> {
         let signs = self.starve.signs();
-        (!signs.is_empty()).then(|| signs.join("; "))
+        let needed = if self.world().next().is_some() { 2 } else { 1 };
+        (signs.len() >= needed).then(|| signs.join("; "))
     }
 
     fn line(&mut self, line: &str) {

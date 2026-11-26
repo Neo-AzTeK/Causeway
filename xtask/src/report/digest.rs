@@ -538,7 +538,7 @@ impl Log {
         });
         let mut out = vec![
             "## 8. Next".to_owned(),
-            "rule: a failed stability area first (the run stopped), then draws or dispatches lost per frame, then frames lost; same area and reason merge".to_owned(),
+            "rule: a starved machine (rerun), then a failed stability area (the run stopped), then draws or dispatches lost per frame, then frames lost; same area and reason merge".to_owned(),
         ];
         if items.is_empty() {
             out.push("nothing lost is named in this log".into());
@@ -683,7 +683,13 @@ mod tests {
         let slow = format!(
             "{T}  INFO victory_gpu::pipeline::library: host pipeline library loaded bytes=1 ms=2679\n"
         );
-        let text = slow + &window(&[("being made", 5.0)]);
+        // One sign in a log that reached the world may be a cold disk cache.
+        let one = digest(&(slow.clone() + &window(&[("being made", 5.0)])), &ctx(&[], Baseline::Off));
+        assert!(!one.contains("STARVED"), "{one}");
+        let translations = format!(
+            "{T}  INFO victory_gpu::pipeline: shader translated stage=\"pixel\" hash=9 cached=true ms=466000 user_ms=1500 kernel_ms=500\n"
+        );
+        let text = slow + &translations + &window(&[("being made", 5.0)]);
         let d = digest(&text, &ctx(&[], Baseline::Off));
         let next: Vec<&str> = d.lines().skip_while(|l| !l.starts_with("## 8")).collect();
         assert!(
