@@ -1,6 +1,7 @@
 //! `cargo xtask compare`: one run against earlier runs, metric by metric.
 //!
-//! A report holds medians; the log holds every world line. Speed is judged by
+//! A report holds medians; the log holds every world line, and only the steady
+//! ones (after the warm-up) are judged. Speed is judged by
 //! the median against the spread (the larger interquartile range of the two
 //! runs, with a floor), so a CPU-noisy baseline cannot make a regression out
 //! of nothing. Fidelity counters (draws, dropped draws by cause and kind,
@@ -29,7 +30,7 @@ pub struct Compare {
     all: bool,
 }
 
-/// Fewer world lines than this say nothing about a spread.
+/// Fewer steady world lines than this say nothing about a spread.
 const MIN_LINES: usize = 3;
 
 pub fn run(args: &Compare) -> Result<()> {

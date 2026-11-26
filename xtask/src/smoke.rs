@@ -384,11 +384,11 @@ fn capture_frames(seconds: u64) -> String {
     listed.join(",")
 }
 
-/// Builds the diagnostics build; its path.
 /// The diagnostics build a run makes (`queue run` makes it ahead of one).
 pub(crate) const DIAG_BUILD: &[&str] =
     &["build", "--locked", "--profile", "diag", "-p", "victory", "--features", "diagnostics"];
 
+/// Builds the diagnostics build; its path.
 fn build(root: &Path) -> Result<PathBuf> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let built = Command::new(cargo)
