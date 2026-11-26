@@ -265,8 +265,8 @@ extern "system" fn mount_result(
 }
 
 /// Titles enumerate content packages (kind 1); there are none.
-// shortcut: the game kind (0) also lists nothing, not this installation.
-// The kind a title asks for is the only one that matters here: the title's
+// shortcut: every kind returns none (the game kind (0) too), not this
+// installation's content. The kind only goes into the log line; the title's
 // own identifiers are its data, not ours (see Rule #1 in CONTRIBUTING.md).
 extern "system" fn enumerate(
     _: This,
