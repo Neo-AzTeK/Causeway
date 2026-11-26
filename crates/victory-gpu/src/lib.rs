@@ -24,6 +24,8 @@ pub mod caps;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(windows)]
+mod detile;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
