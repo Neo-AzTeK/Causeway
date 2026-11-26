@@ -159,8 +159,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host, counts it by why
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
-/// it in the list, with the targets it would have written (`bound`, empty for
-/// compute) (diagnostics).
+/// it in the list, with what it would have written (`bound`) (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn dropped(list: &HostList, pipeline: usize, kind: &str, bound: &str) {
     // A skip or a missing host pipeline is the pipeline's own reason.
@@ -997,7 +996,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            dropped(list, self.pipeline, "dispatch", "");
+            dropped(list, self.pipeline, "dispatch", &self.written_text());
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -1007,7 +1006,7 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "dispatch", "");
+            dropped(list, self.pipeline, "dispatch", &self.written_text());
             return;
         };
         if !p.compute {
@@ -1017,7 +1016,7 @@ impl State {
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "dispatch", "");
+            dropped(list, self.pipeline, "dispatch", &self.written_text());
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1100,6 +1099,44 @@ impl State {
         let mem = |r: usize| crate::resource::texture_memory(r as This).map_or(0, |(p, _)| p as u64);
         let targets: Vec<String> = self.targets.iter().map(|&t| format!("{t:#x} mem {:#x}", mem(t))).collect();
         format!(" targets {targets:?} depth {:#x} mem {:#x}", self.depth, mem(self.depth))
+    }
+
+    /// In a listed frame, what a compute call that cannot run would have
+    /// written: each unordered-access view its program reads from the bound
+    /// compute roots, and the heap slots its table user data names. Empty in
+    /// other frames; says so if no translation is made (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn written_text(&self) -> String {
+        use std::fmt::Write;
+        if !crate::capture::listed(crate::queue::presented() + 1) {
+            return String::new();
+        }
+        let Some((hash, t)) = crate::pipeline::compute_translation(self.pipeline as This) else {
+            return " writes unknown (no compute translation made)".into();
+        };
+        let mut text = format!(" writes of {hash}:");
+        for u in t.used.iter().filter(|u| u.kind == ResourceType::Uav) {
+            let what = match (u.root, self.roots_ref(true).get(usize::from(u.slot))) {
+                (RootType::Table, Some(Root::Table(table))) => {
+                    describe(crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4).as_ref())
+                }
+                (_, root) => format!("{root:?}"),
+            };
+            let _ = write!(text, " [s{}+{}: {what}]", u.slot, u.table_offset_dwords);
+        }
+        let views = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten();
+        for u in t.host.user_data.iter().filter(|u| u.root == RootType::Table && !is_root_view(u)) {
+            if !matches!(self.roots_ref(true).get(usize::from(u.slot)), Some(Root::Table(_))) {
+                continue;
+            }
+            let index = self.user_value(true, u.slot, u.root, u.dword) / 32;
+            if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
+                let _ = write!(text, " u{} [heap {index}: {slot}]", u.index);
+            }
+        }
+        text
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
@@ -1721,9 +1758,9 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        // What a dropped call would have written (nothing named for compute).
+        // What a dropped call would have written.
         #[cfg(feature = "diagnostics")]
-        let bound = if kind == DISPATCH { String::new() } else { self.bound_text() };
+        let bound = if kind == DISPATCH { self.written_text() } else { self.bound_text() };
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
