@@ -139,6 +139,19 @@ impl Shadow {
         format!("copy {:#x}+{:#x} {v:?}", self.start, self.len)
     }
 
+    /// `len` bytes (up to 256) of the copy at title address `address`
+    /// (zeros past its end; diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek_bytes(&self, address: u64, len: u64) -> Vec<u8> {
+        let at = address.saturating_sub(self.start) as usize;
+        let n = (len.min(256) as usize).min((self.len as usize).saturating_sub(at));
+        let mut out = vec![0u8; len.min(256) as usize];
+        // SAFETY: inside the mapping (checked); a racing GPU write only makes
+        // the logged value stale.
+        unsafe { std::ptr::copy_nonoverlapping(self.data.add(at), out.as_mut_ptr(), n) };
+        out
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start
