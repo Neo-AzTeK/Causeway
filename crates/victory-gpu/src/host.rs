@@ -1074,11 +1074,6 @@ impl Host {
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            #[cfg(feature = "diagnostics")]
-            let touching = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::TouchUs);
-            list.touch_textures();
-            #[cfg(feature = "diagnostics")]
-            drop(touching);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1092,6 +1087,16 @@ impl Host {
         batch.flush();
         #[cfg(feature = "diagnostics")]
         drop(flushing);
+        // Stamped as used only now, with nothing slow left before eviction
+        // looks: preparing a batch can take longer than the idle time it
+        // asks for, and a texture stamped before that could be taken.
+        #[cfg(feature = "diagnostics")]
+        let touching = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::TouchUs);
+        for list in runs {
+            list.touch_textures();
+        }
+        #[cfg(feature = "diagnostics")]
+        drop(touching);
         // Last before the lists run: every texture they reach is raised by
         // now (`resource::residency`).
         #[cfg(feature = "diagnostics")]
