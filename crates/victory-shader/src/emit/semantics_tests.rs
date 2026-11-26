@@ -2776,8 +2776,8 @@ fn output_multipliers_give_positive_zero() {
 /// Denormal operands of `v_min/max/med3/min3/max3_f32` read as zeros of
 /// their sign, and a float `v_cndmask_b32` with `abs`/`neg` moves only the
 /// sign bit. Guards against leaving it to the host, whose adapters differ
-/// (as measured, WARP flushes and the RX 6700 XT does not, and a flushed
-/// denormal meets +0 as an equal).
+/// (as measured, WARP flushed and the RX 6700 XT did not, so a flushed
+/// denormal met +0 as an equal).
 #[test]
 fn min_max_and_selects_take_denormals_on_the_bits() {
     let mut p = min_max_probes();
@@ -2834,8 +2834,8 @@ fn med3_orders_signed_zeros() {
 }
 
 /// `v_cmp_f_f32` and `v_cmp_tru_f32` (always false, always true).
-/// Guards against `fcmp false`/`fcmp true`, which as observed remove the
-/// WARP device.
+/// Guards against `fcmp false`/`fcmp true`, which removed the WARP device
+/// when observed.
 #[test]
 fn constant_compares_run() {
     let ab = pairs(&F32_EDGES[..8], &F32_EDGES[..8]);
