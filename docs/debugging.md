@@ -42,7 +42,12 @@ console: do not copy it into the repository).
 runs a title unattended with this build (300 s, `--seconds`), skips its menus
 with `VICTORY_KEYS` (`--keys` replaces them; they do nothing while an XInput pad is
 connected), and judges each graphics area in `report.txt` and `report.json`.
-`--log <file>` judges an existing log instead. It also writes `digest.md` (at most 60
+`--log <file>` judges an existing log instead.
+`--world-lines <n>` ends the run once it has `n` steady world lines (one about
+every 5 s): world lines logged 90 s or more after the first, the warm-up. The log
+is read every 2 s and the title is ended one look after the `n`th, as at the end
+of the time; `--seconds` stays the cap, and a run that ends short of `n` fails the
+"steady world lines" area, which says how many it had. It also writes `digest.md` (at most 60
 lines: run header with the switches the game saw, delta against `--baseline <report.json>`,
 frame cost, draws lost by cause and pipeline, refusals ranked by draws lost, a contact
 sheet and the top 3 next items). `--env NAME=VALUE` passes a `VICTORY_*` switch to the
@@ -66,13 +71,14 @@ the repository.
 
 ```powershell
 cargo xtask queue add --name mesh-9 --seconds 420 --env VICTORY_SHADER_LOOP_LIMIT=64 --baseline smoke-15 --requester local_... --wait
-cargo xtask queue run --exe E:\GTA\game_scarlett_master.exe   # once, in the background
+cargo run -q --target-dir target\queue-runner -p xtask -- queue run --exe E:\GTA\game_scarlett_master.exe   # once, in the background
 cargo xtask queue status
 ```
 
 `add` writes `<name>.toml`: the worktree (this one by default), its commit (HEAD
 by default; the runner refuses a worktree at another commit, with uncommitted
-tracked changes, or that `git worktree list` does not show), `seconds`, `env`
+tracked changes, or that `git worktree list` does not show), `seconds`, `world_lines`
+(`--world-lines`; the worktree's own `xtask` must know it), `env`
 (`VICTORY_*` only), `baseline` (a run's name, or an absolute `report.json`),
 `requester`, and `data_dir`, `data_from`, `keys`. Any other field, or a switch
 that is not `VICTORY_*`, refuses the request; `--accept-terms` is not one. `run`
@@ -88,6 +94,16 @@ start a waiter per request. While the smoke lock is held (a run by hand) the hea
 a run that still stops at the lock goes back to the head (its request is untouched), and
 after 60 such tries it is given up on in its `.done`. `status` prints what runs (and for
 how long), then the queue in the order it runs, then the last finished.
+
+The runner gets its own target directory (the command above), or a request for the
+worktree it was built from could not rebuild `xtask` while it runs. While a run
+plays, the runner builds the next request's worktree (`xtask`, then the `diag`
+title build; output in `<runs>\<name>.build.txt`), below normal priority on half the
+cores, and waits for that build before it starts the next run. It skips a request
+for the playing run's worktree. The build still takes cores and disk from the title:
+an incremental one is over during boot, but a cold one can reach into the steady
+lines (its `.build.txt` is written until it ends). The queue, the smoke lock and the
+run are looked at every 2 s.
 
 ```powershell
 cargo xtask compare E:\Causeway-tools\runs\mesh-9 --baseline E:\Causeway-tools\runs\smoke-16 --baseline E:\Causeway-tools\runs\smoke-15

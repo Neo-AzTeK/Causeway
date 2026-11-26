@@ -449,7 +449,7 @@ impl Log {
     fn stability_section(&self, areas: &[Area]) -> Vec<String> {
         let mut out = vec!["## 7. Stability".to_owned()];
         for a in areas.iter().filter(|a| {
-            ["crash", "hang", "device removed", "host GPU failure"].contains(&a.name)
+            ["crash", "hang", "device removed", "host GPU failure", STEADY_AREA].contains(&a.name)
         }) {
             out.push(format!("{}: {} - {}", a.name, a.status.name(), cut(&a.detail, 90)));
         }

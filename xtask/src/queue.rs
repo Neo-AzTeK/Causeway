@@ -10,11 +10,12 @@
 //! ends with `<name>.done` beside it (exit code, digest path), refused ones
 //! too, so a requester only ever waits for that file.
 
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -25,9 +26,11 @@ use crate::smoke;
 const DEFAULT_QUEUE: &str = r"E:\Causeway-tools\queue";
 const DEFAULT_RUNS: &str = r"E:\Causeway-tools\runs";
 const LOCK: &str = "runner.lock";
-const POLL: Duration = Duration::from_secs(5);
-/// A request whose run stops at the smoke lock this many times is given up on.
-const MAX_BUSY: u32 = 60;
+/// How often the queue, the smoke lock and a run are looked at.
+const POLL: Duration = Duration::from_secs(2);
+/// A request whose run stops at the smoke lock this many times (five minutes)
+/// is given up on.
+const MAX_BUSY: u32 = 150;
 
 #[derive(Args)]
 pub struct Queue {
@@ -67,6 +70,10 @@ struct Add {
     commit: Option<String>,
     #[arg(long, default_value_t = 300)]
     seconds: u64,
+    /// `smoke --world-lines`: end the run once it has these steady world
+    /// lines; --seconds stays the cap.
+    #[arg(long)]
+    world_lines: Option<u64>,
     /// `NAME=VALUE`: a `VICTORY_*` switch for the game.
     #[arg(long = "env", value_name = "NAME=VALUE")]
     envs: Vec<String>,
@@ -136,6 +143,7 @@ struct Request {
     worktree: PathBuf,
     commit: String,
     seconds: u64,
+    world_lines: Option<u64>,
     env: Vec<(String, String)>,
     baseline: Option<String>,
     requester: Option<String>,
@@ -145,7 +153,7 @@ struct Request {
 }
 
 const FIELDS: &[&str] = &[
-    "name", "worktree", "commit", "seconds", "env", "baseline", "requester", "data_dir",
+    "name", "worktree", "commit", "seconds", "world_lines", "env", "baseline", "requester", "data_dir",
     "data_from", "keys",
 ];
 
@@ -204,6 +212,11 @@ impl Request {
             Some(toml::Value::Integer(n)) if (1..=86400).contains(n) => *n as u64,
             Some(_) => bail!("seconds must be a whole number from 1 to 86400"),
         };
+        let world_lines = match table.get("world_lines") {
+            None => None,
+            Some(toml::Value::Integer(n)) if (1..=100_000).contains(n) => Some(*n as u64),
+            Some(_) => bail!("world_lines must be a whole number from 1 to 100000"),
+        };
         let env = match table.get("env") {
             None => Vec::new(),
             Some(toml::Value::Array(list)) => list
@@ -240,6 +253,7 @@ impl Request {
             worktree: path("worktree")?.context("worktree is missing")?,
             commit,
             seconds,
+            world_lines,
             env,
             baseline,
             requester,
@@ -259,6 +273,9 @@ impl Request {
         put("worktree", Str(self.worktree.display().to_string()));
         put("commit", Str(self.commit.clone()));
         put("seconds", Integer(self.seconds as i64));
+        if let Some(n) = self.world_lines {
+            put("world_lines", Integer(n as i64));
+        }
         let env = self.env.iter().map(|(n, v)| Str(format!("{n}={v}"))).collect();
         put("env", Array(env));
         for (key, value) in [
@@ -282,6 +299,9 @@ impl Request {
         args.push(exe.into());
         args.extend(["--out".into(), dirs.runs.join(&self.name).into()]);
         args.extend(["--seconds".into(), self.seconds.to_string().into()]);
+        if let Some(n) = self.world_lines {
+            args.extend(["--world-lines".into(), n.to_string().into()]);
+        }
         for (flag, path) in [("--data-dir", &self.data_dir), ("--data-from", &self.data_from)] {
             if let Some(p) = path {
                 args.extend([flag.into(), p.into()]);
@@ -315,6 +335,12 @@ impl Request {
             "{} has no xtask",
             self.worktree.display()
         );
+        ensure!(
+            self.world_lines.is_none() || knows_world_lines(&self.worktree),
+            "{}: its xtask predates --world-lines (the runner runs the worktree's own): merge main \
+             there",
+            self.worktree.display()
+        );
         let head = git(&self.worktree, &["rev-parse", "HEAD"])?;
         ensure!(
             head.starts_with(&self.commit),
@@ -331,6 +357,12 @@ impl Request {
         ensure!(!dirs.runs.join(&self.name).exists(), "{} exists already", dirs.runs.join(&self.name).display());
         Ok(())
     }
+}
+
+/// Whether a worktree's `smoke` takes `--world-lines`.
+fn knows_world_lines(worktree: &Path) -> bool {
+    let smoke = worktree.join("xtask").join("src").join("smoke.rs");
+    fs::read_to_string(smoke).is_ok_and(|text| text.contains("world_lines: Option<u64>"))
 }
 
 /// The same place, whatever the slashes, case and `\\?\` prefix.
@@ -368,6 +400,7 @@ fn add_request(root: &Path, dirs: &Dirs, add: &Add) -> Result<()> {
         worktree,
         commit,
         seconds: add.seconds,
+        world_lines: add.world_lines,
         env: add.envs.iter().map(|e| parse_switch(e)).collect::<Result<_>>()?,
         baseline: add.baseline.clone(),
         requester: add.requester.clone(),
@@ -381,7 +414,7 @@ fn add_request(root: &Path, dirs: &Dirs, add: &Add) -> Result<()> {
     fs::create_dir_all(&dirs.queue).with_context(|| format!("creating {}", dirs.queue.display()))?;
     publish(dirs, &request.name, &text)?;
     let done = dirs.file(&request.name, "done");
-    println!("queued {} ({} s); wait for {}", request.name, request.seconds, done.display());
+    println!("queued {} ({}); wait for {}", request.name, length(&request), done.display());
     if add.wait {
         while !done.is_file() {
             std::thread::sleep(POLL);
@@ -526,9 +559,11 @@ fn recover(dirs: &Dirs) -> Result<()> {
 fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
     let mut busy: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut said = false;
+    let mut builder = Builder::default();
     loop {
         let Some(name) = waiting(dirs).into_iter().next() else {
             if args.once {
+                builder.finish();
                 return Ok(());
             }
             std::thread::sleep(POLL);
@@ -545,6 +580,8 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
             continue;
         }
         said = false;
+        // No build may go on into the next run.
+        builder.finish();
         fs::write(dirs.file(&name, "running"), format!("started_unix {}\n", unix_now()))?;
         let outcome = fs::read_to_string(dirs.file(&name, "toml"))
             .context("reading the request")
@@ -552,8 +589,8 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
             .and_then(|request| {
                 ensure!(request.name == name, "the request names {}, its file {name}", request.name);
                 request.check(root, dirs)?;
-                println!("runner: start {name} ({} s)", request.seconds);
-                launch(dirs, &request, &args.exe)
+                println!("runner: start {name} ({})", length(&request));
+                launch(dirs, &request, &args.exe, || builder.tick(root, dirs, &request.worktree))
             });
         match outcome {
             Ok(Ran::Exit(code)) => {
@@ -596,20 +633,155 @@ fn stopped_at_the_lock(code: i32, console: &str, out_exists: bool) -> bool {
     code != 0 && !out_exists && console.contains(smoke::LOCK_BUSY)
 }
 
+/// How long a request runs, for people.
+fn length(request: &Request) -> String {
+    match request.world_lines {
+        Some(n) => format!("{n} world lines, {} s at most", request.seconds),
+        None => format!("{} s", request.seconds),
+    }
+}
+
+/// Builds what the next run will need while the current one plays, so that no
+/// build sits between two runs. The run being played measures CPU time, so
+/// this runs below normal priority, on half the cores.
+// shortcut: it still shares cores, memory and disk with the title; a cold
+// build can reach into the steady lines. An incremental one ends during boot.
+#[derive(Default)]
+struct Builder {
+    running: Option<Build>,
+    /// Requests built for already, whether or not the build worked.
+    tried: HashSet<String>,
+}
+
+/// The build under way and the steps after it.
+struct Build {
+    name: String,
+    log: PathBuf,
+    child: Child,
+    after: VecDeque<Command>,
+}
+
+impl Builder {
+    /// Moves the build on, or starts the one the next run needs.
+    fn tick(&mut self, root: &Path, dirs: &Dirs, playing: &Path) {
+        self.advance();
+        if self.running.is_some() {
+            return;
+        }
+        let Some(request) = next_build(dirs, playing, &self.tried) else { return };
+        self.tried.insert(request.name.clone());
+        // A request that will be refused is not built for; its turn says why.
+        if request.check(root, dirs).is_err() {
+            return;
+        }
+        let log = dirs.runs.join(format!("{}.build.txt", request.name));
+        // The runner of that worktree first (`cargo xtask`), then the title's build.
+        let steps = [&["build", "--locked", "-p", "xtask"][..], smoke::DIAG_BUILD];
+        let steps = steps.map(|step| build_command(&request.worktree, step)).into();
+        println!("runner: building ahead for {}", request.name);
+        self.start(request.name, log, steps);
+    }
+
+    /// Starts the first of `steps`, its output added to `log`. A step that
+    /// cannot start ends the build: the run builds for itself.
+    fn start(&mut self, name: String, log: PathBuf, mut steps: VecDeque<Command>) {
+        let Some(mut command) = steps.pop_front() else { return };
+        let spawned = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .and_then(|out| {
+                command.stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
+                command.spawn()
+            });
+        match spawned {
+            Ok(child) => self.running = Some(Build { name, log, child, after: steps }),
+            Err(e) => println!("runner: the build for {name} did not start: {e}"),
+        }
+    }
+
+    /// Takes a step that has ended: the next one, or the build is over.
+    fn advance(&mut self) {
+        let Some(build) = &mut self.running else { return };
+        let status = match build.child.try_wait() {
+            Ok(None) => return,
+            Ok(Some(status)) => status.success(),
+            Err(_) => false,
+        };
+        let Some(Build { name, log, after, .. }) = self.running.take() else { return };
+        if !status {
+            println!("runner: the build ahead for {name} failed: {}", log.display());
+        } else if after.is_empty() {
+            println!("runner: built ahead for {name}");
+        } else {
+            self.start(name, log, after);
+        }
+    }
+
+    /// Waits for what is being built.
+    fn finish(&mut self) {
+        if let Some(build) = &self.running {
+            println!("runner: waiting for the build for {} to end", build.name);
+        }
+        while let Some(build) = &mut self.running {
+            let _ = build.child.wait();
+            self.advance();
+        }
+    }
+}
+
+/// The request to build for: the next to run, once. Not one in the worktree
+/// of the run going on, where cargo is that run's.
+fn next_build(dirs: &Dirs, playing: &Path, tried: &HashSet<String>) -> Option<Request> {
+    let name = waiting(dirs).into_iter().next()?;
+    if tried.contains(&name) {
+        return None;
+    }
+    let text = fs::read_to_string(dirs.file(&name, "toml")).ok()?;
+    let request = Request::parse(&text).ok().filter(|r| r.name == name)?;
+    (!same_path(&request.worktree, playing)).then_some(request)
+}
+
+/// A build step in a worktree that leaves the processor to the run playing.
+fn build_command(worktree: &Path, step: &[&str]) -> Command {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let mut command = Command::new("cargo");
+    command.args(step).args(["-j", &(cores / 2).max(1).to_string()]).current_dir(worktree);
+    // What it starts (rustc, the linker) takes the same class.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(
+        &mut command,
+        windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS,
+    );
+    command
+}
+
 /// Runs `cargo xtask smoke` for a checked request; its console goes to
-/// `<runs>/<name>.console.txt`.
-fn launch(dirs: &Dirs, request: &Request, exe: &Path) -> Result<Ran> {
+/// `<runs>/<name>.console.txt`. `meanwhile` is called every `POLL` it runs.
+fn launch(
+    dirs: &Dirs,
+    request: &Request,
+    exe: &Path,
+    mut meanwhile: impl FnMut(),
+) -> Result<Ran> {
     let console = dirs.runs.join(format!("{}.console.txt", request.name));
     let out = fs::File::create(&console).with_context(|| format!("creating {}", console.display()))?;
     let err = out.try_clone()?;
-    let status = Command::new("cargo")
+    let mut child = Command::new("cargo")
         .args(request.smoke_args(dirs, exe))
         .current_dir(&request.worktree)
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err)
-        .status()
+        .spawn()
         .context("starting cargo")?;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting for cargo")? {
+            break status;
+        }
+        meanwhile();
+        std::thread::sleep(POLL);
+    };
     let code = status.code().unwrap_or(-1);
     let text = fs::read(&console).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
     if stopped_at_the_lock(code, &text, dirs.runs.join(&request.name).exists()) {
@@ -644,7 +816,7 @@ fn status(dirs: &Dirs) -> Result<()> {
         let parsed = fs::read_to_string(dirs.file(&name, "toml")).ok().and_then(|t| Request::parse(&t).ok());
         let what = parsed.as_ref().map_or("unreadable".to_owned(), |r| {
             let who = r.requester.as_deref().map_or(String::new(), |q| format!(", {q}"));
-            format!("{} s, {}{who}", r.seconds, &r.commit[..r.commit.len().min(8)])
+            format!("{}, {}{who}", length(r), &r.commit[..r.commit.len().min(8)])
         });
         if let Ok(done) = fs::read_to_string(dirs.file(&name, "done")) {
             let table: toml::Table = done.parse().unwrap_or_default();
@@ -860,6 +1032,86 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
         drop(first);
         assert_eq!(runner_state(&lock), "not running");
         drop(runner_lock(&lock).unwrap());
+        fs::remove_dir_all(&dirs.queue).unwrap();
+    }
+
+    #[test]
+    fn world_lines_pass_through_to_smoke() {
+        let r = Request::parse(&with("world_lines = 40")).unwrap();
+        assert_eq!(r.world_lines, Some(40));
+        assert_eq!(Request::parse(&r.to_toml()).unwrap(), r);
+        let dirs = Dirs { queue: "Q".into(), runs: "R".into() };
+        let args = r.smoke_args(&dirs, Path::new("title.exe"));
+        let at = args.iter().position(|a| a == "--world-lines").unwrap();
+        assert_eq!(args[at + 1], "40");
+        // The cap stays.
+        assert!(args.iter().any(|a| a == "--seconds"));
+        assert_eq!(length(&r), "40 world lines, 420 s at most");
+        // Not asked for: not passed.
+        let plain = Request::parse(GOOD).unwrap().smoke_args(&dirs, Path::new("title.exe"));
+        assert!(!plain.iter().any(|a| a == "--world-lines"));
+        for bad in ["0", "-1", "\"40\"", "1.5", "100001"] {
+            assert!(refused(&with(&format!("world_lines = {bad}"))).contains("world_lines"));
+        }
+    }
+
+    #[test]
+    fn a_worktree_without_the_flag_is_told_apart() {
+        assert!(knows_world_lines(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()));
+        assert!(!knows_world_lines(Path::new("no/such/worktree")));
+    }
+
+    #[test]
+    fn the_next_run_is_built_for_once_and_not_where_a_run_plays() {
+        let dirs = scratch("next-build");
+        let playing = Path::new(r"E:\Causeway\.claude\worktrees\playing");
+        assert!(next_build(&dirs, playing, &HashSet::new()).is_none());
+        // The one playing is not waiting.
+        for (name, at) in [("now", "playing"), ("next", "mesh"), ("later", "other")] {
+            let text = GOOD.replace("mesh-emu-8", name).replace(r"worktrees\mesh", &format!(r"worktrees\{at}"));
+            fs::write(dirs.file(name, "toml"), text).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        fs::write(dirs.file("now", "running"), "started_unix 1\n").unwrap();
+        let mut tried = HashSet::new();
+        assert_eq!(next_build(&dirs, playing, &tried).unwrap().name, "next");
+        // Once; and never one further down the queue.
+        tried.insert("next".to_owned());
+        assert!(next_build(&dirs, playing, &tried).is_none());
+        let same = Path::new("E:/Causeway/.claude/worktrees/mesh");
+        assert!(next_build(&dirs, same, &HashSet::new()).is_none());
+        fs::remove_dir_all(&dirs.queue).unwrap();
+    }
+
+    #[test]
+    fn the_build_ahead_leaves_the_cores_to_the_run() {
+        let command = build_command(Path::new("w"), smoke::DIAG_BUILD);
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(&args[..args.len() - 2], smoke::DIAG_BUILD);
+        assert_eq!(args[args.len() - 2], "-j");
+        let cores = std::thread::available_parallelism().unwrap().get();
+        assert!(args.last().unwrap().parse::<usize>().unwrap() <= cores.div_ceil(2));
+        assert_eq!(command.get_current_dir(), Some(Path::new("w")));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_steps_of_a_build_run_in_turn_until_one_fails() {
+        let dirs = scratch("builder");
+        let step = |script: &str| {
+            let mut command = Command::new("cmd");
+            command.args(["/d", "/c", script]);
+            command
+        };
+        let log = dirs.queue.join("x.build.txt");
+        let mut builder = Builder::default();
+        let steps = [step("echo one"), step("echo two & exit 1"), step("echo three")];
+        builder.start("x".into(), log.clone(), steps.into_iter().collect());
+        builder.finish();
+        assert!(builder.running.is_none());
+        let said = fs::read_to_string(&log).unwrap();
+        assert!(said.contains("one") && said.contains("two"), "{said}");
+        assert!(!said.contains("three"), "{said}");
         fs::remove_dir_all(&dirs.queue).unwrap();
     }
 

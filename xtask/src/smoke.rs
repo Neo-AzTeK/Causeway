@@ -4,6 +4,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +27,11 @@ pub struct Smoke {
     /// How long the title runs.
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86400))]
     seconds: u64,
+    /// Ends the run once this many world lines are logged after the world's
+    /// warm-up. --seconds stays the cap: a run that ends short of them fails
+    /// the "steady world lines" area.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=100000))]
+    world_lines: Option<u64>,
     /// The title's saves and settings; a folder in --out by default, so
     /// every run goes through the first-start menus (see --accept-terms).
     #[arg(long)]
@@ -92,7 +98,10 @@ pub fn run(root: &Path, args: &Smoke) -> Result<()> {
     let log_path = log;
     let mut log = Log::parse(&String::from_utf8_lossy(&bytes));
     log.ended = end.map(|(_, at)| at);
-    let areas = log.judge(end.map(|(end, _)| end), |png| flat_png(&std::fs::read(png).ok()?));
+    let mut areas = log.judge(end.map(|(end, _)| end), |png| flat_png(&std::fs::read(png).ok()?));
+    if let Some(asked) = args.world_lines {
+        areas.push(log.steady_area(asked as usize, end.map(|(end, _)| end)));
+    }
     let text = log.text(&areas);
     create(&args.out)?;
 
@@ -255,7 +264,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file);
-    let end = run_for(command, Duration::from_secs(args.seconds))
+    let mut watch = args.world_lines.map(|asked| Watch::new(&log, asked as usize));
+    let enough = || watch.as_mut().is_some_and(Watch::enough);
+    let end = run_for(command, Duration::from_secs(args.seconds), enough)
         .with_context(|| format!("running {}", victory.display()))?;
     Ok((log, end))
 }
@@ -336,11 +347,14 @@ fn capture_frames(seconds: u64) -> String {
 }
 
 /// Builds the diagnostics build; its path.
+/// The diagnostics build a run makes (`queue run` makes it ahead of one).
+pub(crate) const DIAG_BUILD: &[&str] =
+    &["build", "--locked", "--profile", "diag", "-p", "victory", "--features", "diagnostics"];
+
 fn build(root: &Path) -> Result<PathBuf> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let built = Command::new(cargo)
-        .args(["build", "--locked", "--profile", "diag", "-p", "victory"])
-        .args(["--features", "diagnostics"])
+        .args(DIAG_BUILD)
         .args(["--message-format", "json-render-diagnostics"])
         .current_dir(root)
         .stderr(Stdio::inherit())
@@ -367,9 +381,55 @@ fn executable(messages: &str) -> Option<PathBuf> {
     }
 }
 
-/// Runs a process for at most `time`, then ends it and what it started.
-/// Also when it ended, or was ended (Unix time).
-fn run_for(mut command: Command, time: Duration) -> Result<(End, f64)> {
+/// How often a running title's log is read.
+const LOOK: Duration = Duration::from_secs(2);
+
+/// Follows the growing log for `--world-lines`.
+struct Watch {
+    log_file: PathBuf,
+    /// Bytes read, and the last line while it is not whole.
+    read: u64,
+    rest: Vec<u8>,
+    log: Log,
+    asked: usize,
+    reached: bool,
+}
+
+impl Watch {
+    fn new(log_file: &Path, asked: usize) -> Watch {
+        let (rest, log) = (Vec::new(), Log::default());
+        Watch { log_file: log_file.to_owned(), read: 0, rest, log, asked, reached: false }
+    }
+
+    /// Whether the lines asked for were there at the look before this one: the
+    /// run goes on for one more, so that what a world line brings with it
+    /// (its drops, by cause and reason) is in the log. A log that cannot be
+    /// read is never enough: the run goes to its cap.
+    fn enough(&mut self) -> bool {
+        let mut new = Vec::new();
+        if let Ok(mut file) = File::open(&self.log_file)
+            && file.seek(SeekFrom::Start(self.read)).is_ok()
+            && file.read_to_end(&mut new).is_ok()
+        {
+            self.read += new.len() as u64;
+            self.rest.append(&mut new);
+        }
+        if let Some(end) = self.rest.iter().rposition(|&b| b == b'\n') {
+            let whole: Vec<u8> = self.rest.drain(..=end).collect();
+            self.log.feed(&String::from_utf8_lossy(&whole));
+        }
+        std::mem::replace(&mut self.reached, self.log.steady_lines() >= self.asked)
+    }
+}
+
+/// Runs a process for at most `time`, or until `enough` (asked every `LOOK`)
+/// says so, then ends it and what it started. Also when it ended, or was ended
+/// (Unix time).
+fn run_for(
+    mut command: Command,
+    time: Duration,
+    mut enough: impl FnMut() -> bool,
+) -> Result<(End, f64)> {
     let now = || SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
     let group = Group::new()?;
     let mut child = command.spawn()?;
@@ -379,6 +439,8 @@ fn run_for(mut command: Command, time: Duration) -> Result<(End, f64)> {
         return Err(e);
     }
     let start = Instant::now();
+    let mut looked = start;
+    let mut end = End::TimedOut;
     while start.elapsed() < time {
         // A title that relaunches itself goes on in a child.
         if let Some(status) = child.try_wait()?
@@ -386,13 +448,20 @@ fn run_for(mut command: Command, time: Duration) -> Result<(End, f64)> {
         {
             return Ok((End::Exited(status.code()), now()?));
         }
+        if looked.elapsed() >= LOOK {
+            looked = Instant::now();
+            if enough() {
+                end = End::Enough;
+                break;
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     // Before ending it, which takes a while for a process of this size.
     let ended = now()?;
     group.kill(&mut child)?;
     child.wait()?;
-    Ok((End::TimedOut, ended))
+    Ok((end, ended))
 }
 
 /// A job: the process and what it starts, and nothing else. They end with
@@ -632,6 +701,7 @@ mod tests {
             exe: None,
             out: root.join("smoke-out"),
             seconds: 1,
+            world_lines: None,
             data_dir: None,
             data_from: None,
             accept_terms: false,
@@ -646,6 +716,63 @@ mod tests {
         assert!(!args.out.exists());
     }
 
+    /// A world line `at` seconds in.
+    fn world_line(at: u32) -> String {
+        format!(
+            "2026-01-01T00:{:02}:{:02}Z  INFO victory_gpu::host: 1.0 fps, 1000.0 ms/frame (1.0 \
+             preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; 2.0 on the GPU; 0.1 copying \
+             back 0.0 MB), 900 draws/frame, dropped 0 without a host pipeline (0 being made) and \
+             0 indirect\n",
+            at / 60,
+            at % 60
+        )
+    }
+
+    #[test]
+    fn a_growing_log_is_enough_one_look_after_its_last_line_asked_for() {
+        let path = std::env::temp_dir().join(format!("xtask-watch-{}", std::process::id()));
+        let mut watch = Watch::new(&path, 2);
+        assert!(!watch.enough(), "no log yet");
+        let append = |text: &str| {
+            use std::io::Write as _;
+            let mut file =
+                std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        std::fs::write(&path, world_line(0)).unwrap();
+        append(&world_line(50));
+        append(&world_line(95)); // The first steady one.
+        assert!(!watch.enough());
+        assert!(!watch.enough(), "one steady line of two");
+        // Half a line counts for nothing.
+        let second = world_line(100);
+        let (head, tail) = second.split_at(60);
+        append(head);
+        assert!(!watch.enough());
+        assert!(!watch.enough());
+        append(tail);
+        assert!(!watch.enough(), "the look that sees it: what follows it may not be there");
+        assert!(watch.enough());
+        assert_eq!(watch.log.steady_lines(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_run_with_its_lines_is_ended_before_its_time() {
+        let mut command = Command::new("cmd");
+        command.args(["/d", "/c", "ping -n 60 127.0.0.1"]).stdout(Stdio::null());
+        let start = Instant::now();
+        let mut looks = 0;
+        let enough = || {
+            looks += 1;
+            looks == 2
+        };
+        let (end, _) = run_for(command, Duration::from_secs(60), enough).unwrap();
+        assert_eq!((end, looks), (End::Enough, 2));
+        assert!(start.elapsed() >= LOOK * 2 && start.elapsed() < Duration::from_secs(30));
+    }
+
     #[cfg(windows)]
     #[test]
     fn what_outlives_its_time_is_ended_with_its_children() {
@@ -654,7 +781,7 @@ mod tests {
             c.args(["/d", "/c", script]).stdout(Stdio::null());
             c
         };
-        let exited = run_for(shell("exit 3"), Duration::from_secs(60)).unwrap();
+        let exited = run_for(shell("exit 3"), Duration::from_secs(60), || false).unwrap();
         assert_eq!(exited.0, End::Exited(Some(3)));
 
         // The grandchild holds the pipe: reading ends only when it is gone.
@@ -662,7 +789,7 @@ mod tests {
         let mut command = shell("ping -n 60 127.0.0.1");
         command.stdout(write);
         let start = Instant::now();
-        assert_eq!(run_for(command, Duration::from_secs(1)).unwrap().0, End::TimedOut);
+        assert_eq!(run_for(command, Duration::from_secs(1), || false).unwrap().0, End::TimedOut);
         std::io::Read::read_to_end(&mut read, &mut Vec::new()).unwrap();
         assert!(start.elapsed() < Duration::from_secs(30));
     }
