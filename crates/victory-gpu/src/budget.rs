@@ -47,8 +47,33 @@ pub(crate) fn skip_draw(size: Option<u32>) -> bool {
     skip
 }
 
-/// H was pressed in the game window.
-pub(crate) fn toggle_full() {
+/// Polls H on a thread of its own, as the keyboard pad polls its keys: the
+/// window shown need not be one whose messages the host sees, and a slow
+/// frame must not delay the switch.
+fn watch_h() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    std::thread::spawn(|| {
+        let mut was = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            // SAFETY: a plain query.
+            let down = unsafe { GetAsyncKeyState(i32::from(b'H')) } < 0;
+            if down && !was {
+                let mut process = 0;
+                // SAFETY: plain queries; a null window gives process 0.
+                unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process)) };
+                if process == std::process::id() {
+                    toggle_full();
+                }
+            }
+            was = down;
+        }
+    });
+}
+
+/// H was pressed while one of our windows had the focus.
+fn toggle_full() {
     if BUDGET_MS.is_none() {
         return;
     }
@@ -76,6 +101,10 @@ static FRAMES: LazyLock<Mutex<Frames>> = LazyLock::new(|| {
             f,
             "frame,ms,full,prepare_ms,gpu_ms,copies_ms,textures_ms,copy_back_ms,rest_ms,draws,skipped,small,dispatches"
         );
+    }
+    if let Some(budget) = *BUDGET_MS {
+        tracing::info!(budget, "draw budget on: H switches full drawing");
+        watch_h();
     }
     Mutex::new(Frames { started: Instant::now(), number: 0, totals: [0; 6], file })
 });

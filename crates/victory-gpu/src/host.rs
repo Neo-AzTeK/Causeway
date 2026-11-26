@@ -3379,11 +3379,6 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // A key going down, not repeating: H switches full drawing.
-    #[cfg(feature = "diagnostics")]
-    if message == 0x100 && wparam.0 == usize::from(b'H') && lparam.0 & (1 << 30) == 0 {
-        crate::budget::toggle_full();
-    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
