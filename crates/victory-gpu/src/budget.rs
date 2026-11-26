@@ -6,7 +6,8 @@
 //! skipped. Dispatches, copies, clears and synchronization all run, so a
 //! frame can still take longer. Small draws (fullscreen passes, quads)
 //! always run, so a finished picture still reaches the screen. H in the
-//! game window switches to full drawing and back.
+//! game window draws the next frames in full, then holds the game at that
+//! picture until H is pressed again.
 //!
 //! `VICTORY_PROFILE=<file>`: one CSV line for each presented frame.
 //!
@@ -21,6 +22,9 @@ use std::time::Instant;
 
 /// Draws of up to this many vertices or indices are never skipped.
 const SMALL: u32 = 6;
+/// Frames drawn in full before the game is held: effects that build over
+/// several frames need them.
+const SETTLE: u64 = 8;
 /// The fewest other draws a limited frame may record.
 const FLOOR: u64 = 32;
 
@@ -28,6 +32,8 @@ static BUDGET_MS: LazyLock<Option<f64>> = LazyLock::new(|| {
     std::env::var("VICTORY_DRAW_BUDGET_MS").ok()?.parse().ok().filter(|ms| *ms > 0.0)
 });
 static FULL: AtomicBool = AtomicBool::new(false);
+/// Full frames still to draw before the game is held.
+static TO_HOLD: AtomicU64 = AtomicU64::new(0);
 /// The frame had full drawing at some point.
 static WAS_FULL: AtomicBool = AtomicBool::new(false);
 static ALLOWED: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -81,7 +87,23 @@ fn toggle_full() {
     if full {
         WAS_FULL.store(true, Relaxed);
     }
+    TO_HOLD.store(if full { SETTLE } else { 0 }, Relaxed);
     tracing::info!(full, "draw budget: H pressed");
+}
+
+/// At a presented frame: after the last of the full frames H asked for,
+/// keeps the game here until H is pressed again. True if it did.
+fn hold() -> bool {
+    if !FULL.load(Relaxed)
+        || TO_HOLD.fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1)) != Ok(1)
+    {
+        return false;
+    }
+    tracing::info!("draw budget: game held at a full frame; H goes on");
+    while FULL.load(Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
 }
 
 struct Frames {
@@ -144,5 +166,9 @@ pub(crate) fn frame(totals: [u64; 6]) {
             u8::from(full),
             spent[5]
         );
+    }
+    if hold() {
+        // The time held is no frame's.
+        frames.started = Instant::now();
     }
 }
