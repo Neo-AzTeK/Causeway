@@ -42,6 +42,12 @@ one evening, one agent 32%).
   only for status, `docs/debugging.md` only for debug variables and smoke runs,
   `docs/architecture.md` only for cross-crate flow or import resolution.
 
+## Compiling beside a run
+The title takes ~32 GB and boots slowly; a compile during its boot starves it
+into a black screen of minutes, or no world. Run `cargo xtask queue wait-idle`
+before any cargo build, test or clippy: it returns once no queued run is booting
+(details: `docs/debugging.md`, "Sharing the GPU").
+
 ## Output
 - At most 60 lines per command: `-q`, `--stat` before a diff, `--name-only`
   before a full one, `gh ... --json <fields> -q <filter>`. Count and group

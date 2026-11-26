@@ -59,6 +59,17 @@ pub(super) fn translate_caps(
     group: (bool, u32, u32),
     min_lod_clamp: bool,
 ) -> Result<HostShader, ShaderError> {
+    translate_host(body, view, group, (min_lod_clamp, false))
+}
+
+/// [`translate_caps`] for a device that `wave64_native` runs waves of 64 and
+/// not 32 (`(min_lod_clamp, wave64_native)`).
+pub(super) fn translate_host(
+    body: &[u32],
+    view: (ResourceType, u8, u32),
+    group: (bool, u32, u32),
+    (min_lod_clamp, wave64_native): (bool, bool),
+) -> Result<HostShader, ShaderError> {
     let (wave64, threads, lds) = group;
     let (image, dwords, stride) = view;
     let table = |user_data: u8| RootParam {
@@ -117,6 +128,7 @@ pub(super) fn translate_caps(
         min_lod_clamp,
         view_marks: false,
         mesh_compute: false,
+        wave64_native,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

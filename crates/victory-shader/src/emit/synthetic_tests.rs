@@ -129,6 +129,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
     let io = io::raise(&p, native).expect("io::raise");
     lower::lower(&lower::Parts {
         mesh_compute: false,
+        wave64_native: false,
         native,
         p: &p,
         st: &st,

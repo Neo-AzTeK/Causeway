@@ -3,8 +3,11 @@
 mod capability;
 mod comments;
 mod machine;
+mod compare;
+mod load;
 mod policy;
 mod problem;
+mod queue;
 mod report;
 mod setup;
 mod smoke;
@@ -50,6 +53,12 @@ enum Cmd {
     /// Claim, resume and close problem sessions (docs/problem-sessions.md).
     #[command(subcommand)]
     Problem(problem::Problem),
+    /// Judge one smoke run against earlier runs, per world line: speed against
+    /// the spread, fidelity counters; exits with an error on a regression.
+    Compare(compare::Compare),
+    /// Smoke runs requested by many sessions, run one at a time by one runner:
+    /// `queue add`, `queue run`, `queue status`.
+    Queue(Box<queue::Queue>),
 }
 
 fn main() -> Result<()> {
@@ -59,6 +68,8 @@ fn main() -> Result<()> {
         Cmd::Smoke(args) => smoke::run(&root, &args),
         Cmd::Problem(command) => problem::run(&root, &command),
         Cmd::Alone { command } => smoke::alone(&command),
+        Cmd::Compare(args) => compare::run(&args),
+        Cmd::Queue(args) => queue::run(&root, &args),
         Cmd::Setup { game_dir } => setup::run(&root, game_dir.as_deref()),
     }
 }

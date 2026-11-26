@@ -82,17 +82,20 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there. `mesh_as_compute`: mesh
 /// programs are made as compute (hosts without mesh shaders).
+/// `wave64_native`: a console wave of 64 is asked for as such (hosts without
+/// waves of 32).
 pub fn host_shader(
     container: &[u8],
     min_lod_clamp: bool,
     mesh_as_compute: bool,
+    wave64_native: bool,
 ) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true, min_lod_clamp, mesh_as_compute };
+    let options = victory_shader::emit::Options { view_marks: true, min_lod_clamp, mesh_as_compute, wave64_native };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), (min_lod_clamp, mesh_as_compute), container, translate),
+        Some(cache) => cached(cache, build(), (min_lod_clamp, mesh_as_compute, wave64_native), container, translate),
         None => (translate(container), false),
     }
 }
@@ -118,15 +121,22 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
+/// What of the device is in the cache key. A host with waves of 32 keeps the
+/// key it had before `wave64_native` existed: its bit is set only where the
+/// flag is.
+fn device_key(min_lod_clamp: bool, mesh_as_compute: bool, wave64_native: bool) -> u8 {
+    u8::from(min_lod_clamp) | u8::from(mesh_as_compute) << 1 | u8::from(wave64_native) << 2
+}
+
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
-    (min_lod_clamp, mesh_as_compute): (bool, bool),
+    (min_lod_clamp, mesh_as_compute, wave64_native): (bool, bool, bool),
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> (Result<HostShader, String>, bool) {
     // The device's capability changes what translates: it is part of the key.
-    let device = u8::from(min_lod_clamp) | u8::from(mesh_as_compute) << 1;
+    let device = device_key(min_lod_clamp, mesh_as_compute, wave64_native);
     let input = [&build[..], &[device], container].concat();
     let converter = Translate {
         translate,
@@ -412,13 +422,42 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert!(!cached(&cache, &build, (false, false), container, translate).1);
-        assert!(!cached(&cache, &build, (false, true), container, translate).1);
-        assert!(!cached(&cache, &build, (true, true), container, translate).1);
+        assert!(!cached(&cache, &build, (false, false, false), container, translate).1);
+        assert!(!cached(&cache, &build, (false, true, false), container, translate).1);
+        assert!(!cached(&cache, &build, (true, true, false), container, translate).1);
         assert_eq!(runs.load(Ordering::Relaxed), 3, "three keys, three translations");
-        assert!(cached(&cache, &build, (false, true), container, translate).1);
-        assert!(cached(&cache, &build, (false, false), container, translate).1);
+        assert!(cached(&cache, &build, (false, true, false), container, translate).1);
+        assert!(cached(&cache, &build, (false, false, false), container, translate).1);
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    /// A translation asking for waves of 64 is its own entry, and a host
+    /// with waves of 32 keeps the keys it had.
+    #[test]
+    fn wave64_native_is_part_of_the_key() {
+        for (flags, key) in [
+            ((false, false), 0),
+            ((true, false), 1),
+            ((false, true), 2),
+            ((true, true), 3),
+        ] {
+            assert_eq!(device_key(flags.0, flags.1, false), key, "unchanged for {flags:?}");
+            assert_eq!(device_key(flags.0, flags.1, true), key | 4, "{flags:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"a console container".as_slice();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert!(!cached(&cache, &build, (false, false, false), container, translate).1);
+        assert!(!cached(&cache, &build, (false, false, true), container, translate).1);
+        assert!(cached(&cache, &build, (false, false, true), container, translate).1);
+        assert!(cached(&cache, &build, (false, false, false), container, translate).1);
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -433,18 +472,18 @@ mod tests {
             Ok(shader())
         };
         assert_eq!(
-            cached(&cache, &build, (false, false), container, translate),
+            cached(&cache, &build, (false, false, false), container, translate),
             (Ok(shader()), false)
         );
         assert_eq!(
-            cached(&cache, &build, (false, false), container, translate),
+            cached(&cache, &build, (false, false, false), container, translate),
             (Ok(shader()), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
         assert_eq!(
-            cached(&cache, &[8; 32], (false, false), container, translate).0,
+            cached(&cache, &[8; 32], (false, false, false), container, translate).0,
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
@@ -454,12 +493,12 @@ mod tests {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
         assert_eq!(
-            cached(&cache, &build, (false, false), container, translate),
+            cached(&cache, &build, (false, false, false), container, translate),
             (Ok(shader()), false)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(
-            cached(&cache, &build, (false, false), container, translate),
+            cached(&cache, &build, (false, false, false), container, translate),
             (Ok(shader()), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -471,8 +510,8 @@ mod tests {
             Err::<HostShader, _>("unsupported".to_owned())
         };
         let refused = (Err("unsupported".to_owned()), false);
-        assert_eq!(cached(&cache, &build, (false, false), b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, (false, false), b"other", fail), (refused.0, true));
+        assert_eq!(cached(&cache, &build, (false, false, false), b"other", fail), refused);
+        assert_eq!(cached(&cache, &build, (false, false, false), b"other", fail), (refused.0, true));
         assert_eq!(fails.load(Ordering::Relaxed), 1);
     }
 

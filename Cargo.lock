@@ -922,6 +922,7 @@ dependencies = [
  "anyhow",
  "clap",
  "miniz_oxide",
+ "toml",
  "victory-core",
  "walkdir",
  "windows-sys",

@@ -398,14 +398,14 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 }
                                 let one = std::time::Instant::now();
                                 let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP, false);
+                                    victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP, false, false);
                                 // A mesh program also as hosts without mesh
                                 // shaders make it (the cache keys the two
                                 // apart): which one runs is the host's.
                                 let mesh = done.as_ref().is_ok_and(|s| s.stage == HwStage::Ms);
                                 let (done, cached) = if mesh {
                                     let (compute, also) =
-                                        victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP, true);
+                                        victory_gpu::shader_cache::host_shader(container, MIN_LOD_CLAMP, true, false);
                                     (done.and(compute), cached && also)
                                 } else {
                                     (done, cached)
@@ -615,7 +615,7 @@ fn translate(
                         .map_or(0, u32::from_le_bytes) as usize;
                     let hash = blake3::hash(bytes.get(..size).unwrap_or(&bytes)).to_hex()[..16]
                         .to_owned();
-                    let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP, mesh_as_compute: false };
+                    let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP, mesh_as_compute: false, wave64_native: false };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;

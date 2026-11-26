@@ -594,6 +594,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         mesh_stride: 0,
         min_lod_clamp: false,
         mesh_compute: false,
+        wave64_native: false,
         view_marks: false,
     })
     .expect("lower");
