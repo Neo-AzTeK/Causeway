@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 /// References to numbered decisions still in comments. Lower it when one goes.
-pub const DECISION_REFS: usize = 36;
+pub const DECISION_REFS: usize = 35;
 
 /// What is wrong in `sources`, the repository's Rust files as (path, text),
 /// expecting `decision_refs` references to numbered decisions.

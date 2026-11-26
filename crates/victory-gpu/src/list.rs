@@ -1094,8 +1094,8 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
 /// same address; null on failure. The title's BVH builder puts
-/// its instance descriptions there (and wrote through our old
-/// `E_NOTIMPL` as a pointer).
+/// its instance descriptions there, and writes through whatever is returned
+/// as a pointer (so never an error code).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
@@ -1462,9 +1462,8 @@ fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Draws of the kinds the host does not run yet (indirect, mesh), and
-/// dispatches, counted per frame for the log.
-/// shortcut: dropped until their shaders translate (decision 0007).
+/// Without a host GPU API (builds other than Windows) draws and dispatches
+/// are only counted, per frame, for the log.
 #[cfg(not(windows))]
 extern "system" fn draw(_: This) {
     count_draw();
@@ -2193,7 +2192,7 @@ pub(crate) mod tests {
             S_OK
         );
         let buffer = crate::resource::test_buffer(64);
-        // Used to overflow `offset + count * 8` (panic in debug, wrap in release).
+        // `offset + count * 8` must not overflow (panic in debug, wrap in release).
         resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
