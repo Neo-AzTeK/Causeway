@@ -81,8 +81,12 @@ area failed; what a log does not show is "unknown".
 On a real GPU this can reset the display driver, so only one smoke run at a
 time starts on a machine, and none while another `victory.exe`, the testbed or
 any cargo test binary runs (it may be on the GPU; `victory census` and
-`victory translate` without `--pipelines` are not). `cargo xtask alone --
-<command>` holds the same lock around GPU tests. `--quiet` also refuses to start
+`victory translate` without `--pipelines` are not). A run or `cargo xtask alone --
+<command>` (which holds the same lock around GPU tests) that finds the lock held or
+a GPU process running waits, not refuses: it logs `waiting (N s so far): <holder>`
+at once and then every 60 s, and starts when both are free. It never ends or breaks
+the other. After 60 minutes it refuses, naming the holder, and a queued request
+records that in its `.done`. `--quiet` also refuses to start
 beside a compiler, a linker or such a scan: use it when timings matter. Each launched run
 is sampled every 5 s; `run.txt` and the digest header say `machine: quiet`,
 `NOT QUIET: ...` or `unknown` (by process name: other load is not seen).
@@ -131,9 +135,12 @@ is empty). The console goes to `<runs>\<name>.console.txt`. It then writes
 request, `exit = -1`, and the `requester`) beside the request: wait for that file, or
 pass `--wait`. There is one runner and it owns the order (oldest request first); never
 start a waiter per request. While the smoke lock is held (a run by hand) the head waits;
-a run that still stops at the lock goes back to the head (its request is untouched), and
-after 150 such tries (five minutes) it is given up on in its `.done`. `status` prints what runs (and for
-how long), then the queue in the order it runs, then the last finished.
+a run that still finds the lock held when it starts goes back to the head (its request is
+untouched), and after 150 such tries (five minutes) it is given up on in its `.done`. A
+run that starts waits for the lock and for GPU processes itself (see above), so a
+request is refused only after that wait's 60 minutes, with the holder in its `.done`.
+`status` prints what runs (and for how long), then the queue in the order it runs, then
+the last finished.
 
 The runner gets its own target directory (the command above), or a request for the
 worktree it was built from could not rebuild `xtask` while it runs. A compile
