@@ -209,15 +209,20 @@ impl GraphicsState {
         )
     }
 
-    /// The blend state the host takes. The title's states leave blending on
-    /// for integer targets, which D3D12 refuses on every adapter (the whole
-    /// pipeline, E_INVALIDARG); the console writes those unblended, so the
-    /// host turns it off for them.
-    fn host_blend(&self) -> D3D12_BLEND_DESC {
+    /// The blend state the host takes: no blending on a target whose format
+    /// it cannot blend (`blendable`), as integer formats everywhere and
+    /// B4G4R4A4 on some GPUs. A state asking for it gets the whole pipeline
+    /// refused (E_INVALIDARG) when the pixel shader writes that target.
+    /// shortcut: such a target is written unblended; a host copy in a format
+    /// that blends would keep the title's blending.
+    fn host_blend(&self, blendable: impl Fn(DXGI_FORMAT) -> bool) -> D3D12_BLEND_DESC {
         let mut blend = self.blend;
         let count = self.targets.NumRenderTargets.min(8) as usize;
-        let integer = |i: usize| i < count && crate::twin::integer(self.targets.RTFormats[i].0 as u32);
-        if !(0..count).any(integer) {
+        let unblendable = |i: usize| {
+            let format = self.targets.RTFormats[i];
+            i < count && format != DXGI_FORMAT_UNKNOWN && !blendable(format)
+        };
+        if !(0..count).any(unblendable) {
             return blend;
         }
         if !blend.IndependentBlendEnable.as_bool() {
@@ -231,7 +236,7 @@ impl GraphicsState {
             blend.IndependentBlendEnable = true.into();
         }
         for (i, target) in blend.RenderTarget.iter_mut().enumerate() {
-            if integer(i) {
+            if i < count && unblendable(i) {
                 target.BlendEnable = false.into();
             }
         }
@@ -810,7 +815,7 @@ impl HostPipeline {
                 pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
-            BlendState: g.host_blend(),
+            BlendState: g.host_blend(blendable(&host.device)),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -887,6 +892,15 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
     }
 }
 
+/// Whether `device` blends a render target of a format. With no answer the
+/// title's state is kept: creating the pipeline is then the test.
+fn blendable(device: &ID3D12Device) -> impl Fn(DXGI_FORMAT) -> bool {
+    |format| {
+        crate::caps::per_resource::format_support(device, format)
+            .is_none_or(|s| s.0 & D3D12_FORMAT_SUPPORT1_BLENDABLE.0 != 0)
+    }
+}
+
 /// A mesh pipeline from the title's graphics state: the pipeline-state
 /// stream form (no input layout).
 fn mesh_pipeline(
@@ -898,6 +912,7 @@ fn mesh_pipeline(
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
+    let d3d = device;
     /// A stream subobject: its type, then its description, pointer-aligned.
     #[repr(C, align(8))]
     struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
@@ -919,7 +934,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend(blendable(d3d))),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -1062,31 +1077,37 @@ mod tests {
         std::array::from_fn(|i| blend.RenderTarget[i].BlendEnable.as_bool())
     }
 
+    /// With fake format support: what blends, what does not, and a host
+    /// with every format blendable (the title's state is kept).
     #[test]
-    fn only_integer_targets_lose_blending() {
+    fn only_unblendable_targets_lose_blending() {
         let mut g = blending_with_an_integer_target();
-        assert_eq!(blending(&g.host_blend()), [true, true, false, false]);
+        let integer_only = |f| f != DXGI_FORMAT_R8_UINT;
+        let nor_4444 = |f| f != DXGI_FORMAT_R8_UINT && f != DXGI_FORMAT_B4G4R4A4_UNORM;
+        assert_eq!(blending(&g.host_blend(integer_only)), [true, true, false, false]);
+        assert_eq!(blending(&g.host_blend(nor_4444)), [true, false, false, false]);
+        assert_eq!(blending(&g.host_blend(|_| true)), [true, true, true, false]);
 
         // One entry for every target: written out so one can differ.
         g.blend.IndependentBlendEnable = false.into();
-        let host = g.host_blend();
+        let host = g.host_blend(integer_only);
         assert!(host.IndependentBlendEnable.as_bool());
         assert_eq!(blending(&host), [true, true, false, true]);
         assert_eq!(host.RenderTarget[1].BlendOp, D3D12_BLEND_OP_MAX);
 
         // Without blending that entry is left as it is (a logic op needs it).
         g.blend.RenderTarget[0].BlendEnable = false.into();
-        assert!(!g.host_blend().IndependentBlendEnable.as_bool());
+        assert!(!g.host_blend(integer_only).IndependentBlendEnable.as_bool());
 
         // No integer target in use: the title's state, unchanged.
         g.blend.RenderTarget[0].BlendEnable = true.into();
         g.targets.NumRenderTargets = 2;
-        assert!(!g.host_blend().IndependentBlendEnable.as_bool());
+        assert!(!g.host_blend(integer_only).IndependentBlendEnable.as_bool());
     }
 
-    /// D3D12 refuses blending on an integer target with E_INVALIDARG: a
-    /// title state that asks for it still makes its mesh and vertex
-    /// pipelines. On the adapter `host()` takes; the mesh half needs a mesh
+    /// The host refuses (E_INVALIDARG) blending on a target it cannot blend
+    /// that the pixel shader writes: a title state that asks for it still
+    /// makes its mesh and vertex pipelines. On the adapter `host()` takes; the mesh half needs a mesh
     /// tier.
     #[cfg(windows)]
     #[test]
@@ -1103,20 +1124,26 @@ mod tests {
                 .unwrap();
             s
         };
-        let ps = victory_shader::emit::host::stub_ps();
+        // It writes every target: one not written is accepted either way.
+        let ps = victory_shader::emit::HostShader {
+            dxil: victory_shader::emit::flat_pixel_shader(&[0, 1, 2]),
+            ..victory_shader::emit::host::stub_ps()
+        };
         let g = blending_with_an_integer_target();
 
         let vs = victory_shader::emit::host::stub_vs(&ps).unwrap();
         let shaders = [made("vertex", vs), made("pixel", ps.clone())];
-        assert!(HostPipeline::new(&shaders, Some(&g)).is_some(), "vertex pipeline");
+        let vertex = HostPipeline::new(&shaders, Some(&g)).is_some();
 
-        if !crate::caps::mesh_shaders(&host.caps) {
-            eprintln!("skipped: no mesh tier");
-            return;
-        }
-        let (_, ms) = crate::mesh::gpu_tests::program(false);
-        let shaders = [made("mesh", ms), made("pixel", ps)];
-        assert!(HostPipeline::new(&shaders, Some(&g)).is_some(), "mesh pipeline");
+        let mesh = if crate::caps::mesh_shaders(&host.caps) {
+            let (_, ms) = crate::mesh::gpu_tests::program(false);
+            let shaders = [made("mesh", ms), made("pixel", ps)];
+            HostPipeline::new(&shaders, Some(&g)).is_some()
+        } else {
+            eprintln!("mesh half skipped: no mesh tier");
+            true
+        };
+        assert_eq!((vertex, mesh), (true, true), "(vertex, mesh) pipelines made");
     }
 
     /// A pipeline is refused when its shader requires a wave size the host

@@ -282,7 +282,7 @@ pub(crate) fn uav(
 }
 
 /// Whether a format holds integers (`_UINT`, `_SINT`).
-pub(crate) fn integer(format: u32) -> bool {
+fn integer(format: u32) -> bool {
     matches!(format, 3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64)
 }
 
