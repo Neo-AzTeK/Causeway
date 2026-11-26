@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 
 use crate::machine::{self, Others};
@@ -265,8 +265,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     // script never accepts the title's terms unasked.
     let set_up = args.data_from.as_ref().or(args.data_dir.as_ref());
     check_terms(&keys, set_up.map(PathBuf::as_path), args.accept_terms)?;
-    // Held until the title ends: two runs can reset the display driver.
-    let _only = one_run(&lock_path())?;
+    // Held until the title ends: two runs can reset the display driver. Waits
+    // for the lock and for GPU processes to end, see `take_gpu`.
+    let _only = take_gpu(&lock_path(), &|| others(&[]), PATIENCE)?;
     // Before the build, which is long; again after it.
     may_start(&others(&[])?, args.quiet)?;
     create(&args.out)?;
@@ -285,8 +286,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         Some(path) => path.clone(),
         None => build(root)?,
     };
-    // Here, so that a refusal leaves --out empty, to be used again.
-    let at_start = others(&[])?;
+    // Here, so that a refusal leaves --out empty, to be used again. A GPU
+    // process that started during the build is waited for, not refused.
+    let at_start = wait_for_gpu(&|| others(&[]), PATIENCE)?;
     may_start(&at_start, args.quiet)?;
     let out = std::path::absolute(&args.out)?;
     let frames = out.join("frames");
@@ -460,17 +462,109 @@ fn lock_path() -> PathBuf {
     std::env::temp_dir().join("causeway-smoke.lock")
 }
 
-/// `cargo xtask alone`: runs a command that uses the GPU (tests) while no
-/// smoke run is on, and none can start.
-pub fn alone(command: &[OsString]) -> Result<()> {
-    run_alone(&lock_path(), &others(&[])?, command)
+/// How a run waits for the GPU or the lock: looks every `poll`, says why it
+/// waits at once and then every `every`, and refuses once `cap` has passed
+/// (zero: refuse at once).
+#[derive(Clone, Copy)]
+pub(crate) struct Patience {
+    pub poll: Duration,
+    pub every: Duration,
+    pub cap: Duration,
 }
 
-fn run_alone(lock: &Path, others: &Others, command: &[OsString]) -> Result<()> {
+/// The wait of a smoke run and of `alone`. A run is minutes long, so an hour
+/// of waiting is a holder that has hung, not a busy machine.
+// shortcut: one cap for every waiter; a caller that needs another passes its own.
+pub(crate) const PATIENCE: Patience = Patience {
+    poll: Duration::from_secs(2),
+    every: Duration::from_secs(60),
+    cap: Duration::from_secs(60 * 60),
+};
+
+/// Waits until no GPU process runs, and returns the look that found none. A
+/// test binary or a title is waited for, never ended.
+pub(crate) fn wait_for_gpu(
+    snapshot: &dyn Fn() -> Result<Others>,
+    patience: Patience,
+) -> Result<Others> {
+    let start = Instant::now();
+    let mut said = None;
+    loop {
+        let found = snapshot()?;
+        if found.gpu.is_empty() {
+            return Ok(found);
+        }
+        let why = format!("the GPU is in use: {}", listed(&found.gpu));
+        wait_turn(start, &mut said, &why, patience)?;
+    }
+}
+
+/// Takes the lock once no GPU process runs. A GPU process that starts as the
+/// lock is taken lets go and waits again, so no run holds the lock while
+/// waiting on a process that may need it. Keeps the request: refuses only
+/// once `patience.cap` has passed, naming what it waited for. The lock is
+/// never broken.
+fn take_gpu(
+    lock: &Path,
+    snapshot: &dyn Fn() -> Result<Others>,
+    patience: Patience,
+) -> Result<File> {
+    let start = Instant::now();
+    let mut said = None;
+    loop {
+        let found = snapshot()?;
+        let why = if !found.gpu.is_empty() {
+            format!("the GPU is in use: {}", listed(&found.gpu))
+        } else {
+            match one_run(lock) {
+                Ok(file) => {
+                    if snapshot()?.gpu.is_empty() {
+                        return Ok(file);
+                    }
+                    drop(file);
+                    "the GPU came into use as the lock was taken".to_owned()
+                }
+                Err(_) => "a smoke run or `xtask alone` holds the lock".to_owned(),
+            }
+        };
+        wait_turn(start, &mut said, &why, patience)?;
+    }
+}
+
+/// One turn of a wait: refuses past the cap, says why when due, then looks again later.
+fn wait_turn(
+    start: Instant,
+    said: &mut Option<Instant>,
+    why: &str,
+    patience: Patience,
+) -> Result<()> {
+    let waited = start.elapsed();
+    if waited >= patience.cap {
+        bail!("waited {} s and refused: {why}", waited.as_secs());
+    }
+    if said.is_none_or(|at| at.elapsed() >= patience.every) {
+        println!("waiting ({} s so far): {why}", waited.as_secs());
+        *said = Some(Instant::now());
+    }
+    std::thread::sleep(patience.poll);
+    Ok(())
+}
+
+/// `cargo xtask alone`: runs a command that uses the GPU (tests) while no
+/// smoke run is on, and none can start. Waits for both, see `take_gpu`.
+pub fn alone(command: &[OsString]) -> Result<()> {
+    run_alone(&lock_path(), &|| others(&[]), PATIENCE, command)
+}
+
+fn run_alone(
+    lock: &Path,
+    snapshot: &dyn Fn() -> Result<Others>,
+    patience: Patience,
+    command: &[OsString],
+) -> Result<()> {
     // invariant(a_command_run_alone_and_a_smoke_run_exclude_each_other): the
     // lock a smoke run takes, held until the command ends.
-    let _only = one_run(lock)?;
-    may_start(others, false)?;
+    let _only = take_gpu(lock, snapshot, patience)?;
     let (program, args) = command.split_first().context("no command")?;
     // Ended with this process, so that nothing runs on without the lock.
     let group = Group::new()?;
@@ -985,21 +1079,22 @@ mod tests {
     fn a_command_run_alone_and_a_smoke_run_exclude_each_other() {
         let path = std::env::temp_dir().join(format!("causeway-alone-test-{}", std::process::id()));
         let shell = |script: &str| ["cmd", "/d", "/c", script].map(OsString::from);
-        let idle = Others::default();
         let smoke = one_run(&path).unwrap();
-        assert!(run_alone(&path, &idle, &shell("exit 0")).is_err());
+        assert!(run_alone(&path, &no_gpu, REFUSE_NOW, &shell("exit 0")).is_err());
         drop(smoke);
-        run_alone(&path, &idle, &shell("exit 0")).unwrap();
-        assert!(run_alone(&path, &idle, &shell("exit 3")).is_err());
+        run_alone(&path, &no_gpu, REFUSE_NOW, &shell("exit 0")).unwrap();
+        assert!(run_alone(&path, &no_gpu, REFUSE_NOW, &shell("exit 3")).is_err());
 
         // While the command runs, the lock a smoke run takes is not free. The
         // command says it runs, so that trying the lock cannot take it first.
         let started = path.with_extension("started");
         let _ = std::fs::remove_file(&started);
         let busy = path.clone();
-        let script = format!("echo x>{}& ping -n 4 127.0.0.1 >nul", started.display());
+        // Only its running time matters: `ping` exits 1 on machines that do not
+        // answer loopback, so the script says its own exit code.
+        let script = format!("echo x>{}& ping -n 4 127.0.0.1 >nul & exit 0", started.display());
         let command = ["cmd", "/d", "/c", &script].map(OsString::from);
-        let running = std::thread::spawn(move || run_alone(&busy, &Others::default(), &command));
+        let running = std::thread::spawn(move || run_alone(&busy, &no_gpu, REFUSE_NOW, &command));
         let start = Instant::now();
         while !started.exists() {
             assert!(start.elapsed() < Duration::from_secs(30), "the command never ran");
@@ -1010,6 +1105,74 @@ mod tests {
         std::fs::remove_file(started).unwrap();
         drop(one_run(&path).unwrap());
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// A look that finds no GPU process.
+    fn no_gpu() -> Result<Others> {
+        Ok(Others::default())
+    }
+
+    /// Refuses at its first wait: for tests that must not wait.
+    const REFUSE_NOW: Patience = Patience {
+        poll: Duration::from_millis(10),
+        every: Duration::from_secs(60),
+        cap: Duration::ZERO,
+    };
+
+    #[test]
+    #[cfg(windows)]
+    fn a_held_lock_is_waited_for_then_taken() {
+        let path = std::env::temp_dir().join(format!("causeway-wait-test-{}", std::process::id()));
+        let held = one_run(&path).unwrap();
+        let patient = Patience {
+            poll: Duration::from_millis(10),
+            every: Duration::from_millis(50),
+            cap: Duration::from_secs(30),
+        };
+        let waiting = path.clone();
+        let taker = std::thread::spawn(move || take_gpu(&waiting, &no_gpu, patient).map(|_| ()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!taker.is_finished(), "the request was refused, not kept");
+        drop(held);
+        taker.join().unwrap().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_held_lock_past_the_cap_is_refused_naming_the_holder() {
+        let path = std::env::temp_dir().join(format!("causeway-cap-test-{}", std::process::id()));
+        let held = one_run(&path).unwrap();
+        let short = Patience {
+            poll: Duration::from_millis(10),
+            every: Duration::from_secs(60),
+            cap: Duration::from_millis(50),
+        };
+        let err = take_gpu(&path, &no_gpu, short).err().unwrap().to_string();
+        assert!(err.contains("holds the lock") && err.contains("refused"), "{err}");
+        drop(held);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_gpu_in_use_is_waited_for_until_it_ends() {
+        let looks = std::cell::Cell::new(0);
+        let busy_then_quiet = || -> Result<Others> {
+            looks.set(looks.get() + 1);
+            let gpu = if looks.get() <= 3 {
+                BTreeSet::from(["victory_shader.exe".to_owned()])
+            } else {
+                BTreeSet::new()
+            };
+            Ok(Others { gpu, busy: BTreeSet::new() })
+        };
+        let patient = Patience {
+            poll: Duration::from_millis(1),
+            every: Duration::from_secs(60),
+            cap: Duration::from_secs(30),
+        };
+        wait_for_gpu(&busy_then_quiet, patient).unwrap();
+        assert_eq!(looks.get(), 4);
     }
 
     #[test]
