@@ -235,6 +235,8 @@ pub struct Log {
 #[derive(Default)]
 struct DropBlock {
     world: bool,
+    /// When the frame-rate line it follows was logged (Unix time).
+    at: Option<f64>,
     why: Vec<(String, f64)>,
 }
 
@@ -303,30 +305,38 @@ impl Log {
         }
     }
 
-    /// When each world line was logged (Unix time), and from where on they
-    /// are steady.
-    fn world_times(&self) -> (Vec<f64>, usize) {
-        let times: Vec<f64> = self.world().filter_map(|r| unix_time(&r.time)).collect();
-        let steady = times.first().map_or(0, |first| {
-            times.iter().position(|at| at - first >= WARM_UP).unwrap_or(times.len())
-        });
-        (times, steady)
+    /// When the first world line was logged (Unix time).
+    pub fn world_start(&self) -> Option<f64> {
+        self.world().find_map(|r| unix_time(&r.time))
+    }
+
+    /// Whether a line logged `at` is past the world's warm-up.
+    fn is_steady(&self, at: Option<f64>) -> bool {
+        self.world_start().zip(at).is_some_and(|(start, at)| at - start >= WARM_UP)
+    }
+
+    /// When each steady world line was logged.
+    fn steady_times(&self) -> Vec<f64> {
+        let times = self.world().filter_map(|r| unix_time(&r.time));
+        let Some(start) = self.world_start() else { return Vec::new() };
+        times.filter(|at| at - start >= WARM_UP).collect()
     }
 
     /// World lines logged `WARM_UP` seconds or more after the first one.
     pub fn steady_lines(&self) -> usize {
-        let (times, steady) = self.world_times();
-        times.len() - steady
+        self.steady_times().len()
     }
 
     /// The Unix times a run's numbers are measured over: its steady lines, or
     /// all its world lines when fewer than `WORLD_LINES` are steady. `None`:
     /// no world line.
     pub fn measured_window(&self) -> Option<(f64, f64)> {
-        let (times, steady) = self.world_times();
-        let from = if times.len() - steady >= WORLD_LINES { steady } else { 0 };
+        let mut times = self.steady_times();
+        if times.len() < WORLD_LINES {
+            times = self.world().filter_map(|r| unix_time(&r.time)).collect();
+        }
         // A line measures the seconds before it.
-        Some((times.get(from)? - LINE_SPAN, *times.last()?))
+        Some((times.first()? - LINE_SPAN, *times.last()?))
     }
 
     /// Whether the run logged the steady world lines it was asked for.
@@ -414,7 +424,8 @@ impl Log {
         if let Some(causes) = Self::causes(line) {
             self.causes.push(causes);
             let world = self.rates.last().is_some_and(|r| r.asked() >= WORLD_DRAWS && !r.removed);
-            self.blocks.push(DropBlock { world, why: Vec::new() });
+            let at = self.rates.last().and_then(|r| unix_time(&r.time));
+            self.blocks.push(DropBlock { world, at, why: Vec::new() });
         }
         if let Some((_, why)) = line.split_once("/frame without a host pipeline: ")
             && let Some(n) = before(line, "/frame without a host pipeline: ")

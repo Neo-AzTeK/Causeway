@@ -296,8 +296,9 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
     let look = |title: Option<u64>| {
         let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64());
         if let (Ok(at), Some(now), Some(title)) = (at, load::system_times(), title)
-            && let Some(sample) = meter.sample(at, now, title)
+            && let Some(mut sample) = meter.sample(at, now, title)
         {
+            sample.compilers = load::compilers_running();
             // A look that cannot be written is one less.
             let _ = record.write_all(load::Record::line(sample).as_bytes());
         }
@@ -421,21 +422,48 @@ fn executable(messages: &str) -> Option<PathBuf> {
 /// How often a running title's log is read.
 const LOOK: Duration = Duration::from_secs(2);
 
-/// Follows the growing log for `--world-lines`.
-struct Watch {
+/// A log read as it grows.
+pub(crate) struct Follow {
     log_file: PathBuf,
     /// Bytes read, and the last line while it is not whole.
-    read: u64,
+    at: u64,
     rest: Vec<u8>,
     log: Log,
+}
+
+impl Follow {
+    pub(crate) fn new(log_file: &Path) -> Follow {
+        Follow { log_file: log_file.to_owned(), at: 0, rest: Vec::new(), log: Log::default() }
+    }
+
+    /// The log's whole lines so far; what cannot be read yet is not in it.
+    pub(crate) fn read(&mut self) -> &Log {
+        let mut new = Vec::new();
+        if let Ok(mut file) = File::open(&self.log_file)
+            && file.seek(SeekFrom::Start(self.at)).is_ok()
+            && file.read_to_end(&mut new).is_ok()
+        {
+            self.at += new.len() as u64;
+            self.rest.append(&mut new);
+        }
+        if let Some(end) = self.rest.iter().rposition(|&b| b == b'\n') {
+            let whole: Vec<u8> = self.rest.drain(..=end).collect();
+            self.log.feed(&String::from_utf8_lossy(&whole));
+        }
+        &self.log
+    }
+}
+
+/// Follows the growing log for `--world-lines`.
+struct Watch {
+    log: Follow,
     asked: usize,
     reached: bool,
 }
 
 impl Watch {
     fn new(log_file: &Path, asked: usize) -> Watch {
-        let (rest, log) = (Vec::new(), Log::default());
-        Watch { log_file: log_file.to_owned(), read: 0, rest, log, asked, reached: false }
+        Watch { log: Follow::new(log_file), asked, reached: false }
     }
 
     /// Whether the lines asked for were there at the look before this one: the
@@ -443,19 +471,8 @@ impl Watch {
     /// (its drops, by cause and reason) is in the log. A log that cannot be
     /// read is never enough: the run goes to its cap.
     fn enough(&mut self) -> bool {
-        let mut new = Vec::new();
-        if let Ok(mut file) = File::open(&self.log_file)
-            && file.seek(SeekFrom::Start(self.read)).is_ok()
-            && file.read_to_end(&mut new).is_ok()
-        {
-            self.read += new.len() as u64;
-            self.rest.append(&mut new);
-        }
-        if let Some(end) = self.rest.iter().rposition(|&b| b == b'\n') {
-            let whole: Vec<u8> = self.rest.drain(..=end).collect();
-            self.log.feed(&String::from_utf8_lossy(&whole));
-        }
-        std::mem::replace(&mut self.reached, self.log.steady_lines() >= self.asked)
+        let steady = self.log.read().steady_lines();
+        std::mem::replace(&mut self.reached, steady >= self.asked)
     }
 }
 
@@ -809,7 +826,7 @@ mod tests {
         append(tail);
         assert!(!watch.enough(), "the look that sees it: what follows it may not be there");
         assert!(watch.enough());
-        assert_eq!(watch.log.steady_lines(), 2);
+        assert_eq!(watch.log.read().steady_lines(), 2);
         std::fs::remove_file(&path).unwrap();
     }
 

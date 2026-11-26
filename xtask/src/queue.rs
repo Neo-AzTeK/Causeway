@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Subcommand};
 
+use crate::report::WARM_UP;
 use crate::smoke;
 
 const DEFAULT_QUEUE: &str = r"E:\Causeway-tools\queue";
@@ -590,7 +591,11 @@ fn serve(root: &Path, dirs: &Dirs, args: &RunArgs) -> Result<()> {
                 ensure!(request.name == name, "the request names {}, its file {name}", request.name);
                 request.check(root, dirs)?;
                 println!("runner: start {name} ({})", length(&request));
-                launch(dirs, &request, &args.exe, || builder.tick(root, dirs, &request.worktree))
+                let mut window = Window::new(dirs.runs.join(&request.name).join("log.txt"));
+                launch(dirs, &request, &args.exe, || {
+                    let open = window.open(unix_now() as f64);
+                    builder.tick(root, dirs, &request.worktree, open);
+                })
             });
         match outcome {
             Ok(Ran::Exit(code)) => {
@@ -641,31 +646,77 @@ fn length(request: &Request) -> String {
     }
 }
 
-/// Builds what the next run will need while the current one plays, so that no
-/// build sits between two runs. The run being played measures CPU time, so
-/// this runs below normal priority, on half the cores.
-// shortcut: it still shares cores, memory and disk with the title; a cold
-// build can reach into the steady lines. An incremental one ends during boot.
+/// How long before the first steady line a build ahead must be gone: that line
+/// measures the seconds before it, and the runner looks only every `POLL`.
+const BUILD_MARGIN: f64 = 15.0;
+
+/// Whether a build may run beside the title playing: from its start (its log
+/// is there; before, the run waits for a quiet machine) until shortly before
+/// its first line that will be steady. No build is measured.
+fn build_window(started: bool, world_start: Option<f64>, now: f64) -> bool {
+    started && world_start.is_none_or(|at| now < at + WARM_UP - BUILD_MARGIN)
+}
+
+/// `build_window` of the run playing, from its log.
+struct Window {
+    log_file: PathBuf,
+    log: smoke::Follow,
+    /// Once shut it stays shut, and the log is left alone.
+    shut: bool,
+}
+
+impl Window {
+    fn new(log_file: PathBuf) -> Window {
+        Window { log: smoke::Follow::new(&log_file), log_file, shut: false }
+    }
+
+    fn open(&mut self, now: f64) -> bool {
+        if self.shut || !self.log_file.is_file() {
+            return false;
+        }
+        self.shut = !build_window(true, self.log.read().world_start(), now);
+        !self.shut
+    }
+}
+
+/// Builds what the next run will need while the current one boots and warms
+/// up, so that no build sits between two runs. What has not ended when the
+/// lines to be measured come is ended, and taken up again after the run. It
+/// runs below normal priority, on half the cores.
 #[derive(Default)]
 struct Builder {
     running: Option<Build>,
+    /// A build ended to keep it out of a measure.
+    paused: Option<Pending>,
     /// Requests built for already, whether or not the build worked.
     tried: HashSet<String>,
 }
 
-/// The build under way and the steps after it.
-struct Build {
+/// A build for a request, and the steps it has left.
+struct Pending {
     name: String,
     log: PathBuf,
+    steps: VecDeque<Command>,
+}
+
+/// The step under way: its processes are one job, to end them together.
+struct Build {
+    job: smoke::Group,
     child: Child,
-    after: VecDeque<Command>,
+    step: Command,
+    pending: Pending,
 }
 
 impl Builder {
-    /// Moves the build on, or starts the one the next run needs.
-    fn tick(&mut self, root: &Path, dirs: &Dirs, playing: &Path) {
+    /// Moves the build on, or starts the one the next run needs, while `open`;
+    /// else ends what runs.
+    fn tick(&mut self, root: &Path, dirs: &Dirs, playing: &Path, open: bool) {
+        if !open {
+            self.pause();
+            return;
+        }
         self.advance();
-        if self.running.is_some() {
+        if self.running.is_some() || self.paused.is_some() {
             return;
         }
         let Some(request) = next_build(dirs, playing, &self.tried) else { return };
@@ -679,24 +730,29 @@ impl Builder {
         let steps = [&["build", "--locked", "-p", "xtask"][..], smoke::DIAG_BUILD];
         let steps = steps.map(|step| build_command(&request.worktree, step)).into();
         println!("runner: building ahead for {}", request.name);
-        self.start(request.name, log, steps);
+        self.start(Pending { name: request.name, log, steps });
     }
 
-    /// Starts the first of `steps`, its output added to `log`. A step that
-    /// cannot start ends the build: the run builds for itself.
-    fn start(&mut self, name: String, log: PathBuf, mut steps: VecDeque<Command>) {
-        let Some(mut command) = steps.pop_front() else { return };
-        let spawned = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-            .and_then(|out| {
-                command.stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
-                command.spawn()
-            });
+    /// Starts the next step, its output added to the log. A step that cannot
+    /// start ends the build: the run builds for itself.
+    fn start(&mut self, mut pending: Pending) {
+        let Some(mut step) = pending.steps.pop_front() else { return };
+        let spawned = (|| -> Result<(smoke::Group, Child)> {
+            let out = fs::OpenOptions::new().create(true).append(true).open(&pending.log)?;
+            step.stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
+            let job = smoke::Group::new()?;
+            let mut child = step.spawn()?;
+            // A step outside its job could not be ended in time.
+            if let Err(e) = job.add(&child) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+            Ok((job, child))
+        })();
         match spawned {
-            Ok(child) => self.running = Some(Build { name, log, child, after: steps }),
-            Err(e) => println!("runner: the build for {name} did not start: {e}"),
+            Ok((job, child)) => self.running = Some(Build { job, child, step, pending }),
+            Err(e) => println!("runner: the build for {} did not start: {e:#}", pending.name),
         }
     }
 
@@ -708,20 +764,38 @@ impl Builder {
             Ok(Some(status)) => status.success(),
             Err(_) => false,
         };
-        let Some(Build { name, log, after, .. }) = self.running.take() else { return };
+        let Some(Build { pending, .. }) = self.running.take() else { return };
         if !status {
-            println!("runner: the build ahead for {name} failed: {}", log.display());
-        } else if after.is_empty() {
-            println!("runner: built ahead for {name}");
+            let log = pending.log.display();
+            println!("runner: the build ahead for {} failed: {log}", pending.name);
+        } else if pending.steps.is_empty() {
+            println!("runner: built ahead for {}", pending.name);
         } else {
-            self.start(name, log, after);
+            self.start(pending);
         }
     }
 
-    /// Waits for what is being built.
+    /// Ends the step under way, to run it again later (cargo keeps the crates
+    /// it finished). One that has already ended counts as done.
+    fn pause(&mut self) {
+        self.advance();
+        let Some(Build { job, mut child, step, mut pending }) = self.running.take() else { return };
+        if let Err(e) = job.kill(&mut child) {
+            println!("runner: cannot end the build for {}: {e:#}", pending.name);
+        }
+        let _ = child.wait();
+        println!("runner: the build for {} waits for the run to end", pending.name);
+        pending.steps.push_front(step);
+        self.paused = Some(pending);
+    }
+
+    /// Takes up what was paused, and waits for what is being built.
     fn finish(&mut self) {
+        if let Some(pending) = self.paused.take() {
+            self.start(pending);
+        }
         if let Some(build) = &self.running {
-            println!("runner: waiting for the build for {} to end", build.name);
+            println!("runner: waiting for the build for {} to end", build.pending.name);
         }
         while let Some(build) = &mut self.running {
             let _ = build.child.wait();
@@ -1106,12 +1180,77 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
         let log = dirs.queue.join("x.build.txt");
         let mut builder = Builder::default();
         let steps = [step("echo one"), step("echo two & exit 1"), step("echo three")];
-        builder.start("x".into(), log.clone(), steps.into_iter().collect());
+        let steps = steps.into_iter().collect();
+        builder.start(Pending { name: "x".into(), log: log.clone(), steps });
         builder.finish();
         assert!(builder.running.is_none());
         let said = fs::read_to_string(&log).unwrap();
         assert!(said.contains("one") && said.contains("two"), "{said}");
         assert!(!said.contains("three"), "{said}");
+        fs::remove_dir_all(&dirs.queue).unwrap();
+    }
+
+    #[test]
+    fn a_build_runs_only_before_the_lines_measured() {
+        // The title not started: the run is waiting for a quiet machine.
+        assert!(!build_window(false, None, 0.0));
+        // Booting, then warming up.
+        assert!(build_window(true, None, 1000.0));
+        assert!(build_window(true, Some(1000.0), 1000.0 + WARM_UP - BUILD_MARGIN - 1.0));
+        // Gone before the first steady line starts to be measured.
+        assert!(!build_window(true, Some(1000.0), 1000.0 + WARM_UP - BUILD_MARGIN));
+        assert!(BUILD_MARGIN > 5.0 + POLL.as_secs_f64());
+    }
+
+    #[test]
+    fn a_window_follows_the_runs_log_and_stays_shut() {
+        let dirs = scratch("window");
+        let log = dirs.queue.join("log.txt");
+        let mut window = Window::new(log.clone());
+        let then = 1_767_225_600.0; // 2026-01-01T00:00:00Z
+        assert!(!window.open(then), "no log: not started");
+        fs::write(&log, "booting\n").unwrap();
+        assert!(window.open(then + 100.0));
+        let world = "2026-01-01T00:00:00Z  INFO victory_gpu::host: 1.0 fps, 1000.0 ms/frame (1.0 \
+                     preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; 2.0 on the GPU; 0.1 \
+                     copying back 0.0 MB), 900 draws/frame, dropped 0 without a host pipeline (0 \
+                     being made) and 0 indirect\n";
+        fs::write(&log, format!("booting\n{world}")).unwrap();
+        assert!(window.open(then + 10.0));
+        assert!(!window.open(then + WARM_UP));
+        assert!(!window.open(then), "shut for good");
+        fs::remove_dir_all(&dirs.queue).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_paused_build_ends_at_once_and_is_taken_up_again() {
+        let dirs = scratch("pause");
+        let marker = dirs.queue.join("ran.txt");
+        // Says it started, then takes about three seconds, in a child.
+        let mut step = Command::new("cmd");
+        step.args(["/d", "/c", "echo started& ping -n 4 127.0.0.1 >nul& echo ended"]);
+        let log = marker.clone();
+        let mut builder = Builder::default();
+        let steps = VecDeque::from([step]);
+        builder.start(Pending { name: "x".into(), log, steps });
+        let said = || fs::read_to_string(&marker).unwrap_or_default();
+        let wait = std::time::Instant::now();
+        while !said().contains("started") {
+            assert!(wait.elapsed() < Duration::from_secs(20), "the step never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        builder.pause();
+        assert!(builder.running.is_none() && builder.paused.is_some());
+        // While paused, nothing new is started and nothing runs on.
+        builder.tick(Path::new("."), &dirs, Path::new("."), true);
+        assert!(builder.running.is_none());
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(!said().contains("ended"), "the build went on: {}", said());
+        builder.finish();
+        assert!(builder.paused.is_none() && builder.running.is_none());
+        assert_eq!(said().matches("started").count(), 2, "{}", said());
+        assert_eq!(said().matches("ended").count(), 1, "{}", said());
         fs::remove_dir_all(&dirs.queue).unwrap();
     }
 

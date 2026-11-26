@@ -60,7 +60,7 @@ pub fn system_times() -> Option<Times> {
 
 /// How many compiler and linker processes run.
 #[cfg(windows)]
-fn compilers_running() -> usize {
+pub fn compilers_running() -> usize {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
@@ -91,7 +91,7 @@ fn compilers_running() -> usize {
 }
 
 #[cfg(not(windows))]
-fn compilers_running() -> usize {
+pub fn compilers_running() -> usize {
     0
 }
 
@@ -107,6 +107,8 @@ pub struct Sample {
     pub at: f64,
     pub total: f64,
     pub other: f64,
+    /// Compiler and linker processes running at the look.
+    pub compilers: usize,
 }
 
 /// Turns successive counters into samples.
@@ -124,7 +126,7 @@ impl Meter {
         let busy = now.busy.saturating_sub(before.busy);
         let other = busy.saturating_sub(title.saturating_sub(titled));
         let percent = |part: u64| (part as f64 * 100.0 / all as f64).min(100.0);
-        Some(Sample { at, total: percent(busy), other: percent(other) })
+        Some(Sample { at, total: percent(busy), other: percent(other), compilers: 0 })
     }
 }
 
@@ -195,7 +197,7 @@ impl Record {
     }
 
     pub fn line(s: Sample) -> String {
-        format!("look {:.1} {:.1} {:.1}\n", s.at, s.total, s.other)
+        format!("look {:.1} {:.1} {:.1} {}\n", s.at, s.total, s.other, s.compilers)
     }
 
     pub fn parse(text: &str) -> Record {
@@ -204,7 +206,9 @@ impl Record {
         let wait = seconds.map(|seconds| Wait { seconds, quiet: get("quiet ") == Some("yes") });
         let samples = text.lines().filter_map(|l| {
             let mut fields = l.strip_prefix("look ")?.split(' ').map(|v| v.parse::<f64>().ok());
-            Some(Sample { at: fields.next()??, total: fields.next()??, other: fields.next()?? })
+            let (at, total, other) = (fields.next()??, fields.next()??, fields.next()??);
+            // A line without its count was cut short.
+            Some(Sample { at, total, other, compilers: fields.next()?? as usize })
         });
         Record { wait, samples: samples.collect() }
     }
@@ -231,6 +235,7 @@ impl Record {
                 other: mean(|s| s.other),
                 peak: inside.iter().map(|s| s.other).fold(0.0, f64::max),
                 over: inside.iter().filter(|s| s.other > BUSY_OTHER).count(),
+                building: inside.iter().filter(|s| s.compilers > 0).count(),
             }
         })
     }
@@ -244,6 +249,14 @@ impl Record {
             None => "did not wait for a quiet machine".into(),
         };
         let over = if window.is_some() { "the lines measured" } else { "the run" };
+        // A build elsewhere in the run is not measured, but is said.
+        let around = self.samples.iter().filter(|s| {
+            s.compilers > 0 && window.is_some_and(|(from, to)| s.at < from || s.at > to)
+        });
+        let waited = match around.count() {
+            0 => waited,
+            n => format!("{waited}; a build ran during {n} looks outside them"),
+        };
         let (status, detail) = match self.summary(window) {
             None => (Status::Unknown, format!("{waited}; no look at the load during {over}")),
             Some(s) if s.busy() => {
@@ -263,8 +276,9 @@ pub struct Summary {
     total: f64,
     other: f64,
     peak: f64,
-    /// Looks over `BUSY_OTHER`.
+    /// Looks over `BUSY_OTHER`, and looks that found a build going on.
     over: usize,
+    building: usize,
 }
 
 impl Summary {
@@ -279,6 +293,10 @@ impl Summary {
             " (peak {:.0}%, {} of {} looks over {BUSY_OTHER:.0}%), {:.0}% in all",
             self.peak, self.over, self.looks, self.total
         );
+        let _ = match self.building {
+            0 => write!(text, ", no build overlapped"),
+            n => write!(text, ", a build overlapped {n} looks"),
+        };
         text
     }
 }
@@ -329,7 +347,7 @@ mod tests {
         assert_eq!(meter.sample(1.0, Times { busy: 100, all: 1000 }, 50), None);
         // 800 of 1000 busy, 700 of them the title's.
         let s = meter.sample(3.0, Times { busy: 900, all: 2000 }, 750).unwrap();
-        assert_eq!(s, Sample { at: 3.0, total: 80.0, other: 10.0 });
+        assert_eq!(s, Sample { at: 3.0, total: 80.0, other: 10.0, compilers: 0 });
         // Counters read at different moments may put the title above the whole.
         let s = meter.sample(5.0, Times { busy: 1000, all: 3000 }, 900).unwrap();
         assert_eq!(s.other, 0.0);
@@ -340,7 +358,12 @@ mod tests {
         let samples = others
             .iter()
             .enumerate()
-            .map(|(i, &other)| Sample { at: 100.0 + i as f64 * 2.0, total: other + 40.0, other })
+            .map(|(i, &other)| Sample {
+                at: 100.0 + i as f64 * 2.0,
+                total: other + 40.0,
+                other,
+                compilers: 0,
+            })
             .collect();
         Record { wait: Some(Wait { seconds: 22, quiet: true }), samples }
     }
@@ -363,8 +386,22 @@ mod tests {
     }
 
     #[test]
+    fn a_build_that_overlapped_is_recorded() {
+        let mut builds = record(&[5.0; 6]);
+        builds.samples[0].compilers = 2;
+        let window = Some((104.0, 110.0));
+        let clean = builds.area(window);
+        assert!(clean.detail.contains("no build overlapped"), "{}", clean.detail);
+        assert!(clean.detail.contains("a build ran during 1 looks outside them"), "{}", clean.detail);
+        builds.samples[3].compilers = 1;
+        let hit = builds.area(window);
+        assert!(hit.detail.contains("a build overlapped 1 looks"), "{}", hit.detail);
+    }
+
+    #[test]
     fn a_record_is_read_back_from_its_file() {
-        let written = record(&[1.5, 25.0]);
+        let mut written = record(&[1.5, 25.0]);
+        written.samples[1].compilers = 3;
         let mut text = Record::header(written.wait);
         for s in &written.samples {
             text += &Record::line(*s);
@@ -391,5 +428,8 @@ mod tests {
         let then = system_times().unwrap();
         assert!(then.all > first.all && then.busy <= then.all);
         compilers_running();
+        // A cap shorter than the quiet it wants ends the wait.
+        let wait = wait_quiet(Duration::from_secs(1), Duration::from_millis(100)).unwrap();
+        assert!(!wait.quiet, "{wait:?}");
     }
 }

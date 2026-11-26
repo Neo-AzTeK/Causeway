@@ -94,6 +94,7 @@ impl Loaded {
         }
     }
 
+    /// Steady world lines: what is judged.
     fn lines(&self) -> usize {
         self.series.speed.first().map_or(0, |(_, v)| v.len())
     }
@@ -180,6 +181,8 @@ enum Verdict {
     /// The run has no value where the baseline has one: it fails too.
     Missing,
     NoData,
+    /// Shown, not judged.
+    Info,
 }
 
 impl Verdict {
@@ -192,6 +195,7 @@ impl Verdict {
             Verdict::Short => "FAIL: run too short",
             Verdict::Missing => "FAIL: missing in run",
             Verdict::NoData => "n/a",
+            Verdict::Info => "info only",
         }
     }
 }
@@ -210,6 +214,8 @@ enum Judge {
     /// Whether the world was reached: not reaching it, when the baseline did,
     /// is a regression.
     Reached,
+    /// Shown, not judged.
+    Info,
 }
 
 struct Row {
@@ -221,6 +227,9 @@ struct Row {
 }
 
 fn verdict(judge: Judge, higher_is_better: bool, run: &Dist, base: &Dist) -> Verdict {
+    if let Judge::Info = judge {
+        return Verdict::Info;
+    }
     if let Judge::Reached = judge {
         let reached = |d: &Dist| d.median > 0.0;
         return match (reached(run), reached(base)) {
@@ -248,7 +257,7 @@ fn verdict(judge: Judge, higher_is_better: bool, run: &Dist, base: &Dist) -> Ver
             run.iqr().max(base.iqr()).max(rel * base.median.abs()).max(abs)
         }
         Judge::Share { rel } => rel * base.median.abs(),
-        Judge::Count | Judge::Reached => 0.0,
+        Judge::Count | Judge::Reached | Judge::Info => 0.0,
     };
     if worse > noise {
         Verdict::Regression
@@ -263,7 +272,7 @@ fn verdict(judge: Judge, higher_is_better: bool, run: &Dist, base: &Dist) -> Ver
 /// others say. A regression against `any` baseline is one (else against every
 /// baseline that judged it); an improvement is one only against every one.
 fn combine(verdicts: &[Verdict], any: bool) -> Verdict {
-    for v in [Verdict::Missing, Verdict::Short] {
+    for v in [Verdict::Info, Verdict::Missing, Verdict::Short] {
         if verdicts.contains(&v) {
             return v;
         }
@@ -334,6 +343,8 @@ fn rows(run: &Loaded, bases: &[Loaded]) -> Vec<Row> {
         Dist::scalar(l.metric("detail_pct"))
     });
     push("world_lines", true, Judge::Reached, &|l| Dist::scalar(l.metric("world_lines")));
+    // The warm-up is not judged; its frame rates are shown.
+    push("warm_up_fps", true, Judge::Info, &|l| Dist::of(&l.series.warm_up_fps));
     out
 }
 
@@ -381,10 +392,10 @@ fn busy_reason(run: &Loaded, bases: &[Loaded]) -> Option<String> {
 fn too_short(run: &Loaded, bases: &[Loaded]) -> Vec<String> {
     let mut out = Vec::new();
     if run.lines() < MIN_LINES {
-        out.push(format!("the run has {} world lines (needs {MIN_LINES})", run.lines()));
+        out.push(format!("the run has {} steady world lines (needs {MIN_LINES})", run.lines()));
     }
     if bases.iter().all(|b| b.lines() < MIN_LINES) {
-        out.push(format!("no baseline has {MIN_LINES} world lines"));
+        out.push(format!("no baseline has {MIN_LINES} steady world lines"));
     }
     out
 }
@@ -396,7 +407,7 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
     let (mut regressions, mut improvements) = (Vec::new(), Vec::new());
     let mut unjudged = too_short(run, bases);
     for row in &rows {
-        let lines = matches!(row.judge, Judge::Spread { .. });
+        let lines = matches!(row.judge, Judge::Spread { .. } | Judge::Info);
         let verdicts: Vec<Verdict> =
             row.bases.iter().map(|b| verdict(row.judge, row.higher_is_better, &row.run, b)).collect();
         // A busy baseline has its column, and no say while a quiet one has.
@@ -427,13 +438,20 @@ fn compare(run: &Loaded, bases: &[Loaded], any: bool) -> Outcome {
     }
 
     let mut text = format!(
-        "{}: {} world lines (median [q1..q3] per line); {}\n",
+        "{}: {} steady world lines (median [q1..q3] per line), {} of warm-up; {}\n",
         run.name,
         run.lines(),
+        run.series.warm_up_fps.len(),
         run.load_note()
     );
     for b in bases {
-        text += &format!("baseline {}: {} world lines; {}\n", b.name, b.lines(), b.load_note());
+        text += &format!(
+            "baseline {}: {} steady world lines, {} of warm-up; {}\n",
+            b.name,
+            b.lines(),
+            b.series.warm_up_fps.len(),
+            b.load_note()
+        );
     }
     text += &format!(
         "a metric is judged {} the baselines; spread = larger IQR (floor 5% of the baseline)\n",
@@ -635,8 +653,8 @@ mod tests {
     /// synthetic log's times wrap each minute, so looks cover all of one.
     fn measured(name: &str, text: &str, other: f64) -> Loaded {
         let start = 1_767_225_600.0;
-        let samples = (0..30)
-            .map(|i| Sample { at: start + f64::from(i) * 2.0, total: other + 30.0, other })
+        let samples = (0..300)
+            .map(|i| Sample { at: start + f64::from(i) * 2.0, total: other + 30.0, other, compilers: 0 })
             .collect();
         let record = Record { wait: None, samples };
         Loaded::from_text(name, text, Some(3.0), Some(&record))
@@ -679,6 +697,31 @@ mod tests {
     }
 
     #[test]
+    fn only_steady_lines_are_judged_and_the_warm_up_is_shown() {
+        let run = loaded("r", &same_log(20));
+        assert_eq!((run.lines(), run.series.warm_up_fps.len()), (20, WARM_LINES));
+        for (name, values) in &run.series.fidelity {
+            assert_eq!(values.len(), 20, "{name}");
+        }
+        // A run as long again, against a short one: the same numbers.
+        let out = compare(&loaded("r", &same_log(60)), &[loaded("a", &same_log(8))], true);
+        assert!(out.failures().is_empty(), "{}", out.text);
+        assert!(out.text.contains("60 steady world lines"), "{}", out.text);
+        assert!(out.text.contains("baseline a: 8 steady world lines, 18 of warm-up"), "{}", out.text);
+        // A far worse warm-up is a row, and nothing more.
+        let worse = same_log(20).replace("0.10 fps", "0.01 fps");
+        let out = compare(&loaded("r", &worse), &[loaded("a", &same_log(20))], true);
+        assert!(out.failures().is_empty(), "{}", out.text);
+        let row = out.text.lines().find(|l| l.starts_with("warm_up_fps")).unwrap();
+        assert!(row.contains("0.01") && row.ends_with("info only"), "{row}");
+        // World lines, but none steady yet: nothing to judge.
+        let warm: String = same_log(1).lines().take(1 + 2 * WARM_LINES).map(|l| format!("{l}\n")).collect();
+        let out = compare(&loaded("r", &warm), &[loaded("a", &same_log(20))], true);
+        assert!(out.text.contains("the run has 0 steady world lines"), "{}", out.text);
+        assert!(!out.failures().is_empty());
+    }
+
+    #[test]
     fn by_default_one_baseline_is_enough_for_a_regression() {
         let bases = || {
             [loaded("a", &same_log(20)), loaded("b", &log(20, 1.0, 1000.0, 600.0, 650.0, 100.0))]
@@ -688,27 +731,37 @@ mod tests {
         assert!(compare(&run, &bases(), false).regressions.is_empty());
     }
 
-    /// A log of `n` world lines (900 draws each) and one cause line per line.
+    /// The world lines of the synthetic warm-up: one every 5 s for 90 s.
+    const WARM_LINES: usize = 18;
+
+    /// A log of a warm-up and `n` steady world lines (900 draws each), one
+    /// cause line per line; no line at all for `n` = 0. The warm-up is far
+    /// worse than any run's numbers: a test that read it would fail.
     fn log(n: usize, fps: f64, ms: f64, prep: f64, gpu: f64, refused: f64) -> String {
         let mut text = String::from("2026-01-01T00:00:00.0Z WARN victory_gpu::host: copies per frame: 1\n");
-        for i in 0..n {
+        let warm_up = if n == 0 { 0 } else { WARM_LINES };
+        for i in 0..warm_up + n {
             // A little spread, the same for every run.
             let w = (i % 5) as f64;
+            let (fps, ms, prep, gpu, refused, w) = if i < warm_up {
+                (0.1, 9000.0, 5000.0, 3000.0, 4000.0, 0.0)
+            } else {
+                (fps, ms, prep, gpu, refused, w)
+            };
+            let time = format!("2026-01-01T00:{:02}:{:02}.0Z", i * 5 / 60, i * 5 % 60);
             text += &format!(
-                "2026-01-01T00:00:{:02}.0Z  INFO victory_gpu::host: {:.1} fps, {:.1} ms/frame \
-                 ({:.1} preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; {:.1} on the \
-                 GPU; 1.0 copying back 0.0 MB), 900 draws/frame, dropped 0 without a host \
-                 pipeline (0 being made) and 0 indirect; 1 root-view slots/frame\n",
-                i % 60,
+                "{time}  INFO victory_gpu::host: {:.2} fps, {:.1} ms/frame ({:.1} preparing: \
+                 copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; {:.1} on the GPU; 1.0 copying back \
+                 0.0 MB), 900 draws/frame, dropped 0 without a host pipeline (0 being made) and \
+                 0 indirect; 1 root-view slots/frame\n",
                 fps + w * 0.01,
                 ms + w,
                 prep + w,
                 gpu + w
             );
             text += &format!(
-                "2026-01-01T00:00:{:02}.0Z  INFO victory_gpu::host: dropped by cause: refused \
-                 {refused}, compiling 0.0, other 0.0 draws/frame\n",
-                i % 60
+                "{time}  INFO victory_gpu::host: dropped by cause: refused {refused}, compiling \
+                 0.0, other 0.0 draws/frame\n"
             );
         }
         text
