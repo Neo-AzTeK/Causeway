@@ -80,9 +80,8 @@ pub fn wave_plan(caps: &Caps, need: WaveNeed) -> WavePlan {
 
 /// Whether a console wave of 64 must be asked for as waves of 64: the host
 /// cannot run waves of 32 (so two of them cannot stand in for one) and can run
-/// 64. Everywhere else, including a host whose range is unknown, a program the
-/// translator can place runs as two waves of 32, which every host with 32
-/// lanes (wave32-only, 32 to 64, 8 to 32) takes.
+/// 64. When false (also with an unknown range), a program the translator can
+/// place runs as two waves of 32, which any host that offers 32 lanes takes.
 pub fn wave64_native(caps: &Caps) -> bool {
     caps.wave.is_some_and(|w| w.min > 32 && w.max >= 64)
 }

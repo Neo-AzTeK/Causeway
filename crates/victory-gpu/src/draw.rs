@@ -868,7 +868,7 @@ impl State {
     /// shader reaches wherever data its root view leads to lie (a vertex
     /// fetch's streams sit at offsets in the root view's own header).
     /// shortcut: what shaders write through a root UAV goes back to title
-    /// memory for 1 MiB from its address, as before the views.
+    /// memory for 1 MiB from its address only.
     fn root_view(
         &mut self,
         list: &HostList,
@@ -1331,9 +1331,9 @@ impl State {
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // Tables reaching past a host heap smaller than the title's (a
+        // host that caps its view heaps) are made afresh too: the title's
+        // slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;
@@ -2396,8 +2396,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     /// An indirect call without a host pipeline is one drop, under the
-    /// pipeline's reason (it was counted a second time as "indirect kind 2:
-    /// no host pipeline", among the draws lost to other causes).
+    /// pipeline's reason: not a second time under a reason of the indirect
+    /// path, which would put it among the draws lost to other causes.
     #[cfg(feature = "diagnostics")]
     #[test]
     fn an_indirect_call_without_a_pipeline_is_dropped_once() {
@@ -2422,9 +2422,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through
     /// our device: a raw view of the host copy holding the root address,
     /// brought up to date from there to the copy's end, so data 1.5 MiB past
-    /// the root address (past the 1 MiB the old root views brought up to
-    /// date) reads right; reads past the copy's end read 0 (a host root
-    /// descriptor read whatever lay there). Two root addresses in one copy
+    /// the root address (a fixed 1 MiB window would miss it) reads right;
+    /// reads past the copy's end read 0 (through a host root descriptor
+    /// they would read whatever lay there). Two root addresses in one copy
     /// share its view.
     #[test]
     fn root_views_reach_their_copy_and_read_zeros_past_it() {

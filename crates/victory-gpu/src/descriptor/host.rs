@@ -118,8 +118,8 @@ struct Made {
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more (a
+/// capped heap, as seen on NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// Slots past the dynamic ones where a host copy's view pair stays for as
@@ -955,7 +955,7 @@ impl HostHeap {
     }
 }
 
-/// Diagnostics (NVIDIA heap cap): which title slots of a capped view heap
+/// Diagnostics (capped view heaps): which title slots of a capped view heap
 /// hold a live view, by 65,536-slot block, and what lies past the host's
 /// title slots. Logged at power-of-two frames.
 #[cfg(feature = "diagnostics")]
@@ -1049,7 +1049,7 @@ const RAW_ALIGNMENT: u64 = 16;
 /// Whether the host views a structured buffer of this stride as raw.
 /// Translated shaders address buffers by byte (`element_byte` in
 /// `victory-shader`): the title reads one view by element and by byte
-/// (scalar loads), and some hosts (NVIDIA) scale accesses by byte by a
+/// (scalar loads), and some hosts (seen on NVIDIA) scale accesses by byte by a
 /// structured view's stride, which reads other elements.
 fn raw_view(stride: u32) -> bool {
     stride > 0 && stride.is_multiple_of(4)
