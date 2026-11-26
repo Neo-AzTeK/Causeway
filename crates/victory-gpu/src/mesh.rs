@@ -446,6 +446,8 @@ pub(crate) fn run_direct(
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             )]);
+            #[cfg(feature = "diagnostics")]
+            list.note_mesh_work(&format!("compute, {n} groups"));
             l.Dispatch(n, 1, 1);
             l.ResourceBarrier(&[crate::host::transition(&scratch.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, READ)]);
         }
@@ -460,6 +462,8 @@ pub(crate) fn run_direct(
                     Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
                 }));
                 l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                #[cfg(feature = "diagnostics")]
+                list.note_mesh_work(&format!("draw, {n} groups"));
                 l.DrawIndexedInstanced(n * layout.max_primitives * 3, 1, 0, 0, 0);
             }
             l.ResourceBarrier(&[crate::host::transition(&scratch.buffer, READ, D3D12_RESOURCE_STATE_COMMON)]);
@@ -510,6 +514,8 @@ pub(crate) fn run_indirect(
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             )]);
+            #[cfg(feature = "diagnostics")]
+            list.note_mesh_work(&format!("indirect compute, {records} records"));
             l.ExecuteIndirect(dispatches, records, &scratch.commands, 0, None, 0);
             l.ResourceBarrier(&[crate::host::transition(&scratch.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, READ)]);
         }
@@ -518,6 +524,8 @@ pub(crate) fn run_indirect(
         unsafe {
             if ready {
                 l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                #[cfg(feature = "diagnostics")]
+                list.note_mesh_work(&format!("indirect draw, {records} records"));
                 l.ExecuteIndirect(draws, records, &scratch.commands, u64::from(DRAWS_AT), None, 0);
             }
             l.ResourceBarrier(&[crate::host::transition(&scratch.buffer, READ, D3D12_RESOURCE_STATE_COMMON)]);
