@@ -65,16 +65,16 @@ pub fn read_baseline(json: &Path) -> Baseline {
 const HIGHER_IS_BETTER: &[&str] = &["fps", "world_lines", "drawn_per_frame", "detail_pct"];
 
 /// Where a draw was lost: what the host named, and who would fix it.
-struct Lost {
+pub(super) struct Lost {
     /// Hash or verb: what names it.
     id: String,
     kind: String,
     reason: String,
     /// Merges what one fix removes.
     group: String,
-    tag: &'static str,
+    pub(super) tag: &'static str,
     area: &'static str,
-    per_frame: f64,
+    pub(super) per_frame: f64,
 }
 
 fn area_of(reason: &str) -> &'static str {
@@ -121,7 +121,7 @@ impl Log {
         })
     }
 
-    fn classify(&self, why: &str, per_frame: f64) -> Lost {
+    pub(super) fn classify(&self, why: &str, per_frame: f64) -> Lost {
         let unknown = "reason not logged".to_owned();
         let mut lost = Lost {
             id: why.split_whitespace().last().unwrap_or("?").to_owned(),
@@ -452,7 +452,8 @@ impl Log {
     fn stability_section(&self, areas: &[Area]) -> Vec<String> {
         let mut out = vec!["## 7. Stability".to_owned()];
         for a in areas.iter().filter(|a| {
-            ["crash", "hang", "device removed", "host GPU failure"].contains(&a.name)
+            ["crash", "hang", "device removed", "host GPU failure", STEADY_AREA, "machine load"]
+                .contains(&a.name)
         }) {
             out.push(format!("{}: {} - {}", a.name, a.status.name(), cut(&a.detail, 90)));
         }
@@ -476,6 +477,16 @@ impl Log {
             stability: bool,
         }
         let mut items = Vec::new();
+        // First: whatever else this log says was measured on a starved machine.
+        if let Some(signs) = self.starved() {
+            items.push(Item {
+                text: format!("STARVED machine, rerun on a quiet machine: {}", cut(&signs, 90)),
+                area: "machine (memory)".into(),
+                draws: 0.0,
+                frames: 0,
+                stability: true,
+            });
+        }
         for a in areas.iter().filter(|a| {
             a.status == Status::Fail
                 && ["crash", "hang", "device removed", "host GPU failure"].contains(&a.name)
@@ -530,7 +541,7 @@ impl Log {
         });
         let mut out = vec![
             "## 8. Next".to_owned(),
-            "rule: a failed stability area first (the run stopped), then draws or dispatches lost per frame, then frames lost; same area and reason merge".to_owned(),
+            "rule: a starved machine (rerun), then a failed stability area (the run stopped), then draws or dispatches lost per frame, then frames lost; same area and reason merge".to_owned(),
         ];
         if items.is_empty() {
             out.push("nothing lost is named in this log".into());
@@ -670,6 +681,30 @@ mod tests {
         let d = digest(&text, &ctx(&[], Baseline::Off));
         let next: Vec<&str> = d.lines().skip_while(|l| !l.starts_with("## 8")).collect();
         assert!(next[2].starts_with("1. [stability"), "{d}");
+    }
+
+    #[test]
+    fn a_starved_run_is_to_be_rerun_before_anything_else() {
+        let slow = format!(
+            "{T}  INFO victory_gpu::pipeline::library: host pipeline library loaded bytes=1 ms=2679\n"
+        );
+        // One sign in a log that reached the world may be a cold disk cache.
+        let one = digest(&(slow.clone() + &window(&[("being made", 5.0)])), &ctx(&[], Baseline::Off));
+        assert!(!one.contains("STARVED"), "{one}");
+        let translations = format!(
+            "{T}  INFO victory_gpu::pipeline: shader translated stage=\"pixel\" hash=9 cached=true ms=466000 user_ms=1500 kernel_ms=500\n"
+        );
+        let text = slow + &translations + &window(&[("being made", 5.0)]);
+        let d = digest(&text, &ctx(&[], Baseline::Off));
+        let next: Vec<&str> = d.lines().skip_while(|l| !l.starts_with("## 8")).collect();
+        assert!(
+            next[2].starts_with("1. [machine (memory)] STARVED machine, rerun on a quiet machine: pipeline library"),
+            "{d}"
+        );
+        assert!(next[3].starts_with("2. "), "{d}");
+        // A quiet machine's log has no such line.
+        let quiet = digest(&window(&[("being made", 5.0)]), &ctx(&[], Baseline::Off));
+        assert!(!quiet.contains("STARVED"), "{quiet}");
     }
 
     #[test]

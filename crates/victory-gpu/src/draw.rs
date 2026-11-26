@@ -48,6 +48,26 @@ enum Root {
     View(u64),
 }
 
+impl Root {
+    /// The address a shader reading this root parameter as a root view
+    /// takes: a root view's.
+    /// shortcut: titles also set root constants whose first two dwords are
+    /// an address where their shader reads a root view (a world compute
+    /// pass's slot 8: ~370 dispatches a frame dropped, "root view offset:
+    /// no root view set"). Reading those addresses drew them, but they lie
+    /// in title memory outside buffers, at ring positions: each root view
+    /// refreshed its 4 MiB window to the end (0.7-2.2 GB of copies a frame,
+    /// +300-700 ms preparing) and the windows, never freed, ran system
+    /// memory out after 8 minutes (mesh-emu-5). Take them once copies of
+    /// such memory are bounded to what the shader reads and freed.
+    fn address(&self) -> Option<u64> {
+        match self {
+            Root::View(address) => Some(*address),
+            _ => None,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -196,6 +216,13 @@ fn take_not_run() -> &'static str {
         "" => "reason not named",
         why => why,
     }
+}
+
+/// Why an indirect mesh call through an emulated pipeline did not run, as
+/// its note and count give it (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn emulated_mesh_why() -> String {
+    format!("emulated mesh: {}", take_not_run())
 }
 
 /// Notes `why` unless a more specific reason was noted already.
@@ -676,16 +703,16 @@ impl State {
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
-                        && let Some(Root::View(address)) =
-                            self.roots_ref(compute).get(usize::from(u.slot))
-                        && let Some(shadow) = crate::shadow::find(*address, 1)
+                        && let Some(address) =
+                            self.roots_ref(compute).get(usize::from(u.slot)).and_then(Root::address)
+                        && let Some(shadow) = crate::shadow::find(address, 1)
                     {
                         let uav = t.used.iter().any(|r| {
                             r.slot == u.slot
                                 && r.root == RootType::Descriptor
                                 && r.kind == ResourceType::Uav
                         });
-                        roots.push((*address, uav.then_some(shadow)));
+                        roots.push((address, uav.then_some(shadow)));
                     }
                     let fresh = made
                         .iter()
@@ -751,12 +778,12 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let Some(address) = self.roots_ref(compute).get(usize::from(slot)).and_then(Root::address)
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
+                    let Some(gpu) = root_view(list, address, kind == 1, kind == 2) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -1023,6 +1050,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        #[cfg(feature = "diagnostics")]
+        self.probe_window(list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
@@ -1259,12 +1288,11 @@ impl State {
             (stride, max),
             |compute| self.bind_mesh_pass(list, e, compute),
         );
-        if !ran {
-            // Not over the reason a pass that did not bind gave.
-            not_run_unless_named("emulated indirect mesh dispatch not recorded");
+        if let Err(e) = ran {
+            not_run_unless_named(e);
         }
         self.set_topology(list, self.topology);
-        ran
+        ran.is_ok()
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -1483,6 +1511,103 @@ impl State {
                 let (s, w) = (shadow.clone(), who.clone());
                 list.defer_host(move || tracing::info!(target: "victory_gpu::trace", "small {w} at submission: {}", s.peek(at, len)));
                 list.defer_after(move || tracing::info!(target: "victory_gpu::trace", "small {who} after the list: {}", shadow.peek(at, len)));
+            }
+        }
+    }
+
+    /// With `VICTORY_PROBE_WINDOW=<hash>:<user data index>[:big]`, in a listed
+    /// frame: for a dispatch of that program, each table buffer over 64 bytes
+    /// as title memory and as its host copy at the submission, at the byte
+    /// offset the user data holds (the loop counts of `a1f6cdf8874960a9`
+    /// live there). Words in hex. With `:big`, in every frame, and only for
+    /// a dispatch whose loop counts (the dwords at +4 and +0x374) are over
+    /// 4096 in the title or the copy, or whose window lies past the view.
+    #[cfg(feature = "diagnostics")]
+    fn probe_window(&self, list: &HostList) {
+        use std::fmt::Write as _;
+        // Read once: this runs before every dispatch.
+        static SPEC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let Some(spec) = SPEC.get_or_init(|| std::env::var("VICTORY_PROBE_WINDOW").ok()) else { return };
+        let mut parts = spec.split(':');
+        let (Some(hash), Some(index)) = (parts.next(), parts.next()) else { return };
+        let big = parts.next() == Some("big");
+        if !big && !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let Ok(index) = index.trim().parse::<u32>() else { return };
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        for stage in &p.stages {
+            if stage.shader.hash != hash.trim() {
+                continue;
+            }
+            let t = stage.translated();
+            let Some(u) = t.host.user_data.iter().find(|u| u.index == index) else { continue };
+            let off = u64::from(self.user_value(true, u.slot, u.root, u.dword));
+            for used in &t.used {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (used.root, self.roots_ref(true).get(usize::from(used.slot)))
+                else {
+                    continue;
+                };
+                let Some(view) = crate::descriptor::view(table + u64::from(used.table_offset_dwords) * 4) else {
+                    continue;
+                };
+                let range = match view {
+                    View::Constant(address, size) => Some((address, u64::from(size))),
+                    ref v => crate::descriptor::host::buffer_range(v),
+                };
+                let Some((at, len)) = range.filter(|r| r.1 > 64) else { continue };
+                let past = off + 0x3d0 > len;
+                if past && !big {
+                    continue;
+                }
+                let Some(shadow) = crate::shadow::find(at, len) else { continue };
+                let who = format!(
+                    "{hash} {:?} s{}+{} {at:#x}+{len:#x} u{index}={off:#x} frame {} past={past}",
+                    used.kind,
+                    used.slot,
+                    used.table_offset_dwords,
+                    crate::queue::presented() + 1
+                );
+                let words = |bytes: &[u8]| -> String {
+                    bytes.chunks(4).fold(String::new(), |mut s, c| {
+                        let _ = write!(s, " {:x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                        s
+                    })
+                };
+                // The loop counts: +4 (loop 1) and +0x374 (loop 2).
+                let ranges = [(0u64, 0x20u64), (0x370, 0x40)];
+                let counts = |r: &[Vec<u8>]| -> [u32; 2] {
+                    let at = |v: &Vec<u8>| u32::from_le_bytes([v[4], v[5], v[6], v[7]]);
+                    [at(&r[0]), at(&r[1])]
+                };
+                let title: Vec<Vec<u8>> = ranges
+                    .iter()
+                    .map(|&(o, n)| {
+                        let mut b = vec![0u8; n as usize];
+                        let _ = crate::host::read_into((at + off + o) as *const u8, &mut b);
+                        b
+                    })
+                    .collect();
+                let title_big = counts(&title).iter().any(|&c| c > 4096);
+                let t2: Vec<String> =
+                    ranges.iter().zip(&title).map(|(&(o, _), b)| format!("+{o:#x}:{}", words(b))).collect();
+                let (s, w, t2) = (shadow.clone(), who.clone(), t2.join(" "));
+                list.defer_host(move || {
+                    let Some(copy) = ranges
+                        .iter()
+                        .map(|&(o, n)| s.peek_bytes(at + off + o, n))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return;
+                    };
+                    if big && !past && !title_big && !counts(&copy).iter().any(|&c| c > 4096) {
+                        return;
+                    }
+                    let c2: Vec<String> =
+                        ranges.iter().zip(&copy).map(|(&(o, _), b)| format!("+{o:#x}:{}", words(b))).collect();
+                    tracing::info!(target: "victory_gpu::trace", "window {w} title [{t2}] copy [{}]", c2.join(" "));
+                });
             }
         }
     }
@@ -1842,7 +1967,8 @@ impl State {
             let ran = self.execute_mesh_emulated(list, e, (args.gpu(arguments), count), (stride, max));
             #[cfg(feature = "diagnostics")]
             if !ran {
-                why(&format!("emulated mesh dispatch not run: {}", take_not_run()));
+                #[cfg(feature = "diagnostics")]
+                why(&emulated_mesh_why());
             }
             return ran;
         }
@@ -2121,6 +2247,44 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 
 #[cfg(test)]
 mod tests {
+    /// A shader reading a root parameter as a root view takes the address
+    /// of the root view the title set there, not root constants (see
+    /// `Root::address`); the mesh pass reads the graphics ones.
+    #[test]
+    fn root_view_addresses_come_from_views_only() {
+        let mut s = State::default();
+        let address = 0xD_72C8_0000u64;
+        s.set_constants(true, 8, &[address as u32, (address >> 32) as u32, 0, 0, 2, 2], 0);
+        s.set_view(false, 3, 0x1234_5000);
+        s.set_table(true, 2, 0x10);
+        let read = |s: &State, compute, slot: u8, dword| s.user_value(compute, slot, RootType::Descriptor, dword);
+        assert_eq!((read(&s, false, 3, 0), read(&s, false, 3, 1)), (0x1234_5000, 0));
+        assert_eq!((read(&s, true, 8, 0), read(&s, true, 8, 1)), (0, 0), "constants read as a root view");
+        assert_eq!(s.roots_ref(true).get(8).and_then(Root::address), None, "constants holding {address:#x}");
+        assert_eq!(s.roots_ref(false).get(3).and_then(Root::address), Some(0x1234_5000));
+        assert_eq!(s.roots_ref(true).get(2).and_then(Root::address), None, "a table is no address");
+        // One dword of constants is no address either.
+        s.set_constants(true, 9, &[7], 0);
+        assert_eq!(s.roots_ref(true).get(9).and_then(Root::address), None);
+        // The emulated mesh pass's compute bind reads the graphics roots.
+        s.mesh_pass = true;
+        assert_eq!(s.roots_ref(true).get(3).and_then(Root::address), Some(0x1234_5000));
+    }
+
+    /// The reason an inner step of an emulated mesh call gave is the one its
+    /// note and count carry, an outer reason does not cover it, and the
+    /// next call that fails without one is not given it.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn emulated_mesh_drops_keep_the_inner_reason() {
+        not_run("no dynamic slots for root views");
+        not_run_unless_named("compute pass not bound");
+        assert_eq!(emulated_mesh_why(), "emulated mesh: no dynamic slots for root views");
+        assert_eq!(take_not_run(), "reason not named", "taken, not left for the next call");
+        not_run_unless_named("compute pass not bound");
+        assert_eq!(emulated_mesh_why(), "emulated mesh: compute pass not bound");
+    }
+
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;

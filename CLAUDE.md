@@ -31,8 +31,9 @@ and ask the owner for the title's folder if none is set.
 
 - Real-GPU runs through `cargo xtask smoke` are pre-approved by the owner;
   `--accept-terms` still needs the owner's OK for that launch.
-- Before a build or test, check no title is running (`Get-Process victory`):
-  it spoils that run's timings, and several crates' tests use the GPU.
+- Before a build or test, check no title is running (the check under "The GPU"
+  in `docs/problem-sessions.md`; offline `translate`/`census` scans do not
+  count): it spoils that run's timings, and several crates' tests use the GPU.
 - Descriptor and view-heap work belongs to another AI.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
 - The main session coordinates and does not debug: a problem goes to its own

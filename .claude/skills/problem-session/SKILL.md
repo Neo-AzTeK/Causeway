@@ -34,8 +34,8 @@ with evidence, commits, runs, next step) -> `log <id> "<one line>"`.
   commits.
 - Tests that may use the GPU, the full chain's too:
   `cargo xtask alone -- cargo test ...`; wait if it refuses. Before any other
-  build or test, `Get-Process victory -ErrorAction SilentlyContinue` prints
-  nothing.
+  build, test or offline scan, the title check under "The GPU" in
+  `docs/problem-sessions.md` prints nothing (an offline scan is not a title).
 - Runs: `cargo xtask smoke --problem <id> ...`, `--quiet` when timing counts. A
   run without `machine: quiet` proves no timing. `--accept-terms` needs the
   owner's OK for that launch.
