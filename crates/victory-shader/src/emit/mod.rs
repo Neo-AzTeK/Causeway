@@ -1,8 +1,10 @@
 //! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
-//! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! on the lane layout (cross-lane operations) declares a wave size
+//! (`WaveSize`), so the host device must support it: 32 where waves of 32
+//! behave as the console's would (a console wave of 64 may be made as two,
+//! see [`Options::wave64_native`]), otherwise the console's.
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -22,7 +24,7 @@
 //! * **Immediate samplers** as static samplers `s<n>, space 0`, `n` the
 //!   position in [`HostShader::samplers`] (the console sampler words) and
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
-//!   sampler description). Comparison sampling (added 2026-11-23): an
+//!   sampler description). Comparison sampling: an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host. One
 //!   of two immediate samplers chosen by uniform control flow takes two
@@ -30,7 +32,7 @@
 //! * **Root CBVs** as root descriptors `b<i>` in [`ROOT_CBV_SPACE`], `i`
 //!   the title's root parameter index ([`HostShader::root_cbvs`]); the
 //!   address the title sets is the buffer's.
-//! * **Root SRVs and root UAVs** (raw buffers; changed 2026-11-24) are
+//! * **Root SRVs and root UAVs** (raw buffers) are
 //!   resource-heap views the host makes: a raw SRV (UAV) of the whole host
 //!   copy holding the root address, at the heap index the host writes into
 //!   the [`HostShader::user_data`] entry marked [`ROOT_SRV_VIEW`]
@@ -38,14 +40,15 @@
 //!   user-data dword, which such a program never reads as data), and the
 //!   root address's byte offset in that copy into the entry marked
 //!   [`ROOT_VIEW_OFFSET`] (its second); the shader adds that offset to
-//!   every offset it reads at. Host root descriptors have no bounds, so a
-//!   shader reading past the copy read other memory or faulted; through
-//!   the view it reads 0 and its writes there are dropped. One view per
+//!   every offset it reads at. A view rather than a host root descriptor
+//!   because root descriptors have no bounds (reading past the copy would
+//!   reach other memory or fault); through the view such a read gives 0
+//!   and writes there are dropped. One view per
 //!   host copy (and kind) serves every draw of a list. In programs that
 //!   use title memory (below) root SRVs and UAVs are title memory instead;
-//!   elsewhere [`HostShader::root_srvs`] and [`HostShader::root_uavs`] now
+//!   elsewhere [`HostShader::root_srvs`] and [`HostShader::root_uavs`]
 //!   hold only the host's own tables (`VIEW_STRIDES`).
-//! * **Vertex fetch** (added 2026-11-23). The title's mesh and
+//! * **Vertex fetch**. The title's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
 //!   2_10_10_10 unorm, 8_8_8_8 and 16_16_16_16 uint...) is in the
@@ -63,7 +66,7 @@
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
 //!   title's view description says. Typed-format loads from heap
-//!   descriptors (1,024 world compute programs, ray-tracing material
+//!   descriptors (many world compute programs, ray-tracing material
 //!   resolves) read raw views this way. Buffers read by element through
 //!   the resource heap (no used-resource entry, so no stride) are raw too,
 //!   addressed at element × the view's stride + offset, the stride from
@@ -71,7 +74,7 @@
 //!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
 //!   [`VIEW_TABLE_HEADER`] + `i` the host keeps at the byte stride of the
 //!   buffer view at heap index `i`.
-//! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
+//! * **Constant buffers in the heap**: scalar buffer
 //!   loads through a descriptor taken from the resource heap itself (root
 //!   type 5, so no used-resource entry) read a raw buffer view, not a
 //!   constant buffer view: the title's constant buffers are 16-byte
@@ -82,16 +85,16 @@
 //! * **Rectangle lists** ([`rectangle_gs`]): a geometry shader made from a
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner `v0 + v2 - v1`, as the console's hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to the host's last
+//! * **Heap indices** are clamped to the host's last
 //!   view heap index (samplers: [`HEAP_SAMPLERS`] − 1), so an index past the
 //!   heap (data still wrong; the console would read whatever memory follows
 //!   its heap) reads nothing instead of faulting the device. Hosts cap
-//!   their view heaps differently (1,000,000 slots on NVIDIA), so the
+//!   their view heaps differently (e.g. 1,000,000 slots on NVIDIA), so the
 //!   limit is not a constant: it is dword 0 of the view-stride table (the
 //!   header, [`VIEW_TABLE_HEADER`] dwords), which every shader taking a
 //!   view heap index lists in [`HostShader::root_srvs`].
-//! * **Title slots past the host heap** (added 2026-11-25): a host may
-//!   hold fewer view slots than the title's heap (NVIDIA: 1,000,000, the
+//! * **Title slots past the host heap**: a host may
+//!   hold fewer view slots than the title's heap (e.g. NVIDIA: 1,000,000, the
 //!   title 1,245,184). Indices a shader takes from the resource heap itself
 //!   (title slots) from header dword 2 on read their remap entry, which
 //!   follows the strides (header dword 3 entries, the index past them
@@ -99,7 +102,7 @@
 //!   or its null SRV. Table indices are the host's own and are not
 //!   remapped. Where the host holds the whole heap, dword 2 is the heap's
 //!   end and the one entry the null SRV: as the clamp.
-//! * **Buffer views at computed heap indices** (added 2026-11-24): a
+//! * **Buffer views at computed heap indices**: a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV
 //!   `t`[`VIEW_STRIDES`], which covers every index of the heap, dynamic
@@ -109,28 +112,28 @@
 //!   index comes from data, and a texture descriptor read as a buffer one
 //!   is a wild address (the texture's shifted 8 bits down: GPU faults at
 //!   low addresses).
-//! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`],
-//!   added 2026-11-24): whether the shader takes descriptors from the
+//! * **Heap access** ([`HostShader::heap`], [`HostShader::heap_writes`]):
+//!   whether the shader takes descriptors from the
 //!   resource heap itself, and unordered access views among them; the
 //!   host then keeps everything the heap's views reach current, and
 //!   copies back what such views may have written.
 //!
-//! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
+//! * **Texture atomics**: a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
 //!   host's view at that index must be an R32 integer view. Global loads
 //!   from a root SRV read it raw. 64-bit texture atomics (two dwords per
-//!   value; added 2026-11-24) are SM 6.6's on typed heap resources: the
+//!   value) are SM 6.6's on typed heap resources: the
 //!   host's view must be `R32G32_UINT` (low dword in R) and the device must
 //!   report 64-bit atomics on typed resources (options 9) and on descriptor
 //!   heap resources (options 11), else the pipeline is refused.
 //!
-//! * **Root parameters past the user SGPRs** (added 2026-11-24): a
+//! * **Root parameters past the user SGPRs**: a
 //!   compute program whose root signature does not fit its 16 user SGPRs
 //!   loads the rest from memory whose 40-bit address is in user data 0-1;
 //!   the table starts with user-data dword 16. They are user data as any
 //!   other: the host fills dword `index` as above.
 //! * What shaders write through a root UAV is the title's to see.
-//! * **Title memory** (added 2026-11-24, decision 0005's unified-memory
+//! * **Title memory** (decision 0005's unified-memory
 //!   item): accesses at addresses the program computes (pointers in root
 //!   constants or loaded from memory, BVH nodes) go through a page table,
 //!   the root SRV `t0` in [`MEMORY_SPACE`] ([`HostShader::memory`]), dwords:
@@ -158,7 +161,7 @@
 //!   index, two dwords, the buffer view's title address (high dword bits
 //!   0-15; stride bits 0), zeros for no buffer view.
 //! * **Write marks** ([`HostShader::view_marks`], with
-//!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
+//!   [`Options::view_marks`]): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
 //!   itself, root UAVs as their heap views) also sets bits in the root UAV
 //!   `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`], a bitmap of
@@ -173,13 +176,6 @@
 //!   a view the bit of its first byte's page as base with that byte's
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
-//!
-//! Entry points: [`translate`] (container bytes as the title passes them
-//! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
-//! earlier stages already run). The root constants of each stage must
-//! cover [`HostShader::user_data_dwords`]. Stability: these types and the
-//! binding scheme are what pipeline creation builds on; changes are
-//! announced.
 //! * **Signatures** as the console container has them (same semantics,
 //!   registers and masks), so the input layout and stage linking are the
 //!   title's; pixel outputs are plain 32-bit values.
@@ -193,8 +189,8 @@
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
-//! * **Mesh shaders as compute** ([`Options::mesh_as_compute`]; added
-//!   2026-11-25), for hosts without mesh shaders: the mesh program is made
+//! * **Mesh shaders as compute** ([`Options::mesh_as_compute`]), for
+//!   hosts without mesh shaders: the mesh program is made
 //!   as a compute shader of the same group, which writes its vertices and
 //!   triangles to two raw root UAVs in [`MESH_SPACE`] instead of
 //!   outputting them. Group `g` (counted from the dispatch's first),
@@ -220,6 +216,12 @@
 //!   console's wave, not the host's lane. Every primitive slot is culled
 //!   first and indices past the group's vertices are clamped, so the draw
 //!   never reads a vertex outside the dispatch's scratch.
+//!
+//! Entry points: [`translate`] (container bytes as the title passes them
+//! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
+//! earlier stages already run). The root constants of each stage must
+//! cover [`HostShader::user_data_dwords`]. Pipeline creation builds on
+//! these types and the binding scheme: say so when changing them.
 
 mod bitcode;
 #[cfg(all(test, windows))]
@@ -951,11 +953,11 @@ mod tests {
     /// A wave64 compute program that writes only EXEC's high dword
     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask is
     /// opaque and keyed by the unchanged low dword, so building its lane bit
-    /// needed the mask's own value: lowering recursed until the stack
-    /// overflowed, which takes the whole process down (found by
-    /// random-input testing). Now the instruction fails like any other that
+    /// would need the mask's own value, and recursing on it overflows the
+    /// stack, which takes the whole process down (a case random-input
+    /// testing found). So the instruction fails like any other that
     /// cannot be expressed: its result is missing, and only a side effect
-    /// that uses it would stop the translation.
+    /// that uses it stops the translation.
     #[test]
     fn an_exec_high_write_does_not_overflow_the_stack() {
         // s_mov_b32 exec_hi, 0; v_mov_b32 v1, v0; s_endpgm
@@ -1915,10 +1917,11 @@ mod tests {
     }
 
     /// A pixel shader reading channel z of an input whose element starts at
-    /// w. Looking the channel up subtracted the element's first channel
-    /// before checking the channel lies in it, so in a build with overflow
-    /// checks (tests, debug) any read below an element that starts at z or
-    /// w panicked, whichever row it was in (found by random-input testing).
+    /// w. The channel lookup must check that the channel lies in an element
+    /// before subtracting the element's first channel: otherwise, in a
+    /// build with overflow checks (tests, debug), any read below an element
+    /// that starts at z or w panics, whichever row it is in (a case
+    /// random-input testing found).
     #[test]
     fn reading_a_channel_below_an_input_element_does_not_underflow() {
         // v_interp_mov_f32 v3, p0, attr0.z; s_endpgm
