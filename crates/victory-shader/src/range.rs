@@ -14,7 +14,8 @@
 //! bounded limit. A VGPR write under a guard keeps the old value in the
 //! other lanes, so it is bounded only if both are. Anything else (memory,
 //! signed compares, what a relative move writes) is unbounded, and a move
-//! with an unbounded index keeps today's range.
+//! with an unbounded index keeps the full range, every register up to the
+//! program's VGPR count.
 
 use std::collections::{HashMap, HashSet};
 

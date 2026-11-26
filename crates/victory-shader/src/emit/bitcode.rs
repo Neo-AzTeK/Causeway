@@ -103,8 +103,8 @@ pub(crate) mod pred {
     pub const OGE: u8 = 3;
     pub const OLT: u8 = 4;
     pub const OLE: u8 = 5;
-    // Not emitted: the AMD D3D12 driver treats it as UNE, so `v_cmp_lg`
-    // lowers as OLT | OGT instead.
+    // Not emitted: the AMD D3D12 driver was observed to treat it as UNE, so
+    // `v_cmp_lg` lowers as OLT | OGT instead (see "lg" in `lower.rs`).
     #[allow(dead_code)]
     pub const ONE: u8 = 6;
     pub const ORD: u8 = 7;

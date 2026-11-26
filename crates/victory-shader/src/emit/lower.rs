@@ -5636,9 +5636,9 @@ impl<'a> Lower<'a> {
     /// the resource heap itself (module notes, "Buffer views at computed
     /// heap indices"): `index`, or the host's null raw buffer view when the
     /// view-stride table says the slot holds no buffer view. Indices come
-    /// from data; one naming a texture slot read a texture descriptor as a
-    /// buffer one (a wild address: the texture's address shifted 8 bits
-    /// down) and faulted the device.
+    /// from data; one naming a texture slot would read a texture descriptor
+    /// as a buffer one (a wild address: the texture's address shifted 8 bits
+    /// down), which faults the device.
     fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
         // Typed, raw and structured buffers (DXIL resource kinds 10-12).
         if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
@@ -7958,8 +7958,9 @@ impl<'a> Lower<'a> {
                 if op == "lg" {
                     // Ordered and not equal, false for a NaN, as `olt | ogt`.
                     // `fcmp one` means the same, but the AMD D3D12 driver
-                    // runs it as unordered (true for a NaN) where NVIDIA
-                    // and WARP do not; olt and ogt agree on all three.
+                    // was observed to run it as unordered (true for a NaN)
+                    // where NVIDIA and WARP do not; olt and ogt agree on all
+                    // three, so this form stays while a driver does that.
                     let lt = self.s.m.cmp(c, pred::OLT, a, b);
                     let gt = self.s.m.cmp(c, pred::OGT, a, b);
                     self.s.m.bin(c, Bin::Or, lt, gt)

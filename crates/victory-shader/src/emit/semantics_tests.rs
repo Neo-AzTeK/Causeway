@@ -2764,7 +2764,7 @@ fn defect_multiply_adds_fused_only_where_the_host_fuses() {
 
 /// The VOP3 output multipliers flush the result and turn a zero into +0
 /// with IEEE mode off (measured on RDNA2, gfx1031 and gfx1036, by the
-/// Leonida project). Was a defect: the host's multiply kept -0.
+/// Leonida project). Guards against the host's multiply, which keeps -0.
 #[test]
 fn output_multipliers_give_positive_zero() {
     let mut p = arithmetic_probes();
@@ -2775,8 +2775,9 @@ fn output_multipliers_give_positive_zero() {
 
 /// Denormal operands of `v_min/max/med3/min3/max3_f32` read as zeros of
 /// their sign, and a float `v_cndmask_b32` with `abs`/`neg` moves only the
-/// sign bit. Was a defect: the host decided (WARP flushed, the RX 6700 XT
-/// did not, and a flushed denormal met +0 as an equal).
+/// sign bit. Guards against leaving it to the host, whose adapters differ
+/// (as measured, WARP flushes and the RX 6700 XT does not, and a flushed
+/// denormal meets +0 as an equal).
 #[test]
 fn min_max_and_selects_take_denormals_on_the_bits() {
     let mut p = min_max_probes();
@@ -2786,8 +2787,9 @@ fn min_max_and_selects_take_denormals_on_the_bits() {
 
 /// f16 results round to nearest even, the console's default mode (toward
 /// zero only where the program sets that, which the title does around its
-/// 16-bit interpolation). Was a defect: DXIL `legacyF32ToF16` rounds toward
-/// zero on both adapters here (65504 where the hardware gives infinity).
+/// 16-bit interpolation). DXIL `legacyF32ToF16` cannot stand in: it rounded
+/// toward zero on WARP and the RX 6700 XT (65504 where the hardware gives
+/// infinity).
 #[test]
 fn f16_results_round_to_nearest_even() {
     let mut p = conversion_probes();
@@ -2798,9 +2800,9 @@ fn f16_results_round_to_nearest_even() {
 
 /// f16 arithmetic gives the same bits on every host: the f32 intermediate
 /// of an add or multiply of halves is exact or rounds innocuously, and the
-/// narrowing is on the bits. Was a defect: the hosts' own narrowing kept
-/// extra precision on one adapter and not the other (`1.0 * 1.5 + 0x8001`
-/// in `v_pk_fma_f16` gave 0x3e00 on WARP, 0x3dff on the RX 6700 XT).
+/// narrowing is on the bits. Guards against the hosts' own narrowing,
+/// which may keep extra precision (as measured, `1.0 * 1.5 + 0x8001` in
+/// `v_pk_fma_f16` gave 0x3e00 on WARP, 0x3dff on the RX 6700 XT).
 #[test]
 fn f16_arithmetic_rounds_once() {
     let mut p = sixteen_bit_probes();
@@ -2809,7 +2811,7 @@ fn f16_arithmetic_rounds_once() {
 }
 
 /// `s_min_*`/`s_max_*` set SCC to whether the first operand was chosen
-/// (RDNA2 ISA). Was a defect: SCC was `result != 0`.
+/// (RDNA2 ISA), which is not the same as `result != 0`.
 #[test]
 fn scalar_min_max_set_scc_from_the_compare() {
     defect(scalar_probes(), SCC_MIN_MAX);
@@ -2817,23 +2819,23 @@ fn scalar_min_max_set_scc_from_the_compare() {
 
 /// `v_cvt_flr_i32_f32`/`v_cvt_rpi_i32_f32` saturate a NaN by its sign and
 /// add the half exactly (measured on RDNA2, gfx1035/gfx1036, by the
-/// Leonida project). Was a defect: NaN gave 0 and x + 0.5 was rounded
-/// first (0x3effffff gave 1, the hardware 0). The title uses neither.
+/// Leonida project). Guards against giving 0 for NaN, and against rounding
+/// x + 0.5 first (0x3effffff would give 1, the hardware 0).
 #[test]
 fn floor_conversions_match_the_hardware() {
     defect(conversion_probes(), FLOOR_CVT);
 }
 
-/// `v_med3_f32` orders -0 below +0, as its min and max do. Was a defect:
-/// plain DXIL `FMin`/`FMax` gave either zero (the adapters differed).
+/// `v_med3_f32` orders -0 below +0, as its min and max do. Guards against
+/// plain DXIL `FMin`/`FMax`, which may give either zero (adapters differ).
 #[test]
 fn med3_orders_signed_zeros() {
     defect(min_max_probes(), MED3_ZERO);
 }
 
-/// `v_cmp_f_f32` and `v_cmp_tru_f32` (always false, always true; the title
-/// uses neither). Was a defect: `fcmp false`/`fcmp true` removed the WARP
-/// device.
+/// `v_cmp_f_f32` and `v_cmp_tru_f32` (always false, always true).
+/// Guards against `fcmp false`/`fcmp true`, which as observed remove the
+/// WARP device.
 #[test]
 fn constant_compares_run() {
     let ab = pairs(&F32_EDGES[..8], &F32_EDGES[..8]);
