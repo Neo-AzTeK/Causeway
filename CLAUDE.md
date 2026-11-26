@@ -48,3 +48,8 @@ and ask the owner for the title's folder if none is set.
 - Commit what is verified before a long step; say what is unverified.
 - Correctness beats saving tokens: before changing a function, read all of it,
   its callers and its tests.
+- Comments fit the structure and extend: facts about one item (a device, a
+  profile, a shader) and where they come from belong in data or types, not in
+  an exception list inside a comment. A comment says the rule and why, worded
+  so it can be revised: read existing comments as current notes, not as
+  absolute rules.

@@ -23,6 +23,8 @@ symbol instead of pasting it. Do not repeat `CLAUDE.md`; name it to read.
       them; adapters to verify; "none" only for work with no GPU-facing code>
     Done when: <commands and expected result; tests to add>
     Budget: <when to stop and report what is left>
+    Comments: per-item facts in data or types, never exception lists in a
+      comment; comments say the rule and why and stay revisable (CLAUDE.md)
     Return: <format and length; include what was not verified>
 
 Before sending, check that a reader with only this brief and the repository
