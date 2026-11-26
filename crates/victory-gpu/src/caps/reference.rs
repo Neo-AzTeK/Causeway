@@ -2,7 +2,8 @@
 //! planners must serve, for tests that need no GPU.
 //!
 //! Figures are the classes' typical reports written from public vendor and
-//! D3D12 documentation, NOT dumps from those devices; only the class traits
+//! D3D12 documentation, NOT dumps from those devices (except `nvidia_pascal`,
+//! which holds the figures a GTX 1070 logged); only the class traits
 //! that matter to a planner (wave range, tiers, UMA, memory) are set. When
 //! someone owns a device, replace its entry with that device's `{:#?}` of
 //! `Caps` and say so in the commit. Names say what class, not what card.

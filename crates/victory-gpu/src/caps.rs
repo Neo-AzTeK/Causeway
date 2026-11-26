@@ -23,8 +23,8 @@
 //! planners stay vendor-free.
 //!
 //! Not here: live figures (video memory in use changes every frame; the
-//! budget policy samples it itself) and descriptor or heap code, which only
-//! reads [`binding_plan`].
+//! budget policy samples it itself) and descriptor or heap code (which does not
+//! call [`binding_plan`] today).
 
 #[cfg(windows)]
 pub(crate) mod per_resource;
