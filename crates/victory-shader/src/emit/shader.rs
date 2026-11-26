@@ -154,6 +154,9 @@ pub(crate) struct Shader {
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    /// Whether an operation takes its texture level from the neighbouring
+    /// lanes' coordinates (implicit derivatives).
+    derivatives: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     /// Dwords after those, which the translator uses to exchange values
@@ -225,6 +228,7 @@ impl Shader {
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
+            derivatives: false,
             lds_dwords: 0,
             lds_extra: 0,
             lds: None,
@@ -255,6 +259,8 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Sample, SampleBias, SampleCmp, CalculateLOD.
+        self.derivatives |= matches!(opcode, 60 | 61 | 64 | 81);
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -1047,7 +1053,16 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        // Validator version 1.6 refuses implicit derivatives in a compute
+        // program; 1.8 takes them, and wants the entry's name in `PSV0`.
+        let quads = self.derivatives && compute;
+        let validator = if quads {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![validator]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -1133,6 +1148,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            entry_name: quads,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

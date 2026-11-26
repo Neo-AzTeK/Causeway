@@ -897,6 +897,75 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// A compute program may sample with implicit derivatives. Validator 1.6
+    /// refuses that, so such a program asks for 1.8.
+    #[test]
+    fn a_compute_program_with_implicit_derivatives_validates() {
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF40C_0000,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[0:1], null
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E02_02F0, // v_mov_b32 v1, 0.5 (u)
+            0x7E04_02F0, // v_mov_b32 v2, 0.5 (v)
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF080_0108,
+            0x0040_0301, // image_sample v3, v[1:2], s[0:7], s[8:11]
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let host = Container::parse(&out.dxil).unwrap();
+        // Runtime info version 3, which names the entry.
+        assert_eq!(
+            host.part(FourCC::PSV0).unwrap().data[..4],
+            52u32.to_le_bytes()
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
     #[test]
     fn immediate_sampler_slots_distinguish_comparison_uses() {
         let words = [
