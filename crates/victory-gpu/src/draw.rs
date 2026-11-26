@@ -169,7 +169,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// it in the list (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
-    let why = NOT_RUN.with(|w| w.replace(""));
+    let why = take_not_run();
     if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
         crate::pipeline::note_drop(pipeline as This);
     } else {
@@ -185,6 +185,20 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
 thread_local! {
     /// Why the draw or dispatch this thread last prepared cannot run.
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// The reason noted for the draw or dispatch just prepared, left empty for
+/// the next one, which may fail without naming one (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn take_not_run() -> &'static str {
+    NOT_RUN.with(|w| w.replace(""))
+}
+
+/// Why an indirect mesh call through an emulated pipeline did not run, as
+/// its note and count give it (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn emulated_mesh_why() -> String {
+    format!("emulated mesh: {}", take_not_run())
 }
 
 /// Notes why the draw or dispatch being prepared cannot run, unless an
@@ -405,10 +419,8 @@ impl State {
     /// view's address (title memory).
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
-            (Some(r @ (Root::View(_) | Root::Constants(_))), RootType::Descriptor)
-                if dword < 2 && r.address().is_some() =>
-            {
-                (r.address().unwrap_or_default() >> (32 * dword)) as u32
+            (Some(Root::View(address)), RootType::Descriptor) if dword < 2 => {
+                (address >> (32 * dword)) as u32
             }
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
                 Some(heap) => (handle - heap.start) as u32,
@@ -1792,7 +1804,7 @@ impl State {
             let ran = self.execute_mesh_emulated(list, e, (args.gpu(arguments), count), (stride, max));
             if !ran {
                 #[cfg(feature = "diagnostics")]
-                why(&format!("emulated mesh: {}", NOT_RUN.with(|w| w.replace(""))));
+                why(&emulated_mesh_why());
             }
             return ran;
         }
@@ -1825,7 +1837,7 @@ impl State {
                     "prepare failed (compute {}, mesh {}): {}",
                     p.compute,
                     p.mesh,
-                    NOT_RUN.with(|w| w.replace(""))
+                    take_not_run()
                 )),
             }
             return false;
@@ -2080,6 +2092,7 @@ mod tests {
         s.set_table(true, 2, 0x10);
         let read = |s: &State, compute, slot: u8, dword| s.user_value(compute, slot, RootType::Descriptor, dword);
         assert_eq!((read(&s, false, 3, 0), read(&s, false, 3, 1)), (0x1234_5000, 0));
+        assert_eq!((read(&s, true, 8, 0), read(&s, true, 8, 1)), (0, 0), "constants read as a root view");
         assert_eq!(s.roots_ref(true).get(8).and_then(Root::address), None, "constants holding {address:#x}");
         assert_eq!(s.roots_ref(false).get(3).and_then(Root::address), Some(0x1234_5000));
         assert_eq!(s.roots_ref(true).get(2).and_then(Root::address), None, "a table is no address");
@@ -2089,6 +2102,20 @@ mod tests {
         // The emulated mesh pass's compute bind reads the graphics roots.
         s.mesh_pass = true;
         assert_eq!(s.roots_ref(true).get(3).and_then(Root::address), Some(0x1234_5000));
+    }
+
+    /// The reason an inner step of an emulated mesh call gave is the one its
+    /// note and count carry, an outer reason does not cover it, and the
+    /// next call that fails without one is not given it.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn emulated_mesh_drops_keep_the_inner_reason() {
+        not_run("no dynamic slots for root views");
+        not_run_unless_named("compute pass not bound");
+        assert_eq!(emulated_mesh_why(), "emulated mesh: no dynamic slots for root views");
+        assert_eq!(take_not_run(), "", "taken, not left for the next call");
+        not_run_unless_named("compute pass not bound");
+        assert_eq!(emulated_mesh_why(), "emulated mesh: compute pass not bound");
     }
 
     use super::*;
