@@ -1759,6 +1759,7 @@ mod tests {
             3.0, -1.0, corner[2], 1.0,
         ];
         let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
         for warp in [false, true] {
             let Ok(host) = Host::new(warp) else { continue };
             let root = host.root_signature_for(&[]).unwrap();
@@ -1778,7 +1779,10 @@ mod tests {
                 assert!((value - weighed).abs() < 1e-3, "warp {warp}: {value} for i {i}, j {j}");
             }
             assert!(texels.iter().any(|t| (t[1] - t[2]).abs() > 0.1), "warp {warp}: {texels:?}");
+            eprintln!("barycentrics weighed as expected, warp {warp}");
+            ran += 1;
         }
+        assert!(ran > 0, "no device ran the draw");
     }
 
     /// A pixel export before the `done` one, both under a lane guard (EXEC
