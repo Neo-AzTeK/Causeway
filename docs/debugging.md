@@ -137,9 +137,13 @@ queue, the smoke lock and the run are looked at every 2 s.
 Before any cargo build, test or clippy, a session runs `cargo xtask queue wait-idle`
 (`--timeout <s>`, 900 by default): it returns at once when no run is booting, else it
 waits. A run boots from its `.running` file (so through its wait for a quiet machine
-and its own build) until 10 s after its first world line; one 10 minutes old with no
-world is stuck and no longer counts. After the timeout it exits with an error naming the
-run: do not compile then. Already-started compiles are not stopped.
+and its own build) until 10 s after its first world line. A run stuck without a
+world no longer counts: 10 minutes after its log was made, or 30 minutes after it
+started when it has no log. It protects the boot only: a compile after it can still
+disturb the lines measured (the digest then says MACHINE BUSY), so prefer
+`-j 2` while a run plays. After the timeout it exits with an error naming the run:
+do not compile then. Already-started compiles are not stopped, and a smoke run
+started by hand is not seen (it has no `.running`).
 
 ```powershell
 cargo xtask compare E:\Causeway-tools\runs\mesh-9 --baseline E:\Causeway-tools\runs\smoke-16 --baseline E:\Causeway-tools\runs\smoke-15

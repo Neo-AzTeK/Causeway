@@ -681,9 +681,13 @@ const BUILD_MARGIN: f64 = 15.0;
 /// pipelines and shaders): nothing compiles before this has passed.
 const BOOT_SETTLE: f64 = 10.0;
 
-/// A run that has not reached its world this long after it started is stuck,
-/// not booting: it no longer holds anyone back.
+/// A title that has not reached its world this long after its log was made
+/// is stuck, not booting: it no longer holds anyone back.
 const BOOT_CAP: f64 = 600.0;
+
+/// A run with no log yet is in its build and its wait for a quiet machine
+/// (600 s at most); past this long after it started it is stuck too.
+const PRELAUNCH_CAP: f64 = 1800.0;
 
 /// How often `wait-idle` looks at the runs.
 const WAIT_EVERY: Duration = Duration::from_secs(5);
@@ -725,19 +729,28 @@ impl Window {
     }
 }
 
-/// Whether a run is booting: from its `.running` file until its world is
-/// reached and settled. Before its log there is the wait for a quiet machine
-/// and its own build, which a second compile would only lengthen. A run past
-/// `BOOT_CAP` without a world is stuck, not booting.
-fn boot_of(started: Option<f64>, log_exists: bool, world_start: Option<f64>, now: f64) -> bool {
-    if started.is_some_and(|at| now - at >= BOOT_CAP) {
-        return false;
+/// Whether a run is booting: from its `.running` file (`since`) until its
+/// world is reached and settled. `log_since` is when the title's log was made
+/// (`None`: not yet, the run is building or waiting for a quiet machine, which
+/// a second compile would only lengthen).
+fn boot_of(since: f64, log_since: Option<f64>, world_start: Option<f64>, now: f64) -> bool {
+    match (log_since, world_start) {
+        (None, _) => now - since < PRELAUNCH_CAP,
+        (Some(_), Some(at)) => now < at + BOOT_SETTLE,
+        (Some(at), None) => now - at < BOOT_CAP,
     }
-    !log_exists || world_start.is_none_or(|at| now < at + BOOT_SETTLE)
+}
+
+/// When a file was made, in unix seconds.
+fn made_at(path: &Path) -> Option<f64> {
+    let meta = fs::metadata(path).ok()?;
+    let time = meta.created().or_else(|_| meta.modified()).ok()?;
+    Some(time.duration_since(UNIX_EPOCH).ok()?.as_secs_f64())
 }
 
 /// The name of a run that is booting, if one is: a `.running` request with no
-/// `.done`, its log read as `boot_of` asks.
+/// `.done`, its log read as `boot_of` asks. A log made before the run started
+/// is an older run's, and does not count.
 fn booting_run(dirs: &Dirs, now: f64) -> Option<String> {
     let entries = fs::read_dir(&dirs.queue).ok()?;
     entries.filter_map(|e| Some(e.ok()?.path())).find_map(|path| {
@@ -748,12 +761,16 @@ fn booting_run(dirs: &Dirs, now: f64) -> Option<String> {
         if dirs.file(&name, "done").exists() {
             return None;
         }
-        let started = fs::read_to_string(&path)
+        // A file that says nothing (half written, by hand) counts from its own time.
+        let since = fs::read_to_string(&path)
             .ok()
-            .and_then(|t| t.split_whitespace().nth(1).and_then(|s| s.parse::<f64>().ok()));
+            .and_then(|t| t.split_whitespace().nth(1).and_then(|s| s.parse::<f64>().ok()))
+            .or_else(|| made_at(&path))
+            .unwrap_or(now);
         let log = dirs.runs.join(&name).join("log.txt");
-        let world_start = log.is_file().then(|| smoke::Follow::new(&log).read().world_start()).flatten();
-        boot_of(started, log.is_file(), world_start, now).then_some(name)
+        let log_since = made_at(&log).filter(|&at| at >= since - 5.0);
+        let world_start = log_since.and_then(|_| smoke::Follow::new(&log).read().world_start());
+        boot_of(since, log_since, world_start, now).then_some(name)
     })
 }
 
@@ -1372,18 +1389,45 @@ requester = "local_d9f48aa8-e1b5-46aa-aeb1-92d20980a9a3"
 
     #[test]
     fn a_run_boots_until_its_world_is_reached_and_settled() {
-        // Quiet wait and own build: no log yet.
-        assert!(boot_of(Some(1000.0), false, None, 1010.0));
-        // The log, no world line.
-        assert!(boot_of(Some(1000.0), true, None, 1100.0));
+        // Quiet wait and own build: no log yet; stuck only long after.
+        assert!(boot_of(1000.0, None, None, 1010.0));
+        assert!(boot_of(1000.0, None, None, 1000.0 + BOOT_CAP + 100.0));
+        assert!(!boot_of(1000.0, None, None, 1000.0 + PRELAUNCH_CAP));
+        // The log, no world line: the cap counts from the log, not the run.
+        assert!(boot_of(1000.0, Some(1900.0), None, 2000.0));
+        assert!(boot_of(1000.0, Some(1900.0), None, 1900.0 + BOOT_CAP - 1.0));
+        assert!(!boot_of(1000.0, Some(1900.0), None, 1900.0 + BOOT_CAP));
         // The world, settling; then settled.
-        assert!(boot_of(Some(1000.0), true, Some(1100.0), 1100.0 + BOOT_SETTLE - 1.0));
-        assert!(!boot_of(Some(1000.0), true, Some(1100.0), 1100.0 + BOOT_SETTLE));
-        // A run stuck without a world holds nobody back for ever.
-        assert!(!boot_of(Some(1000.0), true, None, 1000.0 + BOOT_CAP));
-        assert!(!boot_of(Some(1000.0), false, None, 1000.0 + BOOT_CAP));
-        // The world proves it is no longer stuck, whatever its age.
-        assert!(!boot_of(Some(1000.0), true, Some(1100.0), 1000.0 + BOOT_CAP + 500.0));
+        assert!(boot_of(1000.0, Some(1050.0), Some(1100.0), 1100.0 + BOOT_SETTLE - 1.0));
+        assert!(!boot_of(1000.0, Some(1050.0), Some(1100.0), 1100.0 + BOOT_SETTLE));
+        // The window of the build ahead opens exactly when the boot ends.
+        assert!(build_window(true, Some(1100.0), 1100.0 + BOOT_SETTLE));
+        assert!(!boot_of(1000.0, Some(1050.0), Some(1100.0), 1100.0 + BOOT_SETTLE));
+        assert!(!build_window(true, Some(1100.0), 1100.0 + BOOT_SETTLE - 1.0));
+    }
+
+    #[test]
+    fn a_running_file_that_says_nothing_and_an_old_log_are_read_with_care() {
+        let dirs = scratch("wait-idle-care");
+        let now = unix_now() as f64;
+        // No started_unix: counted from the file's own time, so it boots now.
+        fs::write(dirs.file("b", "running"), "x").unwrap();
+        assert_eq!(booting_run(&dirs, now).as_deref(), Some("b"));
+        // The same file long ago: stuck, not booting for ever.
+        assert!(booting_run(&dirs, now + PRELAUNCH_CAP + 60.0).is_none());
+        // A log from before this run started is an older run's: still booting.
+        let run = dirs.runs.join("b");
+        fs::create_dir_all(&run).unwrap();
+        fs::write(
+            run.join("log.txt"),
+            "2026-01-01T00:00:00Z INFO victory_gpu::host: 1.0 fps, 1000.0 ms/frame (1.0 preparing: copies 0.0 ms 0.0 MB, textures 0.0 ms 0.0 MB; 2.0 on the GPU; 0.1 copying back 0.0 MB), 900 draws/frame, dropped 0 without a host pipeline (0 being made) and 0 indirect
+",
+        )
+        .unwrap();
+        fs::write(dirs.file("b", "running"), format!("started_unix {}
+", now as u64 + 3600)).unwrap();
+        assert_eq!(booting_run(&dirs, now).as_deref(), Some("b"));
+        fs::remove_dir_all(&dirs.queue).unwrap();
     }
 
     #[test]
