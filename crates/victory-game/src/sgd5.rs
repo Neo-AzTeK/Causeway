@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn bad_table_falls_back_to_markers() {
         let mut file = database();
-        // The effect's size no longer matches what its tables hold.
+        // The effect's size does not match what its tables hold.
         let at = memchr::memmem::find(&file, b"\x03fx\0").unwrap() + 4;
         file[at] ^= 1;
         assert!(databases(&file).is_empty());

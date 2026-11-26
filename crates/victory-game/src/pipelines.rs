@@ -10,10 +10,10 @@
 //! those hashes from the user's files: the shader databases' state blocks,
 //! the states the pack's register images encode, and for rasterisers and
 //! depth-stencil an enumeration of each field's usual values. A description
-//! counts only if its hash is the record's. (Of 25,471 records these name
-//! all three states of 21,036; one-byte changes of the named descriptions
-//! and a blend enumeration named states of 17 and 32 more records, none
-//! drawn with in the runs measured, and were left out.)
+//! counts only if its hash is the record's. Candidates that come only from
+//! one-byte changes of a named description, or from a blend enumeration, are
+//! left out: none was drawn with in the runs measured. How many records a
+//! given pack names is a fact of the user's files, not of this repo.
 //!
 //! Compact layouts (D3D12 enum values throughout):
 //!
