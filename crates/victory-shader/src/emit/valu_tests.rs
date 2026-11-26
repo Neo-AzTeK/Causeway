@@ -1755,3 +1755,60 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[test]
+fn doubles_convert_to_single_precision_as_ieee_rounds() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 0x0f).
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let cases: [(f64, u32); 7] = [
+        (1.0, 1.0f32.to_bits()),
+        (-2.5, (-2.5f32).to_bits()),
+        // Halfway between 1.0 and the next f32: to even.
+        (1.0 + 2f64.powi(-24), 0x3F80_0000),
+        // Just above halfway: up, which needs the low dword.
+        (1.0 + 2f64.powi(-24) + 2f64.powi(-50), 0x3F80_0001),
+        (1e300, f32::INFINITY.to_bits()),
+        (-1e300, f32::NEG_INFINITY.to_bits()),
+        (0.0, 0),
+    ];
+    let inputs = cases.map(|(x, _)| {
+        let b = x.to_bits();
+        [b as u32, (b >> 32) as u32, 0, 0]
+    });
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        assert_eq!(got, cases[i].1, "{backend}, {:e}", cases[i].0);
+    });
+}
+
+#[test]
+fn doubles_add_in_double_precision() {
+    let sum = |dword: u16| {
+        // v_add_f64 v[5:6], v[1:2], v[3:4] (VOP3 0x164); v_mov_b32 v0.
+        let add = vop3(0x164, 5, vgpr(1), vgpr(3), 0);
+        build_valu_cs(&[add[0], add[1], vop1(0x001, 0, dword)])
+    };
+    let cases: [(f64, f64); 3] = [
+        (1.0, 2f64.powi(-40)),
+        (1e16, -1e16 + 4.0),
+        (-0.1, -0.2),
+    ];
+    let split = |x: f64| [x.to_bits() as u32, (x.to_bits() >> 32) as u32];
+    let inputs = cases.map(|(a, b)| {
+        let ([a, b2], [c, d]) = (split(a), split(b));
+        [a, b2, c, d]
+    });
+    for (half, dword) in [vgpr(5), vgpr(6)].into_iter().enumerate() {
+        run_cases(&sum(dword), &inputs, |backend, i, _, got| {
+            let (a, b) = cases[i];
+            assert_eq!(got, split(a + b)[half], "{backend}, {a:e} + {b:e}");
+        });
+    }
+}
+
+#[test]
+fn a_shader_that_needs_doubles_says_so() {
+    let double = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    assert!(super::uses_doubles(&double.dxil));
+    let single = build_valu_cs(&[vop1(0x001, 0, vgpr(1))]);
+    assert!(!super::uses_doubles(&single.dxil));
+}

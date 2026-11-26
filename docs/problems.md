@@ -25,6 +25,7 @@ measure what the picture loses. Measured figures stay on this machine, not here 
 | 9 | `frame-preparing-cost` | here | CPU preparation is a large share of each world frame | measured, some runs not on a quiet machine |
 | 10 | `texture-refresh-menus` | here | on the GTX 1070 slow texture refresh stalls the menus, so unattended runs miss the world | measured on that adapter, older build |
 | 11 | `gpu-tests-hang` | here | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
+| 12 | `device-methods-missing` | here | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
 
 ## Finding what keeps the 3D scene from showing
 

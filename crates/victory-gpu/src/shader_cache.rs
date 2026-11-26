@@ -79,25 +79,54 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// What a device lacks that some translated shaders need: those are refused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lacks {
+    /// Double-precision shader operations.
+    pub doubles: bool,
+    /// `SV_Barycentrics`.
+    pub barycentrics: bool,
+}
+
+/// [`host_shader_for`] a device that lacks nothing.
+pub fn host_shader(container: &[u8], min_lod_clamp: bool, mesh_as_compute: bool, wave64_native: bool) -> (Result<HostShader, String>, bool) {
+    host_shader_for(container, min_lod_clamp, mesh_as_compute, wave64_native, Lacks::default())
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there. `mesh_as_compute`: mesh
 /// programs are made as compute (hosts without mesh shaders).
 /// `wave64_native`: a console wave of 64 is asked for as such (hosts without
-/// waves of 32).
-pub fn host_shader(
+/// waves of 32). `lacks`: what the device cannot run.
+pub fn host_shader_for(
     container: &[u8],
     min_lod_clamp: bool,
     mesh_as_compute: bool,
     wave64_native: bool,
+    lacks: Lacks,
 ) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true, min_lod_clamp, mesh_as_compute, wave64_native };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let shader = victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string())?;
+        runs_here(shader, lacks)
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), (min_lod_clamp, mesh_as_compute, wave64_native), container, translate),
+        Some(cache) => cached(cache, build(), (min_lod_clamp, mesh_as_compute, wave64_native, lacks), container, translate),
         None => (translate(container), false),
     }
+}
+
+/// `shader`, unless the device cannot run it.
+fn runs_here(shader: HostShader, lacks: Lacks) -> Result<HostShader, String> {
+    if lacks.doubles && victory_shader::emit::uses_doubles(&shader.dxil) {
+        return Err("double-precision arithmetic is not supported by this device".into());
+    }
+    if lacks.barycentrics && victory_shader::emit::uses_barycentrics(&shader.dxil) {
+        return Err("reading barycentrics is not supported by this device".into());
+    }
+    Ok(shader)
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -131,12 +160,14 @@ fn device_key(min_lod_clamp: bool, mesh_as_compute: bool, wave64_native: bool) -
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
-    (min_lod_clamp, mesh_as_compute, wave64_native): (bool, bool, bool),
+    (min_lod_clamp, mesh_as_compute, wave64_native, lacks): (bool, bool, bool, Lacks),
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> (Result<HostShader, String>, bool) {
     // The device's capability changes what translates: it is part of the key.
-    let device = device_key(min_lod_clamp, mesh_as_compute, wave64_native);
+    let device = device_key(min_lod_clamp, mesh_as_compute, wave64_native)
+        | u8::from(lacks.doubles) << 3
+        | u8::from(lacks.barycentrics) << 4;
     let input = [&build[..], &[device], container].concat();
     let converter = Translate {
         translate,
@@ -422,13 +453,14 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert!(!cached(&cache, &build, (false, false, false), container, translate).1);
-        assert!(!cached(&cache, &build, (false, true, false), container, translate).1);
-        assert!(!cached(&cache, &build, (true, true, false), container, translate).1);
-        assert_eq!(runs.load(Ordering::Relaxed), 3, "three keys, three translations");
-        assert!(cached(&cache, &build, (false, true, false), container, translate).1);
-        assert!(cached(&cache, &build, (false, false, false), container, translate).1);
-        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        assert!(!cached(&cache, &build, (false, false, false, Lacks::default()), container, translate).1);
+        assert!(!cached(&cache, &build, (false, true, false, Lacks::default()), container, translate).1);
+        assert!(!cached(&cache, &build, (true, true, false, Lacks::default()), container, translate).1);
+        assert!(!cached(&cache, &build, (true, true, false, Lacks { doubles: true, barycentrics: false }), container, translate).1);
+        assert_eq!(runs.load(Ordering::Relaxed), 4, "four keys, four translations");
+        assert!(cached(&cache, &build, (false, true, false, Lacks::default()), container, translate).1);
+        assert!(cached(&cache, &build, (false, false, false, Lacks::default()), container, translate).1);
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
     }
 
     /// A translation asking for waves of 64 is its own entry, and a host
@@ -453,10 +485,10 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert!(!cached(&cache, &build, (false, false, false), container, translate).1);
-        assert!(!cached(&cache, &build, (false, false, true), container, translate).1);
-        assert!(cached(&cache, &build, (false, false, true), container, translate).1);
-        assert!(cached(&cache, &build, (false, false, false), container, translate).1);
+        assert!(!cached(&cache, &build, (false, false, false, Lacks::default()), container, translate).1);
+        assert!(!cached(&cache, &build, (false, false, true, Lacks::default()), container, translate).1);
+        assert!(cached(&cache, &build, (false, false, true, Lacks::default()), container, translate).1);
+        assert!(cached(&cache, &build, (false, false, false, Lacks::default()), container, translate).1);
         assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 
@@ -472,18 +504,18 @@ mod tests {
             Ok(shader())
         };
         assert_eq!(
-            cached(&cache, &build, (false, false, false), container, translate),
+            cached(&cache, &build, (false, false, false, Lacks::default()), container, translate),
             (Ok(shader()), false)
         );
         assert_eq!(
-            cached(&cache, &build, (false, false, false), container, translate),
+            cached(&cache, &build, (false, false, false, Lacks::default()), container, translate),
             (Ok(shader()), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
         assert_eq!(
-            cached(&cache, &[8; 32], (false, false, false), container, translate).0,
+            cached(&cache, &[8; 32], (false, false, false, Lacks::default()), container, translate).0,
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
@@ -493,12 +525,12 @@ mod tests {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
         assert_eq!(
-            cached(&cache, &build, (false, false, false), container, translate),
+            cached(&cache, &build, (false, false, false, Lacks::default()), container, translate),
             (Ok(shader()), false)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(
-            cached(&cache, &build, (false, false, false), container, translate),
+            cached(&cache, &build, (false, false, false, Lacks::default()), container, translate),
             (Ok(shader()), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -510,8 +542,8 @@ mod tests {
             Err::<HostShader, _>("unsupported".to_owned())
         };
         let refused = (Err("unsupported".to_owned()), false);
-        assert_eq!(cached(&cache, &build, (false, false, false), b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, (false, false, false), b"other", fail), (refused.0, true));
+        assert_eq!(cached(&cache, &build, (false, false, false, Lacks::default()), b"other", fail), refused);
+        assert_eq!(cached(&cache, &build, (false, false, false, Lacks::default()), b"other", fail), (refused.0, true));
         assert_eq!(fails.load(Ordering::Relaxed), 1);
     }
 

@@ -219,11 +219,15 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(
+    let (host, cached) = crate::shader_cache::host_shader_for(
         container,
         crate::host::host().is_some_and(|h| crate::caps::min_lod_clamp(&h.caps)),
         crate::host::host().is_some_and(|h| !crate::caps::mesh_shaders(&h.caps)),
         crate::host::host().is_some_and(|h| crate::caps::wave64_native(&h.caps)),
+        crate::host::host().map_or_else(Default::default, |h| crate::shader_cache::Lacks {
+            doubles: !crate::caps::doubles(&h.caps),
+            barycentrics: !crate::caps::barycentrics(&h.caps),
+        }),
     );
     (host.and_then(|host| with_resources(container, host)), cached)
 }

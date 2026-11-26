@@ -430,6 +430,26 @@ pub struct Options {
     pub wave64_native: bool,
 }
 
+/// Whether the host shader `dxil` computes in double precision, which a host
+/// without `Caps::doubles` cannot run.
+pub fn uses_doubles(dxil: &[u8]) -> bool {
+    features(dxil) & 1 != 0
+}
+
+/// Whether the host shader `dxil` reads `SV_Barycentrics`, which a host
+/// without `Caps::barycentrics` cannot run.
+pub fn uses_barycentrics(dxil: &[u8]) -> bool {
+    features(dxil) & 0x2_0000 != 0
+}
+
+/// The feature bits a container asks of its host (`SFI0`).
+fn features(dxil: &[u8]) -> u64 {
+    let container = Container::parse(dxil).ok();
+    let part = container.as_ref().and_then(|c| c.part(FourCC(*b"SFI0")));
+    let bytes = part.and_then(|p| p.data.get(..8)?.try_into().ok());
+    bytes.map_or(0, u64::from_le_bytes)
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -617,29 +637,43 @@ fn emit_once(
         }
         _ => 0,
     };
-    let parts = |st, res| lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs: inputs.clone(),
-        outputs: outputs.clone(),
-        prims: prims.clone(),
-        mesh_stride,
-        view_marks: options.view_marks,
-        min_lod_clamp: options.min_lod_clamp,
-        mesh_compute,
-        wave64_native: options.wave64_native,
+    let lowered = |io: &io::Io| {
+        let with = |st: &structure::Structured, res: &resource::Resources| {
+            lower::lower(&lower::Parts {
+                native,
+                p,
+                st,
+                io,
+                res,
+                inputs: inputs.clone(),
+                outputs: outputs.clone(),
+                prims: prims.clone(),
+                mesh_stride,
+                view_marks: options.view_marks,
+                min_lod_clamp: options.min_lod_clamp,
+                mesh_compute,
+                wave64_native: options.wave64_native,
+            })
+        };
+        match with(st, res) {
+            // Discarded lanes kept on as helpers can read what no surviving
+            // lane does (a register only killed lanes skipped writing); such a
+            // program kills them as the console does (`structure::killing`).
+            Err(_) if !st.discards.is_empty() => {
+                let st = structure::killing(p)?;
+                let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+                with(&st, &res)
+            }
+            l => l,
+        }
     };
-    let l = match lower::lower(&parts(st, res)) {
-        // Discarded lanes kept on as helpers can read what no surviving
-        // lane does (a register only killed lanes skipped writing); such a
-        // program kills them as the console does (`structure::killing`).
-        Err(_) if !st.discards.is_empty() => {
-            let st = structure::killing(p)?;
-            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+    let l = match lowered(io) {
+        // A register that holds barycentrics reaches more than an
+        // interpolation: only then is the host asked for them.
+        Err(ShaderError::Unsupported { what: "barycentrics read directly", .. }) => {
+            let mut io = io.clone();
+            io.barycentrics = io::direct_barycentrics(p, &io);
+            lowered(&io)?
         }
         l => l?,
     };
@@ -1670,6 +1704,128 @@ mod tests {
         assert!(whole.to_string().contains("first half"), "{whole}");
         let part = program(0x3408_0488).unwrap_err(); // v_lshlrev_b32 v4, 8, v2
         assert!(part.to_string().contains("first half"), "{part}");
+    }
+
+    /// A barycentric register read as a number comes from the host's
+    /// `SV_Barycentrics`; a program that only interpolates with them asks
+    /// the host for none.
+    #[test]
+    fn barycentrics_read_directly_come_from_the_host() {
+        let program = |read: u32| {
+            let words = [
+                0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+                read,           // v3 from j or from the attribute
+                0xF800_180F,
+                0x0303_0302, // exp mrt0, v2, v3, v3, v3 done vm
+                0xBF81_0000,
+            ];
+            let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+            let osg1 = rows(&[("SV_Target", 16, false)], false);
+            emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap()
+        };
+        let direct = program(0x7E06_0301); // v_mov_b32 v3, v1
+        assert!(super::uses_barycentrics(&direct.dxil));
+        let plain = program(0x7E06_0302); // v_mov_b32 v3, v2
+        assert!(!super::uses_barycentrics(&plain.dxil));
+    }
+
+    /// A vertex shader passing `POSITION` through, with its z in every
+    /// component of `TEXCOORD0` (row 0, where the pixel programs here take
+    /// it).
+    #[cfg(windows)]
+    fn corner_values() -> Vec<u8> {
+        use super::bitcode::{Attr, Term};
+        let mut s = super::shader::Shader::new(false);
+        let b = s.entry;
+        let element = |name: &str, kind, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: if row == 0 { 2 } else { 4 },
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xf,
+            half: false,
+        };
+        let mut position = Vec::new();
+        for col in 0..4u8 {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            position.push(s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args));
+        }
+        for col in 0..4u8 {
+            for (id, v) in [(0, position[2]), (1, position[usize::from(col)])] {
+                let args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), v];
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
+        }
+        let mut input = element("POSITION", 0, 0);
+        input.interp = 0;
+        s.inputs = vec![input];
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    /// The console's i and j, read as numbers, weigh the second and third
+    /// vertex: with them an attribute that differs at each corner comes out
+    /// as the host interpolates it.
+    #[cfg(windows)]
+    #[test]
+    fn direct_barycentrics_weigh_the_second_and_third_vertex() {
+        use super::host::{Draw, Host};
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E06_0300,    // v_mov_b32 v3, v0
+            0x7E08_0301,    // v_mov_b32 v4, v1
+            0xF800_180F,
+            0x0204_0302, // exp mrt0, v2, v3, v4, v2 done vm
+            0xBF81_0000,
+        ];
+        let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let ps = emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap();
+        let mut vs = corner_values();
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut vs).unwrap();
+        }
+        let corner = [0.125f32, 0.25, 0.875];
+        #[rustfmt::skip]
+        let vertices = [
+            -1.0, -1.0, corner[0], 1.0,
+            -1.0, 3.0, corner[1], 1.0,
+            3.0, -1.0, corner[2], 1.0,
+        ];
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_with(&root, &vs, &ps.dxil).unwrap();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &vertices,
+                stride: 16,
+                size: (8, 8),
+                mesh_groups: 0,
+            };
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            for &[value, i, j, _] in &texels {
+                let weighed = corner[0] + i * (corner[1] - corner[0]) + j * (corner[2] - corner[0]);
+                assert!((value - weighed).abs() < 1e-3, "warp {warp}: {value} for i {i}, j {j}");
+            }
+            assert!(texels.iter().any(|t| (t[1] - t[2]).abs() > 0.1), "warp {warp}: {texels:?}");
+            eprintln!("barycentrics weighed as expected, warp {warp}");
+            ran += 1;
+        }
+        assert!(ran > 0, "no device ran the draw");
     }
 
     /// A pixel export before the `done` one, both under a lane guard (EXEC

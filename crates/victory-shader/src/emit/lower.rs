@@ -446,6 +446,23 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+/// DXIL's semantic kind of `SV_Barycentrics`.
+const BARYCENTRICS: u8 = 28;
+
+/// The DXIL interpolation mode that weighs vertices as `kind` does; the pull
+/// model has none.
+fn interp_mode(kind: Barycentric) -> Option<u8> {
+    match kind {
+        Barycentric::PerspectiveCenter => Some(2),
+        Barycentric::PerspectiveCentroid => Some(3),
+        Barycentric::PerspectiveSample => Some(6),
+        Barycentric::LinearCenter => Some(4),
+        Barycentric::LinearCentroid => Some(5),
+        Barycentric::LinearSample => Some(7),
+        Barycentric::PerspectivePullModel => None,
+    }
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1640,6 +1657,9 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    Some(&Input::Barycentric { kind, index }) if self.x.io.barycentrics.contains(&v) => {
+                        self.barycentric(kind, index)
+                    }
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -1649,6 +1669,36 @@ impl<'a> Lower<'a> {
             self.vals.insert(v, val);
         }
         Ok(())
+    }
+
+    /// A barycentric register as the host has it. The console's i and j are
+    /// the weights of the second and third vertex, the second and third
+    /// components of `SV_Barycentrics`.
+    fn barycentric(&mut self, kind: Barycentric, index: u8) -> Val {
+        let Some(mode) = interp_mode(kind).filter(|_| index < 2) else {
+            return Val::Missing("pull-model barycentrics read directly");
+        };
+        let mine = |e: &SigElement| e.kind == BARYCENTRICS;
+        let found = self.s.inputs.iter().position(|e| mine(e) && e.interp == mode);
+        let id = found.unwrap_or_else(|| {
+            let index = self.s.inputs.iter().filter(|e| mine(e)).count() as u32;
+            self.s.flags |= flags::BARYCENTRICS;
+            self.s.inputs.push(SigElement {
+                name: "SV_Barycentrics".into(),
+                index,
+                kind: BARYCENTRICS,
+                comp: 9,
+                interp: mode,
+                // Not packed into a register: the validator says so.
+                row: None,
+                col: 0,
+                cols: 3,
+                usage: 0,
+                half: false,
+            });
+            self.s.inputs.len() - 1
+        });
+        self.load_any_input(id, index + 1)
     }
 
     fn input(&mut self, input: Input) -> Val {
@@ -6041,6 +6091,7 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_cvt_f32_f64" | "v_add_f64" => self.double(inst, name, guard),
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -6844,6 +6895,84 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// A double-precision operation.
+    fn double(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.clamp || v.omod != 0 {
+            return Err("a double-precision output modifier");
+        }
+        self.s.flags |= flags::DOUBLES;
+        let c = self.cur;
+        let a = self.fsrc64(inst, 0)?;
+        if name == "v_cvt_f32_f64" {
+            let f32t = self.s.t.f32;
+            let r = self.s.m.cast(c, Cast::FpTrunc, a, f32t);
+            return self.write_f(inst, r, guard);
+        }
+        let b = self.fsrc64(inst, 1)?;
+        let r = self.s.m.bin(c, Bin::Add, a, b);
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a 64-bit result");
+        };
+        let pair = vec![self.s.t.i32; 2];
+        let split = self.s.m.named_struct("dx.types.splitdouble", pair);
+        let r = self.s.op(c, "splitDouble.f64", Attr::ReadNone, split, 102, &[r]);
+        for k in 0..2 {
+            let dword = self.s.m.extract(c, r, u32::from(k));
+            self.write(inst, Reg::V(reg + k), dword, guard);
+        }
+        Ok(())
+    }
+
+    /// Source `k` as a double: a register pair; an inline constant of its
+    /// value; or a literal, which is the high dword.
+    fn fsrc64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let (abs, neg) = (v.abs >> k & 1 != 0, v.neg >> k & 1 != 0);
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let constant = |l: &mut Self, bits: u64| (l.s.m.i32(bits as u32), l.s.m.i32((bits >> 32) as u32));
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code: NULL, .. } => constant(self, 0),
+            Operand::Scalar { code, .. } => pair(self, Reg::S(code), Reg::S(code + 1))?,
+            Operand::Const(n @ 128..=208) => {
+                let x = crate::resource::inline(n).ok_or("a special operand")?;
+                constant(self, i64::from(x as i32) as u64)
+            }
+            Operand::Const(n @ 240..=247) => {
+                let x = [0.5f64, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0][usize::from(n - 240)];
+                constant(self, x.to_bits())
+            }
+            // 1 / (2 pi).
+            Operand::Const(248) => constant(self, 0x3FC4_5F30_6DC9_C882),
+            Operand::Literal(x) => constant(self, u64::from(x) << 32),
+            _ => return Err("a double-precision operand"),
+        };
+        let c = self.cur;
+        if abs {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, mask);
+        }
+        if neg {
+            let sign = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, sign);
+        }
+        let double = self.s.m.double();
+        Ok(self.s.op(c, "makeDouble.f64", Attr::ReadNone, double, 101, &[lo, hi]))
     }
 
     /// The low and high dwords of an i64.
@@ -8110,15 +8239,7 @@ impl<'a> Lower<'a> {
                 ..
             } => (
                 attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
+                interp_mode(*barycentric).ok_or("pull-model interpolation")?,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {

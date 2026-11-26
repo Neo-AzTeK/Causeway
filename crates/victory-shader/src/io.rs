@@ -204,6 +204,27 @@ pub struct Io {
     /// root parameter's, then the primitive mask and the ordered-section
     /// (POPS) collision id, as every pixel program of the title reads them).
     pub initialized_sgprs: Option<u8>,
+    /// Barycentric inputs to load from the host (`SV_Barycentrics`) for code
+    /// that reads the registers themselves; empty: such a read is refused.
+    pub barycentrics: Vec<Value>,
+}
+
+/// The barycentric inputs `p` reads other than to interpolate with them:
+/// by another instruction, or where paths join (which may be paths on which
+/// no lane goes on to use the value, but emission cannot tell).
+pub fn direct_barycentrics(p: &Program, io: &Io) -> Vec<Value> {
+    let reads = |v: Value| {
+        p.blocks.iter().any(|b| {
+            let joined = b.phis.iter().any(|phi| phi.args.contains(&v));
+            let mut others = b.insts.iter().filter(|i| !i.name().starts_with("v_interp_"));
+            joined || others.any(|i| i.reads.iter().any(|r| r.1 == v))
+        })
+    };
+    io.inputs
+        .iter()
+        .filter(|(v, input)| matches!(input, Input::Barycentric { .. }) && reads(*v))
+        .map(|&(v, _)| v)
+        .collect()
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -308,6 +329,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     };
 
     let mut io = Io {
+        barycentrics: Vec::new(),
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),

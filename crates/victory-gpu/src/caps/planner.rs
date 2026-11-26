@@ -86,6 +86,18 @@ pub fn wave64_native(caps: &Caps) -> bool {
     caps.wave.is_some_and(|w| w.min > 32 && w.max >= 64)
 }
 
+/// Whether pixel shaders may read `SV_Barycentrics`: a translated program
+/// that does is refused where they may not.
+pub fn barycentrics(caps: &Caps) -> bool {
+    caps.barycentrics == Some(true)
+}
+
+/// Whether shaders may compute in double precision: a translated program
+/// that does is refused where they may not.
+pub fn doubles(caps: &Caps) -> bool {
+    caps.doubles == Some(true)
+}
+
 /// Whether sampling with a least-level clamp is native (tiled resources
 /// tier 2 or better).
 pub fn min_lod_clamp(caps: &Caps) -> bool {

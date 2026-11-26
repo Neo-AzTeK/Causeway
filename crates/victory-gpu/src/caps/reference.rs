@@ -63,6 +63,8 @@ fn base(name: &str, vendor_id: u32, wave: (u32, u32), tiers: (u8, u8, u8)) -> Ca
         typed_atomics64: Some(false),
         heap_atomics64: Some(false),
         aniso_point_mip: Some(false),
+        doubles: Some(true),
+        barycentrics: Some(true),
         uma: Some(false),
         memory: MemoryCaps { budget: Some(7 * GIB), dedicated: 8 * GIB, shared: 16 * GIB },
         formats: BTreeMap::new(),
@@ -121,6 +123,7 @@ pub fn nvidia_pascal() -> Caps {
         typed_atomics64: Some(true),
         heap_atomics64: Some(true),
         memory: MemoryCaps { budget: Some(7_653_556_224), dedicated: 8067 << 20, shared: 16 * GIB },
+        barycentrics: Some(false),
         ..base("nvidia-pascal", 0x10de, (32, 32), (3, 4, 0))
     }
 }
