@@ -6,9 +6,9 @@
 //! skipped. Dispatches, copies, clears and synchronization all run, so a
 //! frame can still take longer. Small draws (fullscreen passes, quads)
 //! always run, so a finished picture still reaches the screen. H in the
-//! game window draws the next frames in full, then keeps the last of them in
-//! the window until H is pressed again. The title is not stopped: it goes on
-//! behind that picture, under the limit.
+//! game window draws one whole frame in full, then holds the game at that
+//! picture until H is pressed again. The hold blocks the thread that
+//! presents; the title's other threads go on until they wait for it.
 //!
 //! `VICTORY_PROFILE=<file>`: one CSV line for each presented frame.
 //!
@@ -23,12 +23,12 @@ use std::time::Instant;
 
 /// Draws of up to this many vertices or indices are never skipped.
 const SMALL: u32 = 6;
-/// The fewest frames drawn in full before the picture is held: effects that
-/// build over several frames need them.
-const SETTLE: u64 = 8;
-/// The most: past [`SETTLE`] the picture waits for the pipelines still being
-/// made, whose draws are dropped until then, but a title may always have one.
-const SETTLE_LIMIT: u64 = 64;
+/// Presents not counted after H: the frame under way, and one the title may
+/// have recorded ahead, have draws that were skipped.
+const PARTIAL: u64 = 2;
+/// The most full frames drawn while the picture waits for pipelines still
+/// being made, whose draws are dropped until then; a title may always have one.
+const SETTLE_LIMIT: u64 = 8;
 /// The fewest other draws a limited frame may record.
 const FLOOR: u64 = 32;
 
@@ -38,8 +38,6 @@ static BUDGET_MS: LazyLock<Option<f64>> = LazyLock::new(|| {
 static FULL: AtomicBool = AtomicBool::new(false);
 /// Full frames drawn since H asked for them.
 static SETTLED: AtomicU64 = AtomicU64::new(0);
-/// The window keeps the picture it has.
-static HELD: AtomicBool = AtomicBool::new(false);
 /// The frame had full drawing at some point.
 static WAS_FULL: AtomicBool = AtomicBool::new(false);
 static ALLOWED: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -89,37 +87,32 @@ fn toggle_full() {
     if BUDGET_MS.is_none() {
         return;
     }
-    if HELD.swap(false, Relaxed) {
-        tracing::info!("draw budget: H pressed, picture released");
-        return;
-    }
     let full = !FULL.fetch_xor(true, Relaxed);
     if full {
         WAS_FULL.store(true, Relaxed);
     }
     SETTLED.store(0, Relaxed);
-    HELD.store(false, Relaxed);
     tracing::info!(full, "draw budget: H pressed");
 }
 
-/// Whether the window is to keep its picture: frames are not presented.
-pub(crate) fn picture_held() -> bool {
-    HELD.load(Relaxed)
-}
-
-/// After a presented full frame: holds the picture once enough were drawn.
-/// A held picture ends the full drawing, so the title goes on quickly.
-fn settle() {
-    if !FULL.load(Relaxed) || HELD.load(Relaxed) {
-        return;
+/// After a presented full frame: once a whole one is on the screen, keeps the
+/// game here until H is pressed again. True if it did.
+fn hold() -> bool {
+    if !FULL.load(Relaxed) {
+        return false;
     }
-    let drawn = SETTLED.fetch_add(1, Relaxed) + 1;
+    let Some(whole) = (SETTLED.fetch_add(1, Relaxed) + 1).checked_sub(PARTIAL) else {
+        return false;
+    };
     let waiting = crate::pipeline::making();
-    if drawn >= SETTLE_LIMIT || (drawn >= SETTLE && waiting == 0) {
-        HELD.store(true, Relaxed);
-        FULL.store(false, Relaxed);
-        tracing::info!(drawn, waiting, "draw budget: picture held; H goes on");
+    if whole == 0 || (waiting > 0 && whole < SETTLE_LIMIT) {
+        return false;
     }
+    tracing::info!(whole, waiting, "draw budget: game held at a full frame; H goes on");
+    while FULL.load(Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
 }
 
 struct Frames {
@@ -183,8 +176,10 @@ pub(crate) fn frame(totals: [u64; 6]) {
             spent[5]
         );
     }
-    // A full frame is one that reached the window with no limit all along.
-    if full && BUDGET_MS.is_some() {
-        settle();
+    // Not held under the lock: nothing else may wait for it.
+    drop(frames);
+    if BUDGET_MS.is_some() && hold() {
+        // The time held is no frame's.
+        FRAMES.lock().unwrap_or_else(|e| e.into_inner()).started = Instant::now();
     }
 }
