@@ -327,10 +327,28 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+        // With `VICTORY_EMIT_DUMP`, the pairs' shaders are written as files
+        // and no pipeline is made: the GPU is not touched.
+        let dump = std::env::var_os("VICTORY_EMIT_DUMP");
+        let host = match dump {
+            Some(_) => None,
+            None => Some(Host::new(false).map_err(anyhow::Error::msg)?),
+        };
         for (v, p) in &pairs {
+            if let Some(dir) = &dump {
+                for name in [v, p] {
+                    if let Some((label, shader)) = find(name) {
+                        let file = Path::new(dir).join(format!("{name}.dxil"));
+                        std::fs::write(&file, &shader.dxil)?;
+                        println!("pair {v} + {p}: {label} -> {}", file.display());
+                    } else {
+                        println!("pair {v} + {p}: {name} not emitted");
+                    }
+                }
+            }
+            let Some(host) = &host else { continue };
             let made = match (find(v), find(p)) {
                 (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
@@ -617,8 +635,6 @@ fn translate(
                     }
                 };
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
-                    let label = || format!("{} {:?}", example(), p.stage);
-                    *counter(t, p.stage, 0) += 1;
                     // The container's hash as the GPU side logs it.
                     let size = bytes
                         .get(24..28)
@@ -626,6 +642,10 @@ fn translate(
                         .map_or(0, u32::from_le_bytes) as usize;
                     let hash = blake3::hash(bytes.get(..size).unwrap_or(&bytes)).to_hex()[..16]
                         .to_owned();
+                    // In every label, so a log's hashes name a program
+                    // (`VICTORY_PAIRS`).
+                    let label = || format!("{} {:?} {hash}", example(), p.stage);
+                    *counter(t, p.stage, 0) += 1;
                     let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP, mesh_as_compute: false, wave64_native: false };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {

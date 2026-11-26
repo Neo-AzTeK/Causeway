@@ -609,7 +609,7 @@ mod tests {
 /// clipping off, so every group draws. Runs on the adapter `host()` takes
 /// (the hardware one; WARP with `VICTORY_D3D12_WARP=1` and diagnostics).
 #[cfg(all(test, windows))]
-mod gpu_tests {
+pub(crate) mod gpu_tests {
     use super::*;
     use crate::host::{Host, HostList};
     use victory_shader::emit::{MESH_SPACE, Options};
@@ -623,8 +623,8 @@ mod gpu_tests {
     const SIZE: u32 = 16;
 
     /// The console container (its output signature: SV_Position) and the
-    /// mesh program made as compute.
-    fn program() -> (Vec<u8>, victory_shader::emit::HostShader) {
+    /// mesh program, as a mesh shader or made as compute.
+    pub(crate) fn program(mesh_as_compute: bool) -> (Vec<u8>, victory_shader::emit::HostShader) {
         let words = [
             0x7E00_0505u32, // v_readfirstlane_b32 s0, v5
             0x7E0C_0C00,    // v_cvt_f32_u32 v6, s0
@@ -685,7 +685,7 @@ mod gpu_tests {
         let res = victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = victory_shader::io::raise(&p, &native).unwrap();
         let options = Options {
-            mesh_as_compute: true,
+            mesh_as_compute,
             ..Options::default()
         };
         let cs = victory_shader::emit::emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
@@ -721,7 +721,7 @@ mod gpu_tests {
     }
 
     fn passes(host: &Host) -> Passes {
-        let (container, cs) = program();
+        let (container, cs) = program(true);
         assert_eq!(cs.user_data_dwords(), 0, "the program reads no user data");
         let vs = victory_shader::emit::mesh_vertex_shader(&container).unwrap();
         let ps = victory_shader::emit::flat_pixel_shader(&[0]);
