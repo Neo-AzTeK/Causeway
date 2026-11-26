@@ -1582,12 +1582,7 @@ impl<'a> Lower<'a> {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
                 Reg::S(n) => match io_inputs.get(&v) {
-                    Some(&input) => match input {
-                        Input::Barycentric { kind, index } if self.x.io.barycentrics.contains(&v) => {
-                            self.barycentric(kind, index)
-                        }
-                        _ => self.input(input),
-                    },
+                    Some(&input) => self.input(input),
                     // Above the SGPRs the hardware initializes, a register
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch
@@ -1613,6 +1608,9 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    Some(&Input::Barycentric { kind, index }) if self.x.io.barycentrics.contains(&v) => {
+                        self.barycentric(kind, index)
+                    }
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -1634,8 +1632,6 @@ impl<'a> Lower<'a> {
         let mine = |e: &SigElement| e.kind == BARYCENTRICS;
         let found = self.s.inputs.iter().position(|e| mine(e) && e.interp == mode);
         let id = found.unwrap_or_else(|| {
-            let rows = self.s.inputs.iter().filter_map(|e| e.row);
-            let row = rows.map(|r| r + 1).max().unwrap_or(0);
             let index = self.s.inputs.iter().filter(|e| mine(e)).count() as u32;
             self.s.flags |= flags::BARYCENTRICS;
             self.s.inputs.push(SigElement {
@@ -1644,7 +1640,8 @@ impl<'a> Lower<'a> {
                 kind: BARYCENTRICS,
                 comp: 9,
                 interp: mode,
-                row: Some(row),
+                // Not packed into a register: the validator says so.
+                row: None,
                 col: 0,
                 cols: 3,
                 usage: 0,
@@ -8114,7 +8111,7 @@ impl<'a> Lower<'a> {
                 ..
             } => (
                 attribute,
-                interp_mode(barycentric).ok_or("pull-model interpolation")?,
+                interp_mode(*barycentric).ok_or("pull-model interpolation")?,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
