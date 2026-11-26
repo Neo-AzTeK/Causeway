@@ -181,6 +181,7 @@ fn program() -> HostShader {
         mesh_stride: 0,
         min_lod_clamp: false,
         mesh_compute: false,
+        wave64_native: false,
         view_marks: false,
     })
     .expect("lower");
@@ -409,6 +410,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         mesh_stride: 0,
         min_lod_clamp: false,
         mesh_compute: false,
+        wave64_native: false,
         view_marks: false,
     })
     .expect("lower");
@@ -557,6 +559,7 @@ fn writes_through_views_mark_their_pages() {
         mesh_stride: 0,
         min_lod_clamp: false,
         mesh_compute: false,
+        wave64_native: false,
         view_marks: true,
     })
     .expect("lower");

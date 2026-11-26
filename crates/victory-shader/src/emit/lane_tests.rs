@@ -699,6 +699,27 @@ fn a_wave64_skip_over_a_lane_read_is_left_out_for_two_waves_of_32() {
     assert_eq!(skips_left_out(&after), after);
 }
 
+/// A host without waves of 32 is asked for waves of 64 where the others get two
+/// waves of 32 (`caps::wave64_native`): the same program, either way.
+#[test]
+fn a_host_without_waves_of_32_is_asked_for_waves_of_64() {
+    use super::image_tests::translate_host;
+    let body = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0008,
+        0x0002_02C1, // v_mbcnt_hi_u32_b32 v8, -1, v1
+    ];
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let waves = |native| {
+        let shader = translate_host(&words, (ResourceType::Srv, 8, 0), (true, 64, 0), (true, native)).unwrap();
+        check(&shader);
+        crate::emit::required_waves(&shader.dxil)
+    };
+    assert_eq!(waves(false), Some((32, 32)), "two waves of 32 stand in for one");
+    assert_eq!(waves(true), Some((64, 64)), "waves of 64 as the console runs them");
+}
+
 #[test]
 fn a_mask_set_to_a_constant_then_a_compare_joins() {
     let body = [
