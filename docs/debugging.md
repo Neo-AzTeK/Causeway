@@ -30,7 +30,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records process audio output to WAV |
 | `VICTORY_XMA_DUMP=<dir>` | dumps context and input for first 32 XMA voices |
 
-Crashes and host GPU failures append to `crashes.log` in the title's data folder after the title's crash filter returns, followed by latest debug output and report path if saved. On `int3` breakpoints in diagnostics builds, unhandled reports also log up to eight quadwords at each register target except `rsp` (excluding loaded images; title memory in log/console—do not copy into repo).
+Crashes and host GPU failures append to `crashes.log` in the title's data folder after the title's crash filter returns, followed by latest debug output and report path if saved. An access violation's report names the reservation an uncommitted address lies in and the faulting thread's stack range. On `int3` breakpoints and access violations in diagnostics builds, unhandled reports also log up to eight quadwords at each register target except `rsp` (excluding loaded images; title memory in log/console—do not copy into repo).
 
 ## Smoke runs
 

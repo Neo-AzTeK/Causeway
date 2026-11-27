@@ -31,8 +31,12 @@ Each item names its problem in the ranked table below.
       both sides (problem notes, "Confirm: refusal shift")
 - [ ] The title's code wrote to memory reserved but never committed and the
       run stopped (0xc0000005 in the title's image, one quiet run of `main`
-      before the `descriptor-slots` merge; `image-uncommitted-write`). Find
-      which reservation and who should have committed it
+      before the `descriptor-slots` merge; `image-uncommitted-write`). Not a
+      missing commit: a bytecode interpreter in the title stored through an
+      out-of-range operand index into a register file on its own stack, past
+      the stack's top. Find where the bad index came from; the crash report
+      now names the reservation, the thread's stack and what the registers
+      point at, for the next time it happens
 - [ ] `victory-shader` test `direct_barycentrics_weigh_the_second_and_third_vertex`
       fails on a host without barycentrics (GTX 1070: making its pipeline is
       refused) instead of skipping; seen on `main` and branches alike (no
@@ -125,7 +129,7 @@ measure what the picture loses.
 | 14 | `device-methods-missing` | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
 | 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charges the rest of the list to its last timed command, so slow-command lines mislead on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list |
 | 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay (rank not confirmed by the owner) | seen twice on 2026-11-27 on the GTX 1070; both dumps: `dxgmms2!VIDMM_GLOBAL::EnsureLockedPages` after a failed lock of our process's pages, during an eviction from a system-memory segment; which pages, not known |
-| 17 | `image-uncommitted-write` | the title's code wrote to an address reserved but never committed and the run stopped with an access violation (rank not confirmed by the owner) | seen once on 2026-11-27, in a quiet run of `main`; cause unknown |
+| 17 | `image-uncommitted-write` | the title's code wrote to an address reserved but never committed and the run stopped with an access violation (rank not confirmed by the owner) | seen once on 2026-11-27, in a quiet run of `main`; a wild index in the title's interpreter, its source unknown; crash report extended to catch it |
 
 ## Finding what keeps the 3D scene from showing
 
