@@ -39,6 +39,7 @@
 //! and allocated again while a tracker holds it is not seen.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
@@ -47,8 +48,10 @@ use std::sync::{Arc, Mutex};
 pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, and what it saves
-/// of pages it armed.
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
+/// of pages it armed, and how many pages the set holds: kept with the set
+/// under its lock, read without it, so a check of a tracker with nothing
+/// changed costs one load (`docs/memory-design.md`, step 1).
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, AtomicUsize);
 
 /// Pages (page numbers) whose bytes a tracker keeps when they are first
 /// written after it took them, and those bytes: while shaders may be
@@ -61,6 +64,12 @@ struct Saved {
 }
 
 impl Changed {
+    /// The set changed: its size, stored while its lock is still held so the
+    /// count never trails a page a check could miss.
+    fn count(&self, set: &BTreeSet<usize>) {
+        self.2.store(set.len(), Ordering::Release);
+    }
+
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
         self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
@@ -223,7 +232,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
+    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default(), AtomicUsize::new(pages.len())));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -343,6 +352,7 @@ impl Tracked {
                 guarded += 1;
             }
         }
+        self.changed.count(&changed);
         drop(changed);
         #[cfg(feature = "diagnostics")]
         {
@@ -377,6 +387,7 @@ impl Tracked {
     pub(crate) fn any_changed(&self, from: usize, to: usize) -> bool {
         let (from, to) = (from.max(self.start), to.min(self.end));
         from < to
+            && self.changed.2.load(Ordering::Acquire) != 0
             && self
                 .changed
                 .0
@@ -398,6 +409,7 @@ impl Tracked {
             changed.remove(&page);
             self.changed.taken(page);
         }
+        self.changed.count(&changed);
     }
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
@@ -603,7 +615,10 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+            let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+            let first_write = set.insert(page);
+            c.count(&set);
+            drop(set);
             if first_write && save {
                 c.save(page);
             }
@@ -956,6 +971,37 @@ pub(crate) mod tests {
         assert!(t.any_changed(start, end));
         assert_eq!(t.take(start, end).len(), 1);
         assert!(!t.any_changed(start, end));
+        drop(t);
+        free(p);
+    }
+
+    /// Every way a page is marked changed reaches the check, also on a
+    /// tracker with no changed page left (where the check skips its lock):
+    /// a kernel write, a remap, and a page taken by copy-back then written.
+    #[test]
+    fn a_quiet_tracker_sees_every_kind_of_write() {
+        let p = pool(4);
+        let t = track(p, 4 * PAGE, true).expect("tracked");
+        let all = (p, p + 4 * PAGE);
+        let quiet = |t: &Tracked| {
+            t.take(all.0, all.1);
+            assert!(!t.any_changed(all.0, all.1), "nothing changed after a take");
+        };
+        quiet(&t);
+        drop(kernel_will_write(p + PAGE + 3, 10));
+        assert!(t.any_changed(p + PAGE, p + 2 * PAGE), "a kernel write");
+        quiet(&t);
+        title_memory_remapped(p + 2 * PAGE, PAGE);
+        assert!(t.any_changed(p + 2 * PAGE, p + 3 * PAGE), "a remap");
+        quiet(&t);
+        // Copy-back made page 3 equal to title memory: taken, then written.
+        let page = (p + 3 * PAGE) / PAGE;
+        drop(gpu_writing(p + 3 * PAGE, 8));
+        t.taken(&[page]);
+        assert!(!t.any_changed(all.0, all.1), "taken by copy-back");
+        // SAFETY: our pool, guarded since it was taken.
+        unsafe { ((p + 3 * PAGE + 8) as *mut u8).write_volatile(1) };
+        assert!(t.any_changed(p + 3 * PAGE, p + 4 * PAGE), "a title write after copy-back");
         drop(t);
         free(p);
     }
