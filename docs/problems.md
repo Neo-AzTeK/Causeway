@@ -11,13 +11,15 @@ Goal: **one correct frame** (`docs/agent-workflow.md`).
 
 Each item names its problem in the ranked table below.
 
-- [ ] Read the Windows minidumps of the host stops (`host-bugcheck`): they
-      need an administrator to copy them out of `C:\Windows\Minidump` and a
-      kernel debugger (`!analyze -v`) to name the stack; until then the cause
-      is not known. Both came during GPU work on a day of many GPU resets
-      (one replay ran right after a removal), so fewer resets is the
-      likeliest way to make them rarer, not proven: `gpu-long-lists`, and
-      the owner may raise `TdrDelay` (`crates/victory-gpu/src/tdr.rs`)
+- [ ] Keep write guards (`watch.rs` `protect`) off mapped views that are
+      not the title's memory (`host-bugcheck`). Both dumps have one stack:
+      the video memory manager evicting a system-memory allocation locks its
+      pages in our process for write, the lock fails, and Windows stops.
+      `protect` makes any committed non-private view in a loose copy's 4 MiB
+      window read-only, and the D3D12 runtime's mapped allocations are such
+      views; our fault handler hides the user-mode writes, the kernel's lock
+      is not caught. Not proven: first log any guard on a view the runtime
+      did not report; low memory could also fail the lock
 
 - [ ] Find the pass that should put lit people and ground into the scene's
       colour before tonemap (`scene-blocker`). Traced on the newest build:
@@ -105,7 +107,7 @@ measure what the picture loses.
 | 13 | `gpu-tests-hang` | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
 | 14 | `device-methods-missing` | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
 | 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charges the rest of the list to its last timed command, so slow-command lines mislead on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list |
-| 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay, on a day with many GPU timeouts, near the video memory budget, on a Windows Insider build (rank not confirmed by the owner) | seen twice on 2026-11-27 on the GTX 1070; dumps not read, cause unknown |
+| 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay (rank not confirmed by the owner) | seen twice on 2026-11-27 on the GTX 1070; both dumps: `dxgmms2!VIDMM_GLOBAL::EnsureLockedPages` after a failed lock of our process's pages, during an eviction from a system-memory segment; which pages, not known |
 
 ## Finding what keeps the 3D scene from showing
 
