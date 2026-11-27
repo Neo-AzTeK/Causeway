@@ -52,7 +52,8 @@ Each item names its problem in the ranked table below.
       - [x] H6.2 the slow GPU copy programs read a wrong or stale count:
             refuted (counts sane); second-long commands are H6.6
             (also correctness)
-      - [ ] H0.2 the title's heap kind says which buffers are GPU-only: CPU
+      - [x] H0.2 the title marks GPU-only memory: partly (protection bit 0x800
+            never written; the GPU heap is one class). Old wording: CPU
             writes into buffers on default heaps
       - [ ] H0.1 / H0.3 bytes by class (CPU→GPU, GPU-only, both, neither);
             CPU reads of written-back pages

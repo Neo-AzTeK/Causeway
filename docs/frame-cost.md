@@ -62,6 +62,25 @@ watch, change checks on every declared read, before-images and copy-back.
   writes (guard faults, write watch) into buffers on default heaps. If there
   are none or almost none, the kind can drive placement, with a fallback for
   pages the CPU does touch.
+  **Restated and tested, 2026-11-27** (`VICTORY_PROBE_CLASSES=1`, one 200 s
+  world run). Heap kinds say little: most buffers are placed at addresses
+  the title maps itself, which carry no kind (we label them default). The
+  title does give its own memory calls console bits (above the host's
+  protection) that `xmem` drops. So the probe tallies tracked and written
+  64 KiB pages per frame by those bits, per 60 frames:
+  - virtual memory with protection bit 0x800: up to ~15,000 pages (~0.9
+    GB) tracked, **no page written in any line of the run**;
+  - physical pages (two flag sets, the big GPU heap): up to ~30,000 and
+    ~12,000 pages tracked, 1-3% written in the busiest lines;
+  - virtual memory with bits 0x2400 or 0x22000: up to ~12,000 and ~800
+    pages, a few % written.
+  "Written" here counts every write the watch sees, kernel writes and our
+  own copy-back included, so CPU writes are at most these. Result: **partly
+  confirmed**. One class the title marks (bit 0x800) is never written
+  after allocation and could live on the GPU side with no refresh. The big
+  GPU heap is one class, written in a few % of its pages, so the title's
+  bits cannot split it; that needs per-buffer classes (H0.1). Not yet
+  known: what bit 0x800 means on the console, and whether the CPU reads it.
 - **H0.3 (design): the CPU rarely reads what the GPU writes.** Copy-back
   assumes it might, everywhere. Test: guard a sample of pages after copy-back
   against reads (not only writes) and count faults per buffer.
