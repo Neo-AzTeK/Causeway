@@ -295,23 +295,37 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
+    let last_save = {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }
-        *last = Some(std::time::Instant::now());
-    }
+        last.replace(std::time::Instant::now())
+    };
     let (blob, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
+        // SAFETY: plain query.
+        let size = unsafe { l.library.GetSerializedSize() };
+        // A save copies the whole library (gigabytes after long runs): a big
+        // one waits longer between saves during play, one second per MiB.
+        let wait = std::time::Duration::from_secs((size >> 20) as u64).max(SAVE_EVERY);
+        if !now && last_save.is_some_and(|t| t.elapsed() < wait) {
+            // Not a save: the wait still counts from the last one.
+            *LAST.lock().unwrap_or_else(|e| e.into_inner()) = last_save;
+            return;
+        }
+        // Short of memory, the save waits: an abort would lose the run.
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(size).is_err() {
+            tracing::warn!(size, "host pipeline library not saved now: no memory for its copy");
+            return;
+        }
+        bytes.resize(size, 0u8);
         // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
-        };
+        let bytes = unsafe { l.library.Serialize(&mut bytes).map(|()| bytes) };
         match bytes {
             Ok(bytes) => {
                 l.added = 0;
