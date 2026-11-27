@@ -11,11 +11,16 @@ Goal: **one correct frame** (`docs/agent-workflow.md`).
 
 Each item names its problem in the ranked table below.
 
-- [ ] Record what the 2026-11-27 game run showed, crash or not
-      (`scene-blocker`; needs the owner)
+- [ ] New title crash (a write to address zero in the title's code) about 30
+      frames into the intro's world, in both 2026-11-27 runs of the current
+      branch and in none before: find which recent change brings it
+      (`scene-blocker`; the owner chooses: this first, or capture earlier
+      frames)
 - [ ] Owner decides how the original project's later updates come in: one
       commit at a time, or squashed; cleaned either way
 - [ ] Game run that includes the newest shader fix (lane mask joined with data)
+      and shows the picture: ran twice on 2026-11-27, both crashed before the
+      world could be captured (item above)
 - [ ] Run the `victory-gpu` tests with the new shader changes (`gpu-tests-hang`
       may get in the way)
 - [ ] Mesh programs whose outputs pass the host's size limit: see whether
