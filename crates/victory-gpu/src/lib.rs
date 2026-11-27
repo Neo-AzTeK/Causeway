@@ -41,6 +41,8 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
 #[cfg(windows)]
 mod memory;
