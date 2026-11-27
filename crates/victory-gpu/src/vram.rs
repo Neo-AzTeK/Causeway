@@ -5,9 +5,10 @@
 //! local segment: on an integrated GPU that is the shared memory it may use).
 //! [`decide`] is a pure function of (budget, usage): past [`START_PCT`] of the
 //! budget, host textures no list reached for a while are lowered to the
-//! lowest residency priority (the memory manager moves them out first; they
-//! stay resident, as heap-indexing shaders may reach them), longer-idle
-//! first, until usage is back to [`TARGET_PCT`]; the closer to the budget, the
+//! lowest residency priority (over the budget, the memory manager moves
+//! them out first; they stay resident, as heap-indexing shaders may reach
+//! them), longer-idle first, until usage less the bytes already at that
+//! priority is back to [`TARGET_PCT`]; the closer to the budget, the
 //! shorter the idle time that qualifies. No size is fixed: every figure is a
 //! share of the budget. [`resolve`] picks the (budget, usage) pair: the
 //! query's, or when it fails the `MemoryPlan` budget (`caps::memory_plan`: the
@@ -147,8 +148,9 @@ mod host {
 
     /// At most every [`SAMPLE_MS`]: samples budget and usage, logs them at
     /// most every [`LOG_MS`], and returns what to lower given `own` bytes
-    /// of host textures resident. `None` between samples.
-    pub(crate) fn tick(own: u64) -> Option<Decision> {
+    /// of host textures resident, `lowest` of them at the lowest priority
+    /// already (not counted as used). `None` between samples.
+    pub(crate) fn tick(own: u64, lowest: u64) -> Option<Decision> {
         let monitor = MONITOR.get()?;
         let now = Instant::now();
         let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -158,15 +160,16 @@ mod host {
         state.sampled = Some(now);
         let asked = monitor.adapter.as_ref().and_then(query);
         let (budget, usage) = resolve(asked, monitor.plan, own);
-        let decision = decide(budget, usage);
+        let decision = decide(budget, usage.saturating_sub(lowest));
         if state.logged.is_none_or(|t| now.duration_since(t).as_millis() >= u128::from(LOG_MS)) {
             state.logged = Some(now);
             tracing::info!(
-                "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB, lowering {:.0} MB",
+                "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB ({:.0} MB at the lowest priority), lowering {:.0} MB",
                 usage as f64 / 1e6,
                 budget as f64 / 1e6,
                 if asked.is_some() { "DXGI" } else { "query failed: caps plan" },
                 own as f64 / 1e6,
+                lowest as f64 / 1e6,
                 decision.free as f64 / 1e6,
             );
         }
@@ -192,7 +195,7 @@ mod tests {
     ];
 
     #[test]
-    fn nothing_is_evicted_below_the_start_line() {
+    fn nothing_is_lowered_below_the_start_line() {
         for (name, budget) in MATRIX {
             let usage = budget * (START_PCT - 1) / 100;
             assert_eq!(decide(budget, usage).free, 0, "{name}");
@@ -201,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_frees_down_to_the_target_share_of_each_budget() {
+    fn lowering_frees_down_to_the_target_share_of_each_budget() {
         for (name, budget) in MATRIX {
             for pct in [START_PCT, 80, HIGH_PCT, 90, CRITICAL_PCT, 100, 120] {
                 let usage = budget * pct / 100;
@@ -237,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_budget_evicts_what_it_can_without_overflow() {
+    fn a_zero_budget_lowers_what_it_can_without_overflow() {
         let d = decide(0, 100);
         assert_eq!(d.free, 100);
         assert_eq!(d.idle_ms, IDLE_CRITICAL_MS);

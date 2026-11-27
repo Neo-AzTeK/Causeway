@@ -1087,9 +1087,10 @@ impl Host {
         batch.flush();
         #[cfg(feature = "diagnostics")]
         drop(flushing);
-        // Stamped as used only now, with nothing slow left before eviction
+        // Stamped as used only now, with nothing slow left before lowering
         // looks: preparing a batch can take longer than the idle time it
-        // asks for, and a texture stamped before that could be taken.
+        // asks for, and a texture stamped before that could run at the
+        // lowest priority.
         #[cfg(feature = "diagnostics")]
         let touching = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::TouchUs);
         for list in runs {
@@ -1698,8 +1699,9 @@ impl HostList {
         self.track(&copy, wanted).map(|before| (texture, before))
     }
 
-    /// Stamps the host textures the list holds as used now, resident again if
-    /// eviction took them since it was recorded (`crate::vram`).
+    /// Stamps the host textures the list holds as used now, at the normal
+    /// priority again if they were lowered since it was recorded
+    /// (`crate::vram`).
     fn touch_textures(&self) {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         for (_, _, copy) in states.values() {
