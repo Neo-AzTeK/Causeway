@@ -55,7 +55,11 @@ Each item names its problem in the ranked table below.
       - [x] H0.2 the title marks GPU-only memory: partly (protection bit 0x800
             never written; the GPU heap is one class). Old wording: CPU
             writes into buffers on default heaps
-      - [ ] H0.1 / H0.3 bytes by class (CPU→GPU, GPU-only, both, neither);
+      - [x] H0.1 bytes by writer: confirmed (title code writes ~3% of
+            tracked memory; ~44% written by nobody in two minutes)
+      - [ ] H0.4 ~5.7 GB of distinct heap pages streamed in two minutes of
+            a still scene: re-requested loads?
+      - [ ] H0.3 (rest of the old item:)
             CPU reads of written-back pages
       - [ ] H1.2 our own write-backs refreshed back in as CPU writes
       - [ ] H1.3 one title page in several host copies

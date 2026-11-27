@@ -53,6 +53,31 @@ watch, change checks on every declared read, before-images and copy-back.
   CPU between uses. Test: per host copy, record over a run whether the CPU
   writes it after the first fill and whether the GPU writes it. Then sum bytes
   by class (CPU→GPU, GPU-only, both, neither).
+  **Tested per 64 KiB page, 2026-11-27** (`VICTORY_PROBE_CLASSES=1`, `writers`
+  lines, one 400 s run). In a 100-frame world window (~2 minutes), ~11 GB
+  of title memory was tracked or written:
+
+  | written by | GB | share |
+  |------------|----|-------|
+  | nobody | 4.8 | 44% |
+  | the kernel only (file reads, DirectStorage) | 5.7 | 52% |
+  | the title's code, alone or with others | 0.3 | 3% |
+  | GPU work written back only | 0.1 | 1% |
+
+  Result: **confirmed** that the title's code writes very little of what we
+  track. Nearly half is written by nobody in two minutes, so for that
+  window its refresh checks find nothing. Caution: "nobody" includes what
+  the GPU writes and we never write back (H0.3); the title still sees that
+  memory unchanged. The kernel's share is data loaded for the GPU: it
+  needs one upload per load, not checks every submission. Not tested:
+  whether the CPU reads what the GPU writes (H0.3).
+- **H0.4 (new): the scene streams far more than a still scene should.**
+  Kernel writes reach 5.7 GB of distinct GPU-heap pages in two minutes of
+  standing in one room. Possibly the title re-requests the same data
+  (because a request looks failed, or a residency answer is wrong), or
+  writes land at page grain and are counted wide. Test: DirectStorage
+  requests per window by destination, and how often the same destination
+  is requested again.
 - **H0.2 (missing): the title already says which memory is GPU-only, and we
   drop it.** Heaps and committed resources come with a heap kind (default,
   upload, readback). `resource.rs` uses it only for the title-side
