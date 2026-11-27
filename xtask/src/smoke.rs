@@ -285,7 +285,7 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         args.out.display()
     );
     if let Some(id) = &args.problem {
-        // Refused unless held; says that a run was tried, not that it ran.
+        // Says that a run was tried, not that it ran.
         let asked = format!("smoke run asked for: {}", args.out.display());
         problem::record_run(root, id, &asked)?;
     }

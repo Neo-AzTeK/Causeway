@@ -52,7 +52,7 @@ enum Cmd {
         #[arg(last = true, required = true)]
         command: Vec<std::ffi::OsString>,
     },
-    /// Claim, resume and close problem sessions (docs/problem-sessions.md).
+    /// Notes, resume and close problems (docs/problem-sessions.md).
     #[command(subcommand)]
     Problem(problem::Problem),
     /// Judge one smoke run against earlier runs, per world line: speed against

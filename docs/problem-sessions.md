@@ -1,9 +1,9 @@
 # Problem sessions
 
-Optional: by default one main session does the work (`docs/agent-workflow.md`).
-These rules apply when a problem is handed to a separate session, which keeps
-it until it is 100% fixed. The ranked list is `docs/problems.md`. Start one by
-telling a new session:
+How a problem from `docs/problems.md` is worked on until it is 100% fixed.
+Problems are not owned or locked: any session may work on several at once, and
+several sessions on one (owner, 2026-11-27). A session can be started on one
+with:
 
     /problem-session <id>
 
@@ -11,10 +11,10 @@ telling a new session:
 
 | State | Meaning | Leaves it by |
 |-------|---------|--------------|
-| open | nobody holds it | `claim` |
-| active | one session works on it | `block`, `proven`, `release` |
+| open | nobody has worked on it yet | `log` or any other working command |
+| active | being worked on | `block`, `proven` |
 | blocked | it waits for the owner | `unblock` with their answer |
-| proven | fixed on its branch, with proof; waits for the owner's merge | `confirm`; `reopen` (back to active, same session); `release` |
+| proven | fixed on its branch, with proof; waits for the owner's merge | `confirm`; `reopen` (back to active) |
 | fixed | the proven commit is in `main` and "Done when" passed there | `reopen` |
 
 All commands are `cargo xtask problem <command>` (`--help` lists them).
@@ -39,14 +39,14 @@ switch, a refusal made cleaner, or some of the cases. A problem with several
 sub-causes stays open until every one is closed; new ones found on the way are
 added to the list in `notes.md`. If one turns out to belong to another problem
 or another owner, or the test cannot be met, the session blocks and asks. Only
-the owner changes "Done when" or the scope, or lets a problem go unfixed:
-`release --owner "<their words>"`.
+the owner changes "Done when" or the scope, or lets a problem go unfixed (log
+their words).
 
-## One session, until fixed
+## Until fixed
 
 - No cap on game runs, reads or hours, and no early end because the context is
-  long: compaction keeps the session going. It ends its work on a problem only
-  as proven, blocked (waiting for the owner), or released on the owner's word.
+  long: compaction keeps the session going. Work on a problem ends only as
+  proven, blocked (waiting for the owner), or dropped on the owner's word.
 - Every run still needs a question it answers. Write the question in `notes.md`
   before launching. Three results in a row that change no hypothesis mean the
   method is wrong: write why, and change it (more instrumentation, an offline
@@ -72,7 +72,7 @@ it is ever copied into the repository, a commit message or a PR.
 | `notes.md` | now, next step, sub-causes, hypotheses, ruled out with evidence, commits, runs, questions | after each step and run |
 | `log.md` | dated history, append only | by the commands and `log` |
 | `proof.md` | the proof | before `proven` |
-| `state.txt` | claim and state | by the commands only |
+| `state.txt` | state, branch, proven commit | by the commands only |
 
 `notes.md` is the state now, at most 150 lines: move old detail out with `log`
 or into other files of the folder (long findings, dumps of counts). "Next step"
@@ -92,29 +92,12 @@ summary, check the evidence.
 
 ## Working in parallel
 
-**Claims** (checked by code). `claim <id> --files a,b` takes a problem. One
-holder per problem, one problem per session. The holder is the Claude session id,
-which compaction keeps. `log`, `check`, `agree`, `block`, `unblock`, `resume`
-and `smoke --problem` (as the run starts and ends) keep the claim alive.
-
-**Dead sessions.** A claim is stale after 8 hours without one of those, or at
-once if its worktree is gone. A stale *active* claim is taken with
-`claim <id> --take-over`. Blocked, proven or not yet stale takes
-`--take-over --owner "<their words>"`, because waiting is not dying. The
-command names the earlier branch: build on it, and look for uncommitted files in
-the old worktree. A session that finds its problem held by another stops.
-Before taking over, check that the old session is not just in a long run.
-
-**Files.** `--files` names the repository files or folders the problem expects to
-change; add more with another `claim` as the diff grows. A claim that meets
-another's is refused. Then narrow it, or wait, or agree how the two stay apart
-(which functions, who merges first) and record that with `--accept-overlap`,
-which covers those two claims only; it is better to ask the owner than to guess
-for a large shared file. `check`
-fails on a changed file that is not claimed (`docs/` and `Cargo.lock` are
-free).
-Whoever merges second first merges `main` into its branch and redoes the check
-chain and the proof run.
+**No locks.** Nothing stops two sessions from working on one problem or on the
+same files. Each log line names its session, and `list` shows each problem's
+state and the branch it was last logged from. Before working on a problem,
+`resume` it and read the log: if another session logged recently, build on its
+branch, or tell the owner. Whoever merges second first merges `main` into its
+branch and redoes the check chain and the proof run.
 
 **Each session has its own worktree and branch.** Do not share a checkout.
 
@@ -151,8 +134,8 @@ worktree you run them from: a branch without this rule still waits for every
 A branch made before `alone` existed has no such command: merge `main` into it
 first.
 
-A damaged `state.txt` stops every claim until it is mended, on purpose: it may
-be a claim on anything.
+A damaged `state.txt` stops every command on that problem until it is mended:
+what it held is not guessed.
 
 **Quiet machine.** Pass `--quiet` to every run whose timings matter. It refuses
 to start while a compiler, linker, test binary or title runs. Every launched run
@@ -171,7 +154,7 @@ repository, named for the problem, and keep those the proof cites.
 
 `proven` refuses until `proof.md` is filled, "Scope" and "Done when" are as
 agreed, every sub-cause is a ticked `- [x]` line (details indented under it),
-changed files are claimed, the tree is clean and the branch is not `main` and
+the tree is clean and the branch is not `main` and
 changes something `main` lacks. So prove before the merge. It cannot judge what
 the text says. The session writes:
 
@@ -199,23 +182,18 @@ pushes without their explicit yes.
 records `confirm --evidence "..."`. `confirm` checks that the proven commit is
 in `main` and the agreement unchanged, and refuses the fixing session without
 `--owner`. If the test fails on `main` or the owner rejects the proof,
-`reopen --evidence "..."`: before `confirm` the problem goes back to its
-session. `reopen` gives it a fresh 8 hours: if it is dead, take it over after
-them, or at once with the owner's words.
+`reopen --evidence "..."`: before `confirm` the problem goes back to active.
 
 **Regression.** Anyone who sees a fixed problem's symptom again `reopen`s it with
 the run that shows it, and tells the owner. The agreed "Done when" stands, the
-old proof is kept aside, and a new session claims a fixed one. Whoever reads a run's
+old proof is kept aside, and work starts again. Whoever reads a run's
 digest compares it with the fixed problems of `problem list`.
 
 ## What code enforces and what only these rules do
 
 | Enforced by `xtask` | Written rule only |
 |---|---|
-| one holder per problem, one problem per session | the session stays until fixed, and asks when blocked |
-| rows owned elsewhere (this checkout's list or `main`'s) and `descriptor/`, `descriptor.rs` refused | descriptor work in other files |
-| take-over only when stale and active, or with `--owner`; `release` needs `--owner` | that `--owner` quotes something the owner really said |
-| overlapping claims refused unless explained, per pair; unclaimed changes fail `check` | that sessions run `check`, and keep an agreed overlap apart |
+| nothing about who works on what (no locks) | that a session reads a problem's log before working on it, stays until fixed, and asks when blocked |
 | "Scope" and "Done when" compared with the agreed copy at `proven` and `confirm` | that the test is a good one; editing `agreed.md` or `state.txt` by hand |
 | `proven` needs filled proof, ticked sub-causes, a clean branch that changes something | that the proof is true, the runs quiet, the review done |
 | `confirm` needs the commit in `main` and another session id | that the id is not set by hand, and "Done when" was really run on `main` |

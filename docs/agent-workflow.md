@@ -97,7 +97,8 @@ a missing feature ends as a clean refusal. Review with
 
 ## Sessions and agents
 
-- One main session, one goal at a time, debugging included. Let the context
+- One main session, debugging included, on one or several problems at once
+  (nothing locks a problem: `docs/problem-sessions.md`). Let the context
   compact instead of handing off: no handoff files; durable facts go to the
   tracked docs, the rest stays in the conversation and the commit messages.
 - A goal needs an end, and a stop where the owner must decide. Waiting on the

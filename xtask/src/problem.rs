@@ -1,9 +1,11 @@
-//! Problem sessions (docs/problem-sessions.md): which session owns which
-//! problem, and the gates a problem passes to count as fixed.
+//! Problem sessions (docs/problem-sessions.md): each problem's notes, and
+//! the gates it passes to count as fixed. Problems are not owned or locked:
+//! any session may work on any number of them, so one is never stuck behind
+//! a session that stopped.
 //!
-//! Claims and notes are one folder per problem in a machine-local registry,
-//! shared by every worktree: they are derived from runs of the title, so they
-//! never enter the repository. The ranked list (`docs/problems.md`) is tracked.
+//! Notes are one folder per problem in a machine-local registry, shared by
+//! every worktree: they are derived from runs of the title, so they never
+//! enter the repository. The ranked list (`docs/problems.md`) is tracked.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -15,12 +17,10 @@ use clap::Subcommand;
 
 /// Overrides where the registry is (tests, dry runs).
 const DIR_VARIABLE: &str = "CAUSEWAY_PROBLEMS_DIR";
-/// A claim whose session wrote nothing for this long may be taken over.
-const STALE: u64 = 8 * 3600;
 /// Notes must stay cheap to read back; older detail goes to the log.
 const NOTE_LINES: usize = 150;
-/// Changed by any problem's diff without being claimed.
-const SHARED_PATHS: &[&str] = &["docs", "Cargo.lock"];
+/// Keys of `state.txt` from when problems had holders: read and dropped.
+const OLD_KEYS: &[&str] = &["session", "worktree", "heartbeat", "files", "accepted"];
 
 const PROBLEM: &str = include_str!("../../.claude/skills/problem-session/problem.md");
 const NOTES: &str = include_str!("../../.claude/skills/problem-session/notes.md");
@@ -50,27 +50,10 @@ const PROOF_SECTIONS: &[&str] = &[
 
 #[derive(Subcommand)]
 pub enum Problem {
-    /// The ranked list with each problem's state and holder.
+    /// The ranked list with each problem's state and branch.
     List,
     /// Make a problem's folder from the templates.
     New { id: String },
-    /// Take a problem for this session, or add files to your claim.
-    Claim {
-        id: String,
-        /// Repository paths this problem will change.
-        #[arg(long, value_delimiter = ',')]
-        files: Vec<String>,
-        /// Claim although another claim covers the same files: say how the
-        /// two are kept apart.
-        #[arg(long)]
-        accept_overlap: Option<String>,
-        /// Take a claim whose session is dead.
-        #[arg(long)]
-        take_over: bool,
-        /// The owner's words allowing a take-over of a claim not stale.
-        #[arg(long, requires = "take_over")]
-        owner: Option<String>,
-    },
     /// Where a problem stands; start here, also after compaction.
     Resume { id: String },
     /// Record the owner's agreement to "Scope" and "Done when" in problem.md.
@@ -80,9 +63,9 @@ pub enum Problem {
         #[arg(long)]
         owner: String,
     },
-    /// Add a dated line to the log and keep the claim alive.
+    /// Add a dated line to the log.
     Log { id: String, text: String },
-    /// Format, agreed test, notes and changed files.
+    /// Format, agreed test and notes.
     Check { id: String },
     /// Stop on a question only the owner can answer.
     Block {
@@ -114,15 +97,6 @@ pub enum Problem {
         #[arg(long)]
         evidence: String,
     },
-    /// Give a problem up without calling it fixed.
-    Release {
-        id: String,
-        #[arg(long)]
-        reason: String,
-        /// The owner's words: only they let a problem go unfixed.
-        #[arg(long)]
-        owner: String,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -152,34 +126,23 @@ impl Status {
     }
 }
 
-/// `state.txt`. A claim is a non-empty `session`.
+/// `state.txt`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct State {
     status: Status,
-    session: String,
-    worktree: String,
+    /// Where the work was last logged from.
     branch: String,
-    heartbeat: u64,
-    files: Vec<String>,
-    /// Claims whose files this one may share: `problem@session`, so that it
-    /// ends when the other problem changes hands.
-    accepted: Vec<String>,
     proven_commit: String,
+    /// The session that proved it: another one (or the owner) confirms it.
     proven_by: String,
 }
 
 impl State {
     fn write(&self) -> String {
         format!(
-            "status={}\nsession={}\nworktree={}\nbranch={}\nheartbeat={}\nfiles={}\n\
-             accepted={}\nproven_commit={}\nproven_by={}\nend=\n",
+            "status={}\nbranch={}\nproven_commit={}\nproven_by={}\nend=\n",
             self.status.name(),
-            self.session,
-            self.worktree,
             self.branch,
-            self.heartbeat,
-            self.files.join(","),
-            self.accepted.join(","),
             self.proven_commit,
             self.proven_by,
         )
@@ -201,12 +164,8 @@ impl State {
                         .with_context(|| format!("status {value:?}"))?
                         .0;
                 }
-                "session" => state.session = value,
-                "worktree" => state.worktree = value,
                 "branch" => state.branch = value,
-                "heartbeat" => state.heartbeat = value.parse().context("heartbeat")?,
-                "files" => state.files = list(&value),
-                "accepted" => state.accepted = list(&value),
+                old if OLD_KEYS.contains(&old) => {}
                 "proven_commit" => state.proven_commit = value,
                 "proven_by" => state.proven_by = value,
                 "end" => {}
@@ -220,18 +179,6 @@ impl State {
         );
         Ok(state)
     }
-}
-
-fn list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn pair(id: &str, session: &str) -> String {
-    format!("{id}@{session}")
 }
 
 /// What the commands need to know of the checkout they run in.
@@ -317,8 +264,7 @@ pub fn run(root: &Path, command: &Problem) -> Result<()> {
     Ok(())
 }
 
-/// For `smoke --problem`: writes a run into the problem's log. Refused unless
-/// this session holds the claim, which it keeps alive.
+/// For `smoke --problem`: writes a run into the problem's log.
 pub fn record_run(root: &Path, id: &str, text: &str) -> Result<()> {
     run(
         root,
@@ -393,27 +339,6 @@ fn valid_id(id: &str) -> Result<()> {
         "{id:?}: a problem id is 3-48 of a-z, 0-9 and -"
     );
     Ok(())
-}
-
-fn normal(path: &str) -> Result<String> {
-    let path = path.trim().replace('\\', "/");
-    let path = path.trim_start_matches("./").trim_end_matches('/');
-    ensure!(
-        !path.is_empty()
-            && !path.contains([':', '*', ',', '='])
-            && !path.starts_with('/')
-            && !path.split('/').any(|part| part == ".." || part == "."),
-        "{path:?}: a plain path inside the repository, a file or a folder"
-    );
-    Ok(path.to_owned())
-}
-
-/// Whether `path` is `folder` or inside it.
-fn within(path: &str, folder: &str) -> bool {
-    // Windows does not tell case apart.
-    let (path, folder) = (path.to_ascii_lowercase(), folder.to_ascii_lowercase());
-    path.strip_prefix(&folder)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 struct Ranked {
@@ -500,48 +425,22 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    fn stale(&self, state: &State) -> bool {
-        self.here.now.saturating_sub(state.heartbeat) > STALE
-            || (!state.worktree.is_empty() && !Path::new(&state.worktree).exists())
-    }
-
-    /// The state of a problem this session holds.
-    fn mine(&self, id: &str) -> Result<State> {
-        let state = self.state(id)?;
+    /// The state of a problem being worked on: an open one becomes active,
+    /// on this checkout's branch; a fixed one is `reopen`ed first.
+    fn working(&self, id: &str) -> Result<State> {
+        let mut state = self.state(id)?;
         ensure!(
-            state.session == self.here.session,
-            "this session does not hold {id}: {}",
-            if state.session.is_empty() {
-                "claim it first".to_owned()
-            } else {
-                format!("session {} in {} does; stop", state.session, state.worktree)
-            }
+            state.status != Status::Fixed,
+            "{id} is fixed; a regression is `reopen`ed first"
         );
-        Ok(state)
-    }
-
-    // A damaged state file fails this on purpose: its claim might meet any.
-    /// Other claims whose files meet `files`, unless one of the two accepted
-    /// it: each other problem's id and where they meet.
-    fn overlaps(&self, id: &str, state: &State, files: &[String]) -> Result<Vec<(String, String)>> {
-        let mut found = Vec::new();
-        for other in self.ids()?.into_iter().filter(|o| o != id) {
-            let theirs = self.state(&other)?;
-            if theirs.session.is_empty()
-                || state.accepted.contains(&pair(&other, &theirs.session))
-                || theirs.accepted.contains(&pair(id, &self.here.session))
-            {
-                continue;
-            }
-            for mine in files {
-                for their in &theirs.files {
-                    if within(mine, their) || within(their, mine) {
-                        found.push((other.clone(), format!("{mine} meets {their} of {other}")));
-                    }
-                }
-            }
+        if state.status == Status::Open {
+            state.status = Status::Active;
         }
-        Ok(found)
+        let branch = git(&self.here.root, &["branch", "--show-current"]).unwrap_or_default();
+        if !branch.is_empty() && state.status == Status::Active {
+            state.branch = branch;
+        }
+        Ok(state)
     }
 
     /// Whether "Scope" and "Done when" are as agreed; `None` before `agree`.
@@ -560,23 +459,7 @@ impl Registry {
         ))
     }
 
-    /// What the branch and the working tree change against `main`.
-    fn changed(&self) -> Result<Vec<String>> {
-        let root = &self.here.root;
-        let mut files: Vec<String> = Vec::new();
-        for args in [
-            &["diff", "--name-only", "--no-renames", "main...HEAD"][..],
-            &["diff", "--name-only", "--no-renames", "HEAD"][..],
-            &["ls-files", "--others", "--exclude-standard"][..],
-        ] {
-            files.extend(git(root, args)?.lines().map(str::to_owned));
-        }
-        files.sort();
-        files.dedup();
-        Ok(files)
-    }
-
-    fn problems(&self, id: &str, state: &State, changed: &[String]) -> Result<Vec<String>> {
+    fn problems(&self, id: &str) -> Result<Vec<String>> {
         let mut found = Vec::new();
         let definition = self.file(id, "problem.md")?;
         if !whole_definition(&definition) {
@@ -612,21 +495,6 @@ impl Registry {
                 "notes.md: {lines} lines, at most {NOTE_LINES}: move old detail to log.md"
             ));
         }
-        for file in changed {
-            if !SHARED_PATHS
-                .iter()
-                .copied()
-                .chain(state.files.iter().map(String::as_str))
-                .any(|f| within(file, f))
-            {
-                found.push(format!("{file}: changed but not claimed (`claim --files`)"));
-            }
-        }
-        found.extend(
-            self.overlaps(id, state, &state.files)?
-                .into_iter()
-                .map(|(_, at)| at),
-        );
         Ok(found)
     }
 
@@ -634,22 +502,9 @@ impl Registry {
         match command {
             Problem::List => self.list(),
             Problem::New { id } => self.new_problem(id),
-            Problem::Claim {
-                id,
-                files,
-                accept_overlap,
-                take_over,
-                owner,
-            } => self.claim(
-                id,
-                files,
-                accept_overlap.as_deref(),
-                *take_over,
-                owner.as_deref(),
-            ),
             Problem::Resume { id } => self.resume(id),
             Problem::Agree { id, owner } => {
-                let mut state = self.mine(id)?;
+                let state = self.working(id)?;
                 ensure!(
                     matches!(state.status, Status::Active | Status::Blocked),
                     "{id} is {}: what was proven was proven against the old agreement",
@@ -678,47 +533,40 @@ impl Registry {
                 );
                 std::fs::write(self.folder(id)?.join("agreed.md"), agreed)?;
                 self.append(id, &format!("agreed \"Done when\"; owner: {owner}"))?;
-                state.heartbeat = self.here.now;
                 self.save(id, &state)?;
                 Ok(format!("{id}: \"Done when\" recorded as agreed"))
             }
             Problem::Log { id, text } => {
-                let mut state = self.mine(id)?;
+                let state = self.working(id)?;
                 self.append(id, text)?;
-                state.heartbeat = self.here.now;
                 self.save(id, &state)?;
                 Ok(format!("{id}: logged; keep notes.md current too"))
             }
             Problem::Check { id } => {
-                let mut state = self.mine(id)?;
-                state.heartbeat = self.here.now;
-                self.save(id, &state)?;
-                let found = self.problems(id, &state, &self.changed()?)?;
+                let found = self.problems(id)?;
                 ensure!(found.is_empty(), "{id}:\n  {}", found.join("\n  "));
                 Ok(format!("{id}: check ok"))
             }
             Problem::Block { id, question } => {
-                let mut state = self.mine(id)?;
+                let mut state = self.working(id)?;
                 ensure!(
                     state.status == Status::Active,
                     "{id} is {}",
                     state.status.name()
                 );
                 state.status = Status::Blocked;
-                state.heartbeat = self.here.now;
                 self.append(id, &format!("blocked, asks the owner: {question}"))?;
                 self.save(id, &state)?;
                 Ok(format!("{id}: blocked. Ask the owner, then end the turn."))
             }
             Problem::Unblock { id, answer } => {
-                let mut state = self.mine(id)?;
+                let mut state = self.working(id)?;
                 ensure!(
                     state.status == Status::Blocked,
                     "{id} is {}",
                     state.status.name()
                 );
                 state.status = Status::Active;
-                state.heartbeat = self.here.now;
                 self.append(id, &format!("unblocked; owner: {answer}"))?;
                 self.save(id, &state)?;
                 Ok(format!("{id}: active"))
@@ -743,12 +591,10 @@ impl Registry {
                 std::fs::write(folder.join("proof.md"), PROOF)?;
                 self.append(id, &format!("reopened: {evidence}"))?;
                 let said = if state.status == Status::Proven {
-                    // Still its session's, with time to answer.
                     state.status = Status::Active;
-                    state.heartbeat = self.here.now;
                     state.proven_commit.clear();
                     state.proven_by.clear();
-                    "active again, held by its session"
+                    "active again"
                 } else {
                     state = State {
                         branch: state.branch,
@@ -758,19 +604,6 @@ impl Registry {
                 };
                 self.save(id, &state)?;
                 Ok(format!("{id}: {said}; the agreed \"Done when\" stands"))
-            }
-            Problem::Release { id, reason, owner } => {
-                let mut state = self.state(id)?;
-                ensure!(!state.session.is_empty(), "{id} is not claimed");
-                self.append(id, &format!("owner allowed the release: {owner}"))?;
-                self.append(id, &format!("released ({}): {reason}", state.status.name()))?;
-                // The branch stays named: the next session goes on from it.
-                state = State {
-                    branch: state.branch,
-                    ..State::default()
-                };
-                self.save(id, &state)?;
-                Ok(format!("{id}: released, open, not fixed"))
             }
         }
     }
@@ -789,19 +622,8 @@ impl Registry {
             let what = if here.contains(&id) {
                 match self.state(&id) {
                     Err(e) => format!("DAMAGED: {e:#}"),
-                    Ok(s) if s.session.is_empty() => s.status.name().into(),
-                    Ok(s) => format!(
-                        "{}{} by {:.8} on {}, quiet {} min",
-                        s.status.name(),
-                        if s.status == Status::Active && self.stale(&s) {
-                            " (STALE)"
-                        } else {
-                            ""
-                        },
-                        s.session,
-                        s.branch,
-                        self.here.now.saturating_sub(s.heartbeat) / 60
-                    ),
+                    Ok(s) if s.branch.is_empty() => s.status.name().into(),
+                    Ok(s) => format!("{} on {}", s.status.name(), s.branch),
                 }
             } else {
                 "no folder here (`problem new`)".into()
@@ -827,136 +649,11 @@ impl Registry {
         Ok(format!("{id}: {}", folder.display()))
     }
 
-    fn claim(
-        &self,
-        id: &str,
-        files: &[String],
-        accept_overlap: Option<&str>,
-        take_over: bool,
-        owner: Option<&str>,
-    ) -> Result<String> {
-        let mut state = self.state(id)?;
-        ensure!(
-            state.status != Status::Fixed,
-            "{id} is fixed; a regression is `reopen`ed first"
-        );
-        // One problem per session.
-        for other in self.ids()?.iter().filter(|o| *o != id) {
-            ensure!(
-                self.state(other)?.session != self.here.session,
-                "this session holds {other}: one problem per session"
-            );
-        }
-        let files = files
-            .iter()
-            .map(|f| normal(f))
-            .collect::<Result<Vec<_>>>()?;
-        let held = state.session.clone();
-        if !held.is_empty() && held != self.here.session {
-            ensure!(
-                take_over,
-                "{id} is claimed by session {held} in {} ({}{}); a dead session's claim is taken \
-                 with --take-over",
-                state.worktree,
-                state.status.name(),
-                if self.stale(&state) { ", stale" } else { "" }
-            );
-            let dead = state.status == Status::Active && self.stale(&state);
-            ensure!(
-                dead || owner.is_some(),
-                "{id} is {}{}: only the owner can give it away (--owner \"their words\")",
-                state.status.name(),
-                if self.stale(&state) {
-                    ""
-                } else {
-                    ", not stale"
-                }
-            );
-        }
-        let mut all = state.files.clone();
-        all.extend(files);
-        all.sort();
-        all.dedup();
-        if held != self.here.session {
-            // What the earlier holder accepted was theirs to keep apart.
-            state.accepted.clear();
-        }
-        let overlaps = self.overlaps(id, &state, &all)?;
-        if !overlaps.is_empty() {
-            let met: Vec<_> = overlaps.iter().map(|(_, at)| at.as_str()).collect();
-            let why = accept_overlap.with_context(|| {
-                format!(
-                    "files overlap another claim:\n  {}\nnarrow --files, or say how the two are \
-                     kept apart with --accept-overlap",
-                    met.join("\n  ")
-                )
-            })?;
-            self.append(id, &format!("accepted overlap ({}): {why}", met.join("; ")))?;
-            for (other, _) in &overlaps {
-                let session = self.state(other)?.session;
-                state.accepted.push(pair(other, &session));
-            }
-            state.accepted.sort();
-            state.accepted.dedup();
-        }
-        let branch = git(&self.here.root, &["branch", "--show-current"]).unwrap_or_default();
-        let mut said = format!("{id}: claimed by this session");
-        if held != self.here.session {
-            if !held.is_empty() {
-                let words = owner.map(|o| format!("; owner: {o}")).unwrap_or_default();
-                self.append(id, &format!("taken over from session {held}{words}"))?;
-            }
-            if !state.branch.is_empty() && state.branch != branch {
-                said += &format!(
-                    "\nthe work so far is on branch {}: build on it (and check its worktree for \
-                     uncommitted files: {})",
-                    state.branch,
-                    if state.worktree.is_empty() {
-                        "released"
-                    } else {
-                        &state.worktree
-                    }
-                );
-            }
-        }
-        if state.status == Status::Open {
-            state.status = Status::Active;
-        }
-        state.session = self.here.session.clone();
-        state.worktree = self.here.root.display().to_string();
-        state.branch = branch;
-        state.heartbeat = self.here.now;
-        state.files = all;
-        self.append(
-            id,
-            &format!(
-                "claimed on {} for files [{}]",
-                state.branch,
-                state.files.join(", ")
-            ),
-        )?;
-        self.save(id, &state)?;
-        for (_, overlap) in overlaps {
-            said += &format!("\naccepted overlap: {overlap}");
-        }
-        Ok(said)
-    }
-
     fn resume(&self, id: &str) -> Result<String> {
-        let mut state = self.state(id)?;
+        let state = self.state(id)?;
         let folder = self.folder(id)?;
-        let mine = state.session == self.here.session;
-        if mine {
-            state.heartbeat = self.here.now;
-            self.save(id, &state)?;
-        }
-        let holder = match &*state.session {
-            "" => "nobody (claim it before working)".to_owned(),
-            _ if mine => "this session".to_owned(),
-            other => format!("session {other} in {}: do NOT work on it", state.worktree),
-        };
         let mut out = format!(
-            "{id}: {}; held by {holder}\nfolder: {}\nbranch: {}\nfiles: {}",
+            "{id}: {}\nfolder: {}\nbranch: {}",
             state.status.name(),
             folder.display(),
             if state.branch.is_empty() {
@@ -964,7 +661,6 @@ impl Registry {
             } else {
                 &state.branch
             },
-            state.files.join(", ")
         );
         match self.as_agreed(id)? {
             None => out += "\n\"Done when\" NOT AGREED: define the problem and ask the owner first",
@@ -989,13 +685,13 @@ impl Registry {
     }
 
     fn proven(&self, id: &str) -> Result<String> {
-        let mut state = self.mine(id)?;
+        let mut state = self.working(id)?;
         ensure!(
             state.status == Status::Active,
             "{id} is {}",
             state.status.name()
         );
-        let mut found = self.problems(id, &state, &self.changed()?)?;
+        let mut found = self.problems(id)?;
         let notes = self.file(id, "notes.md")?;
         let causes = section(&notes, "Sub-causes").unwrap_or_default();
         let mut ticked = 0;
@@ -1033,7 +729,6 @@ impl Registry {
         state.proven_commit = git(&self.here.root, &["rev-parse", "HEAD"])?;
         state.proven_by = self.here.session.clone();
         state.branch = branch;
-        state.heartbeat = self.here.now;
         self.append(
             id,
             &format!("proven at {} on {}", state.proven_commit, state.branch),
@@ -1067,13 +762,7 @@ impl Registry {
         .with_context(|| format!("{} is not in main", state.proven_commit))?;
         let words = owner.map(|o| format!("; owner: {o}")).unwrap_or_default();
         self.append(id, &format!("confirmed fixed on main: {evidence}{words}"))?;
-        state = State {
-            status: Status::Fixed,
-            proven_commit: state.proven_commit,
-            proven_by: state.proven_by,
-            branch: state.branch,
-            ..State::default()
-        };
+        state.status = Status::Fixed;
         self.save(id, &state)?;
         Ok(format!("{id}: fixed"))
     }

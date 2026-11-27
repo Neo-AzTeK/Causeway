@@ -36,9 +36,9 @@ and ask the owner for the title's folder if none is set.
   in `docs/problem-sessions.md`; offline `translate`/`census` scans do not
   count): it spoils that run's timings, and several crates' tests use the GPU.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
-- One main session does the work, debugging included, toward one goal at a
-  time. Now: one correct frame; fix the earliest missing or wrong step first,
-  then speed. Add a session or agent only for a separate task with a clear
+- One main session does the work, debugging included; it may work on several
+  problems at once (no locks). Goal now: one correct frame; fix the earliest
+  missing or wrong step first, then speed. Add a session or agent only for a separate task with a clear
   test, or when the owner asks. No agents by default.
 - Before working on a listed problem that has notes, also after compaction or
   a pause: `cargo xtask problem resume <id>` and read them.

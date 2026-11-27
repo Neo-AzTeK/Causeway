@@ -47,8 +47,8 @@ Each item names its problem in the ranked table below.
       same build that plays (`compile-backlog`)
 - [ ] Frame replay tool, if the owner chooses it
 - [ ] Speed and memory (`frame-preparing-cost`): the design the tests point
-      to is `docs/memory-design.md` (4 steps; steps 1-3 need the owner's OK to
-      take over the claimed problem). Remaining hypotheses in
+      to is `docs/memory-design.md` (4 steps, being built; step 1, the
+      changed-page count, is in). Remaining hypotheses in
       `docs/frame-cost.md`, one at a time, writing each result there. Order
       (cheap tests first, then by bytes touched):
       - [x] H6.2 the slow GPU copy programs read a wrong or stale count:
@@ -117,9 +117,9 @@ Not seen to change the picture yet. Where each ran: `docs/adapters.md`.
 ## Ranked problems
 
 Ranked by effect on the picture, then stability, then speed. One row is one
-overall problem, worked by at most one session
-(`docs/problem-sessions.md`). `cargo xtask problem list` adds who holds what on
-this machine. Ids and ranks change only when the owner re-ranks, or a diff adds,
+overall problem; any session may work on any number of them
+(`docs/problem-sessions.md`). `cargo xtask problem list` adds each one's state
+and branch on this machine. Ids and ranks change only when the owner re-ranks, or a diff adds,
 splits or closes a problem; `cargo xtask problem` reads this table, so keep its
 first two columns and number the rows from 1.
 

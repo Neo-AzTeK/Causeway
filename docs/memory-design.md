@@ -1,6 +1,6 @@
 # Title memory on a discrete GPU: design
 
-Proposal, 2026-11-27. Not built. It rests on the tested hypotheses in
+Proposal, 2026-11-27. Step 1 built; steps 2-4 not. It rests on the tested hypotheses in
 `docs/frame-cost.md` (H0.1-H0.6, H1.2, H6.2). Live work stays in
 `docs/problems.md`.
 
@@ -126,9 +126,6 @@ placements (the hook's capability-query rule applies to steps 2-4).
   cut it later.
 - **The streaming churn (H0.6)** is the title's own. This design makes each
   reload cost one upload, and does not stop it.
-- **Ownership.** Steps 1-3 change the code the `frame-preparing-cost` problem
-  covers (claimed, blocked). Taking it over needs the owner's words
-  (`cargo xtask problem claim … --take-over`).
 
 ## Not in this design
 
