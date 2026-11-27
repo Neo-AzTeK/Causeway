@@ -1388,3 +1388,87 @@ fn a_wave64_program_with_full_shared_memory_asks_for_waves_of_64() {
         );
     }
 }
+
+/// The prefix of wave totals the console's structure builder computes: each
+/// console wave of a 256-thread group writes its total (10 + its index) to
+/// LDS, then, under `if (id >> 6 != 0)`, loops over the totals of the waves
+/// before it with lanes leaving at their own wave's index, reading the
+/// running sum's first lane (`v_readfirstlane`) every iteration. The total is
+/// read from the wave's last lane first, a read across the two host waves.
+/// `region` goes first under the `if`. Every thread stores the sum of the
+/// waves before its own: 0, 10, 10 + 11, 10 + 11 + 12.
+/// Adapted from avatarmanz/VIctory-7900XTX 431cab5.
+fn wave_prefix(region: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let skip = 0x11 + region.len() as u32;
+    let body = [
+        &[
+            0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0     (the console wave's index)
+            0x3410_0E82, // v_lshlrev_b32 v8, 2, v7
+            0x4A12_0E8A, // v_add_nc_u32 v9, 10, v7
+            0xD760_0013,
+            0x0201_7F09, // v_readlane_b32 s19, v9, 63 (the wave's last lane)
+            0x7E12_0213, // v_mov_b32 v9, s19
+            0xD834_0000,
+            0x0000_0908,        // ds_write_b32 v8, v9
+            0xBF8C_C07F,        // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000,        // s_barrier
+            0x7E10_0280,        // v_mov_b32 v8, 0
+            0xBE80_047E,        // s_mov_b64 s[0:1], exec
+            0x7DAA_0E80,        // v_cmpx_ne_u32 0, v7
+            0xBF88_0000 | skip, // s_cbranch_execz END
+        ][..],
+        region,
+        &[
+            0xBE86_047E, // s_mov_b64 s[6:7], exec
+            0xBE92_0380, // s_mov_b32 s18, 0
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xBF82_0002, // s_branch BODY
+            0x87FE_0614, // LOOPTOP: s_and_b64 exec, s[20:21], s[6:7]
+            0x7E22_0508, // v_readfirstlane_b32 s17, v8
+            0x8F10_8212, // BODY: s_lshl_b32 s16, s18, 2
+            0x8112_8112, // s_add_i32 s18, s18, 1
+            0x7E10_0210, // v_mov_b32 v8, s16
+            0xD8D8_0000,
+            0x0800_0008, // ds_read_b32 v8, v8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A10_1011, // v_add_nc_u32 v8, s17, v8
+            0xBE94_047E, // s_mov_b64 s[20:21], exec
+            0x7DA4_0E12, // v_cmpx_eq_u32 s18, v7
+            0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+            0xBF85_FFF3, // s_cbranch_scc1 LOOPTOP
+            0xBEFE_0400, // END: s_mov_b64 exec, s[0:1]
+        ],
+    ]
+    .concat();
+    let want = (0..256u32)
+        .map(|t| (0..t / 64).map(|w| 10 + w).sum())
+        .collect();
+    (body, want)
+}
+
+/// The condition and the sum are alike in every lane of a console wave, so
+/// each host wave takes its own first lane, where an exchange (in a loop)
+/// would be refused. With both halves following the console's wave.
+#[test]
+fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
+    let (body, want) = wave_prefix(&[]);
+    if let Some(got) = two_halves_with_lds(&body, 256) {
+        assert_eq!(got, want);
+    }
+}
+
+/// [`a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop`] with a
+/// scalar load where only some waves go, which keeps the halves from
+/// following the console's wave (module `linear`), as in the console's
+/// structure builder: each lane on its own conditions.
+#[test]
+fn a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own() {
+    let (body, want) = wave_prefix(&[
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20 (unused)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ]);
+    if let Some(got) = two_halves_with_lds(&body, 256) {
+        assert_eq!(got, want);
+    }
+}

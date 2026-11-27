@@ -22,6 +22,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
 pub(super) mod linear;
+mod uniform;
 
 type Why = &'static str;
 
@@ -263,6 +264,10 @@ struct Lower<'a> {
     wave64_why: Option<Why>,
     /// IR blocks every lane runs exactly once.
     common: Vec<bool>,
+    /// With `virt`: VGPR values alike in every lane of a console wave
+    /// ([`uniform::lane_uniform`]); a first-lane read of one needs nothing
+    /// from the other host wave.
+    uniform: HashSet<Value>,
     /// With `virt`, made in the entry block: whether this host wave is the
     /// console wave's upper half (0 or 1), and its first exchange slot.
     halves: Option<(V, V)>,
@@ -809,6 +814,11 @@ impl<'a> Lower<'a> {
                 vec![true; p.blocks.len()]
             } else {
                 super::lockstep::common(&p.blocks)
+            },
+            uniform: if virt {
+                uniform::lane_uniform(p, x.st, uniform::wave_tid(x.native, x.io))
+            } else {
+                HashSet::new()
             },
             halves: None,
             has_upper: None,
@@ -6828,6 +6838,16 @@ impl<'a> Lower<'a> {
                     .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if self.virt
+                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))) =>
+            {
+                // Alike in every lane of the console wave: the lane's own
+                // value is its first lane's, in either host wave.
                 let a = s(self, 0)?;
                 int(self, a)
             }

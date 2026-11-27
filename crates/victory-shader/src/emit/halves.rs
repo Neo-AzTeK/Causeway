@@ -26,7 +26,7 @@ fn scalar(reg: Reg) -> bool {
 }
 
 /// The scalar values derived from lanes.
-fn lane_derived(p: &Program) -> HashSet<Value> {
+pub(super) fn lane_derived(p: &Program) -> HashSet<Value> {
     let mut set: HashSet<Value> = p
         .inputs
         .iter()
