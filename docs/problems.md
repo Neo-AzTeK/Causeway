@@ -39,8 +39,8 @@ Each item names its problem in the ranked table below.
       point at, for the next time it happens
 - [x] `victory-shader` test `direct_barycentrics_weigh_the_second_and_third_vertex`
       failed on a host without barycentrics (GTX 1070) instead of skipping;
-      fixed on branch `claude/bary-test-skip-8f4ace` (`Host::has_barycentrics`,
-      the test skips with a message); not yet on `main`
+      fixed on `main` (5ce24f1: `Host::has_barycentrics`, the test skips with
+      a message)
 
 - [ ] Find the pass that should put lit people and ground into the scene's
       colour before tonemap (`scene-blocker`). Traced on the newest build:
@@ -52,6 +52,18 @@ Each item names its problem in the ranked table below.
       everywhere. Tonemap and upscale keep the picture they get, so this
       second loss is in lighting or composition. Measured in one frame of
       one shot; not pinned to one pass, no causal test yet
+- [ ] Texture slots shaders pick by index stay empty because memory runs
+      out (`placed-texture-slots`): probes show the waiting slots need about
+      as much video memory again as the textures already resident, which
+      are all mapped (holding only mapped levels would not free room) and
+      kept resident only because the heap views them. Read bits are built:
+      shaders mark each host slot they read by index (`view_reads`, bits
+      after the write bits in the marks bitmap), and the texture queue makes
+      read slots first, up to the critical memory level; the full shader
+      scan lost no program. Next: a world run's "read marks since the last
+      queue line" figures (how many read slots wait null, how many get made)
+      and its frames against the last run; if read slots then fit, stop
+      keeping unread heap-viewed textures resident (null their slots first)
 - [ ] Owner decides how the original project's later updates come in: one
       commit at a time, or squashed; cleaned either way
 - [ ] Game run that includes the newest shader fix (lane mask joined with data)
@@ -72,8 +84,10 @@ Each item names its problem in the ranked table below.
       buffer of unknown stride; a descriptor read as data (may need the
       descriptor heap's contents; that work is ours too)
 - [x] Look for fixes in forks not yet checked: `avatarmanz/VIctory-7900XTX`,
-      `DexNom/VIctory`: done 2026-11-27, best leads are x7900 wave32 shader commits and DexNom `76749ce` (lane mask); list in `E:Causeway-tools
-otesork-scan.md`
+      `DexNom/VIctory`: done 2026-11-27, best leads are x7900 wave32 shader
+      commits and DexNom `76749ce` (lane mask); list in the fork-scan notes
+      (developer's notes folder, `fork-scan.md`); x7900's `431cab5` is being
+      ported (`wave64-refusals`)
 - [ ] Reach one fixed test scene that every run can repeat (`scene-blocker`)
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
@@ -90,9 +104,67 @@ otesork-scan.md`
 - [ ] Recording runs crash the title at `+0x23cf683` (write to 0), most
       likely when a snapshot stalls the submitting thread for seconds
       (9 recordings, no other run); being fixed on its own branch
-- [ ] Speed, after the picture: look at waiting for the GPU after every batch
-      sent, and at the copies between the two views of memory; the gain is not
-      measured (`frame-preparing-cost`)
+- [ ] Speed and memory (`frame-preparing-cost`): the design agreed with the
+      owner is `docs/memory-design.md` (rewritten 2026-11-27): each byte
+      lives where its users are; assets stream from disk to video memory,
+      GPU-only memory lives only there, the title's pages for both stay
+      unbacked and guarded, and textures are made when read and evicted
+      when not. Next: step 0, one run measuring memory by class and owner,
+      CPU reads of loaded data, and GPU bytes per frame. Built: sections
+      used in place (median frame 500 ms against ~880-980, but 6.1 GB
+      committed up front, to decide after step 0). Remaining hypotheses in
+      `docs/frame-cost.md`, one at a time, writing each result there. Order
+      (cheap tests first, then by bytes touched):
+      - [x] H6.2 the slow GPU copy programs read a wrong or stale count:
+            refuted (counts sane); second-long commands are H6.6
+            (also correctness)
+      - [x] H0.2 the title marks GPU-only memory: partly (protection bit 0x800
+            never written; the GPU heap is one class). Old wording: CPU
+            writes into buffers on default heaps
+      - [x] H0.1 bytes by writer: confirmed (title code writes ~3% of
+            tracked memory; ~44% written by nobody in two minutes)
+      - [x] H0.4 streaming volume is real: ~4.4 GB of DirectStorage loads per
+            ~2 minutes standing still, ~18% reloads of the same data
+      - [x] H0.5 our memory answers make the title evict and reload: mostly
+            refuted (it never asks for working-set statistics)
+      - [ ] H0.6 the title's own streaming churns (not retries: tested);
+            parked until its streaming inputs are known
+      - [ ] H0.3 CPU reads of pages the GPU writes
+      - [x] H1.2 our own write-backs refreshed back in: small (~1% of pages)
+      - [ ] H1.3 one title page in several host copies
+      - [ ] H1.1 changed 64-byte pieces per copied page
+      - [ ] H3.1 / H3.2 changed and equal-rewritten heap slots per page
+      - [ ] H5.1 views per frame seen the frame before
+      - [ ] H1.4 kernel read against plain copy (offline benchmark)
+      - [ ] H1.5 / H5.4 the same scene with the release build
+      - [x] H6.1 buffers in video memory: mostly refuted (GPU time about
+            unchanged with every copy in video memory)
+      - [ ] H6.6 second-long one-off stalls (paging, GPU faults, device
+            drift); redo the GPU ranking from runs without removal
+      - [ ] H6.3 / H6.4 / H6.5 wave 64, translated code, idle gaps
+      - [ ] H2.1 refresh cost per byte with and without shader writes
+      - [ ] H7.1 overlap preparing with the GPU, if H0.x hold
+- [ ] Ideas from xcl-dev/xcl (GPL-2.0-only: ideas only, our own code), by
+      measured cost (world frame ~1.3 s: 709 ms preparing on the submitting
+      thread, 550 ms GPU): (1) changed-bytes upload: copy only 64-byte chunks
+      that differ from what was last sent, on a copy queue the title's queue
+      waits on in the GPU, so preparing leaves the submitting thread; (2)
+      buffer descriptors read as their title address through the page table,
+      not one host view each (23-28k placed-buffer slots a frame, 190-645 ms,
+      `for_view` up to 1.1 s, on title threads, all behind one heap lock);
+      (3) title memory the GPU uses in place (`OpenExistingHeapFromAddress`):
+      host copies of buffers are system memory already, so the GPU reads at
+      today's cost and refresh, snapshot and copy-back go. Probes
+      (`inplace.rs`, RTX 2060 SUPER) open committed pools and physical-page
+      section views in placeholders, GPU writes land in place; the sized form
+      opens part of an allocation. Tried (`VICTORY_IN_PLACE=1`, off by
+      default): the runtime maps title memory as 64 KiB views, so the big GPU
+      heap never opened whole; and an open heap pins its view, so the
+      title's unmaps were refused while lists or slots held the copy (167 in
+      one world run), then the title crashed. Next lead: open the section
+      itself (`OpenExistingHeapFromFileMapping`), which pins no addresses;
+      title addresses then need their section offset, contiguous only where
+      the title maps pages in order
 
 ## Done lately
 
@@ -110,9 +182,9 @@ Not seen to change the picture yet. Where each ran: `docs/adapters.md`.
 ## Ranked problems
 
 Ranked by effect on the picture, then stability, then speed. One row is one
-overall problem, worked by at most one session
-(`docs/problem-sessions.md`). `cargo xtask problem list` adds who holds what on
-this machine. Ids and ranks change only when the owner re-ranks, or a diff adds,
+overall problem; any session may work on any number of them
+(`docs/problem-sessions.md`). `cargo xtask problem list` adds each one's state
+and branch on this machine. Ids and ranks change only when the owner re-ranks, or a diff adds,
 splits or closes a problem; `cargo xtask problem` reads this table, so keep its
 first two columns and number the rows from 1.
 

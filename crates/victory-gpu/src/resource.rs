@@ -792,6 +792,10 @@ pub(crate) struct HostTexture {
     /// When a list or a view last reached it ([`now_ms`]); shared with its
     /// [`LIVE`] entry.
     last_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The title memory and console layout it was made for
+    /// (`crate::levels`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) title: std::sync::OnceLock<(u64, victory_formats::texture::Layout)>,
 }
 
 /// Host textures in video memory only once the GPU may reach them. The
@@ -1062,7 +1066,21 @@ impl HostTexture {
             used: false.into(),
             residency,
             last_used,
+            #[cfg(feature = "diagnostics")]
+            title: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Bytes it takes on the host GPU.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether it is resident now ([`residency`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn resident(&self) -> bool {
+        self.residency.load(std::sync::atomic::Ordering::Acquire) != NOT_RESIDENT
     }
 
     /// A submission holds it: stamped as used now and at the normal
@@ -1507,6 +1525,12 @@ fn shared_texture(
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
     let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    #[cfg(feature = "diagnostics")]
+    if let Some(tex) = texture_layout(desc) {
+        let plane = &tex.planes[0];
+        crate::levels::count("made", (address + plane.offset) as *const u8, &plane.layout, t.bytes);
+        let _ = t.title.set((address + plane.offset, plane.layout.clone()));
+    }
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1518,6 +1542,13 @@ fn shared_texture(
         map.insert(k, std::sync::Arc::downgrade(&t));
     }
     Some(t)
+}
+
+/// Live host textures made for title memory (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn titled() -> Vec<std::sync::Arc<HostTexture>> {
+    let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref().map_or_else(Vec::new, |m| m.values().filter_map(std::sync::Weak::upgrade).collect())
 }
 
 /// Whether host texture `t` takes a title texture of host description
@@ -2014,6 +2045,41 @@ pub(crate) extern "system" fn create_at_address(
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Host bytes a texture placed at `address` with the resource description
+/// `desc` (as words) would add if made now: 0 when it or a host texture of
+/// its memory is live, `None` when the host cannot size it (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_cost(address: u64, desc: &[u32; 14]) -> Option<u64> {
+    let mut desc = *desc;
+    (desc[1], desc[13]) = (0, 0);
+    if let Some(&r) = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).get(&(address, desc))
+        && current(r as This)
+    {
+        return Some(0);
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    if let Some(k) = memory_key(address, &d)
+        && let Some(map) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        && map.get(&k).is_some_and(|w| w.strong_count() > 0)
+    {
+        return Some(0);
+    }
+    let h = host_desc(&d)?;
+    let host = crate::host::host()?;
+    // SAFETY: a plain query on a host description (same layout).
+    let info = unsafe {
+        host.device.GetResourceAllocationInfo(
+            0,
+            &[std::ptr::from_ref(&h).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()],
+        )
+    };
+    Some(info.SizeInBytes)
+}
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.

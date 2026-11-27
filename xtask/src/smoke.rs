@@ -67,6 +67,10 @@ pub struct Smoke {
     /// A diagnostics build to run instead of building one.
     #[arg(long)]
     exe_victory: Option<PathBuf>,
+    /// The console model the title sees (`victory run --console`): it picks
+    /// resolution and memory budgets by it.
+    #[arg(long, default_value = "series-x", value_parser = ["series-x", "series-s"], conflicts_with = "log")]
+    console: String,
     /// Judge this log; nothing runs.
     #[arg(long, conflicts_with_all = ["exe", "keys", "exe_victory", "data_dir"])]
     log: Option<PathBuf>,
@@ -232,14 +236,17 @@ fn git_state(root: &Path) -> (String, String) {
 
 /// Written beside the log: what the digest needs of the build and of what
 /// the runner set. Switch values are not secrets; they stay out of the repo.
-fn write_run_info(root: &Path, out: &Path, env: &[(String, OsString)]) -> Result<()> {
+fn write_run_info(root: &Path, out: &Path, console: &str, env: &[(String, OsString)]) -> Result<()> {
     let (commit, branch) = git_state(root);
     let dirty = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(root)
         .output()
         .is_ok_and(|o| !o.stdout.is_empty());
-    let mut text = format!("commit {commit}\nbranch {branch}\ndirty {}\n", if dirty { "yes" } else { "no" });
+    let mut text = format!(
+        "commit {commit}\nbranch {branch}\ndirty {}\nconsole {console}\n",
+        if dirty { "yes" } else { "no" }
+    );
     for (name, value) in env {
         text += &format!("env {name}={}\n", value.to_string_lossy().replace(['\r', '\n'], " "));
     }
@@ -278,7 +285,7 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         args.out.display()
     );
     if let Some(id) = &args.problem {
-        // Refused unless held; says that a run was tried, not that it ran.
+        // Says that a run was tried, not that it ran.
         let asked = format!("smoke run asked for: {}", args.out.display());
         problem::record_run(root, id, &asked)?;
     }
@@ -340,7 +347,7 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         set.retain(|(n, _)| n != name);
         set.push((name.clone(), value.into()));
     }
-    write_run_info(root, &out, &set)?;
+    write_run_info(root, &out, &args.console, &set)?;
     for (name, value) in &set {
         command.env(name, value);
     }
@@ -348,6 +355,7 @@ fn launch(root: &Path, args: &Smoke) -> Result<(PathBuf, (End, f64))> {
         .arg("run")
         .arg(std::path::absolute(exe)?)
         .arg("--execute")
+        .args(["--console", &args.console])
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file);
@@ -1226,6 +1234,7 @@ mod tests {
             problem: None,
             keys: None,
             exe_victory: None,
+            console: "series-x".into(),
             log: Some(root.join("README.md")),
             envs: vec![],
             baseline: None,

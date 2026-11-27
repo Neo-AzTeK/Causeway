@@ -144,6 +144,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         mesh_stride: 0,
         min_lod_clamp: false,
         view_marks: false,
+        view_reads: false,
     })?;
 
     let shader = HostShader {
@@ -1233,6 +1234,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         mesh_stride: 0,
         min_lod_clamp: true,
         view_marks: false,
+        view_reads: false,
     })
     .expect("lower");
     let shader = HostShader {

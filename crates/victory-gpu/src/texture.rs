@@ -56,6 +56,14 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let read = self.last.get_mut().map_or(0, |l| l.read.capacity());
+        let buffer = if matches!(self.way, Way::Cpu { .. }) { self.size as usize } else { 0 };
+        crate::ledger::add(crate::ledger::Owner::TextureStaging, -((read + buffer) as i64));
+    }
+}
+
 enum Way {
     /// Converted by a shader (`crate::detile`).
     Gpu(crate::detile::Plan),
@@ -401,7 +409,9 @@ impl Staging {
                 match changed {
                     Changed::Mapped(memory, _) => {
                         let size = self.layout.size as usize;
+                        let had = read.capacity();
                         read.resize(size, 0);
+                        crate::ledger::add(crate::ledger::Owner::TextureStaging, (read.capacity() - had) as i64);
                         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
                         self.detile(read);
                     }
@@ -638,10 +648,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
                     d.Width, d.Height, d.DepthOrArraySize, d.Format.0
                 )
             });
+            crate::ledger::add(crate::ledger::Owner::TextureStaging, total as i64);
             Way::Cpu { buffer, data }
         }
     };
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    #[cfg(feature = "diagnostics")]
+    crate::levels::count("first upload", memory, &layout, copy.bytes());
     let layout_size = layout.size as usize;
     let s = Arc::new(Staging {
         way,

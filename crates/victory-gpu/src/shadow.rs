@@ -49,6 +49,16 @@ pub(crate) struct Shadow {
     /// The block of a view-copy heap its buffer is placed on ([`BLOCKS`]),
     /// given back when the copy dies (copies of single views, [`exact`]).
     block: Option<Block>,
+    /// The heap of title memory the GPU uses in place (`crate::inplace`):
+    /// `data` is title memory itself, and there is nothing to refresh,
+    /// snapshot or copy back.
+    in_place: Option<ID3D12Heap>,
+    /// Whether that heap pins the title's view (`crate::inplace::Opened::pins`).
+    pins: bool,
+    /// The system-memory buffer `data` maps, when shaders use `buffer` in
+    /// video memory instead (diagnostics probe, `crate::vramcopy`).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    home: Option<ID3D12Resource>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -86,6 +96,7 @@ fn give_back(v: Vec<u8>) {
         total += v.capacity();
         total <= POOL_BYTES
     });
+    crate::ledger::set(crate::ledger::Owner::SnapshotPool, pool.iter().map(Vec::capacity).sum::<usize>() as i64);
 }
 
 /// Snapshot memory kept for reuse.
@@ -187,6 +198,9 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        if self.in_place.is_some() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -212,7 +226,7 @@ impl Shadow {
             return 0;
         }
         {
-            let _writing = crate::watch::writing(from, n);
+            let _writing = crate::watch::gpu_writing(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
         }
         // Our write is not the title's: the copy holds the page as it is.
@@ -225,11 +239,33 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.in_place.is_some() {
+            // The GPU reads it where it lies: pages of this range disk
+            // loads left without bytes take them first (the rest of the
+            // view, textures read through `host::read`, stays without).
+            crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
+            list.keep_in_place(self);
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, block: Option<Block>) -> Arc<Shadow> {
+    /// A copy of `[start, start + len)` in `buffer`, system memory that
+    /// `data` maps. Where `twin` allows, the diagnostics probe moves what
+    /// shaders use to video memory (`crate::vramcopy`).
+    fn new(buffer: ID3D12Resource, data: *mut u8, start: u64, len: u64, block: Option<Block>, twin: bool) -> Arc<Shadow> {
+        #[cfg(feature = "diagnostics")]
+        // SAFETY: a live buffer.
+        let (buffer, home) = match twin.then(|| crate::vramcopy::twin(unsafe { buffer.GetDesc() }.Width)).flatten() {
+            Some(video) => (video, Some(buffer)),
+            None => (buffer, None),
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let (home, _) = (None, twin);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        crate::ledger::add(crate::ledger::Owner::BufferCopies, len as i64);
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -243,11 +279,41 @@ impl Shadow {
             before: Mutex::default(),
             marks,
             block,
+            in_place: None,
+            pins: false,
+            home,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
+    }
+
+    /// Title memory the GPU uses in place: no copy, no watch.
+    fn opened(o: crate::inplace::Opened) -> Arc<Shadow> {
+        // SAFETY: a live buffer.
+        let gpu = unsafe { o.buffer.GetGPUVirtualAddress() };
+        Arc::new(Shadow {
+            buffer: o.buffer,
+            data: o.start as *mut u8,
+            gpu,
+            start: o.start,
+            len: o.len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            marks: None,
+            block: None,
+            in_place: Some(o.heap),
+            pins: o.pins,
+            home: None,
+        })
+    }
+
+    /// Whether the GPU uses its title memory in place (tests).
+    #[cfg(test)]
+    pub(crate) fn in_place(&self) -> bool {
+        self.in_place.is_some()
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -287,6 +353,14 @@ impl Shadow {
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+        // Written in place: nothing to snapshot or copy back.
+        if self.in_place.is_some() {
+            // A GPU write lands past the guard: the load's bytes go in
+            // first, or a later fill would cover what the GPU wrote.
+            crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
+            list.keep_in_place(self);
+            return;
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
@@ -303,6 +377,9 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+        if self.in_place.is_some() {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -368,6 +445,13 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        if self.in_place.is_some() {
+            // The GPU wrote title memory itself: copies of it elsewhere
+            // (views, textures) take the range again. What it computed
+            // from memory with no copy (`back` false) stays there too.
+            drop(crate::watch::gpu_writing(address, len));
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -429,7 +513,7 @@ impl Shadow {
                     if changed {
                         #[cfg(feature = "diagnostics")]
                         let t3 = std::time::Instant::now();
-                        let _writing = crate::watch::writing(start + at, n);
+                        let _writing = crate::watch::gpu_writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
@@ -531,7 +615,7 @@ impl Shadow {
             }
         };
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
+            let _writing = crate::watch::gpu_writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
             #[cfg(feature = "diagnostics")]
             note_write_back(self, from as u64);
@@ -547,6 +631,9 @@ impl Shadow {
     /// to copy: a page there changed since it was taken, or the memory is not
     /// tracked (copied whole each time).
     pub(crate) fn stale(&self, address: usize, len: usize) -> bool {
+        if self.in_place.is_some() {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         from < to && self.tracked.as_ref().is_none_or(|t| t.any_changed(from, to))
@@ -556,6 +643,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.in_place.is_some() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -678,12 +768,19 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        #[cfg(feature = "diagnostics")]
+        if let Some(home) = &self.home {
+            crate::vramcopy::copied(&self.buffer, home, (from - start) as u64, (to - from) as u64);
+        }
         to - from
     }
 }
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.in_place.is_none() {
+            crate::ledger::add(crate::ledger::Owner::BufferCopies, -(self.len as i64));
+        }
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
@@ -776,7 +873,9 @@ fn bitmap() -> Option<&'static Bitmap> {
     static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
     BITMAP
         .get_or_init(|| {
-            let bits = host()?.mark_bits(u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8))?;
+            // Written-pages bits, then the read marks of heap slots.
+            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8 + victory_shader::emit::VIEW_READ_BITS / 8);
+            let bits = host()?.mark_bits(bytes)?;
             crate::host::name(&bits.gpu, || "views' written pages".into());
             // SAFETY: a live buffer.
             let gpu = unsafe { bits.gpu.GetGPUVirtualAddress() };
@@ -796,6 +895,30 @@ pub(crate) fn view_writes(list: &crate::host::HostList) -> Option<u64> {
     let b = bitmap()?;
     list.read_marks(&b.bits);
     Some(b.gpu)
+}
+
+/// After a submission: the host view heap slots its shaders took from the
+/// heap at computed indices (`victory_shader::emit`, "Read marks"), in
+/// order; the marks are cleared. The last slot also stands for every slot
+/// past the bits.
+pub(crate) fn take_reads() -> Vec<u32> {
+    let Some(b) = bitmap() else {
+        return Vec::new();
+    };
+    let first = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+    let words = (victory_shader::emit::VIEW_READ_BITS / 32) as usize;
+    // SAFETY: the mapped bitmap, past its written-pages bits; the GPU is
+    // done with it (one submission runs at a time).
+    let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+    let mut read = Vec::new();
+    for (w, word) in bits.iter_mut().enumerate() {
+        let mut x = std::mem::take(word);
+        while x != 0 {
+            read.push((w * 32) as u32 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+    read
 }
 
 /// After a submission: every page its shaders marked as written through
@@ -906,6 +1029,64 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// Section views the GPU uses in place, by start: one copy serves every
+/// buffer and loose range in the view ([`find`], [`loose`]).
+static OPEN: Mutex<BTreeMap<u64, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// The in-place copy of the view holding `[at, at + n)`, opened on first
+/// use; none where it needs a host copy (`crate::inplace::open`).
+fn in_place(at: u64, n: u64) -> Option<Arc<Shadow>> {
+    let mut map = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = map.range(..=at).next_back()
+        && at.saturating_add(n) <= s.start + s.len
+    {
+        return Some(s.clone());
+    }
+    let shadow = Shadow::opened(crate::inplace::open(at, n)?);
+    tracing::info!(
+        start = format_args!("{:#x}", shadow.start),
+        len = shadow.len,
+        "title memory used by the GPU in place"
+    );
+    map.insert(shadow.start, shadow.clone());
+    changed();
+    Some(shadow)
+}
+
+/// Before the runtime unmaps title memory `[at, at + len)`: the in-place
+/// copies over it go: what those addresses show changes. A heap opened from
+/// the view's address also pins its pages (Windows refuses the unmap while
+/// one lives); one opened from its section does not. Buffers there are
+/// opened or copied again on their next use.
+pub(crate) fn let_go(at: u64, len: u64) {
+    let end = at.saturating_add(len);
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        let hit: Vec<u64> = map.range(..end).filter(|(_, s)| s.start + s.len > at).map(|(&k, _)| k).collect();
+        hit.iter().filter_map(|k| map.remove(k)).collect()
+    };
+    if gone.is_empty() {
+        return;
+    }
+    for entry in buffers().values_mut() {
+        if entry.shadow.as_ref().is_some_and(|s| gone.iter().any(|g| Arc::ptr_eq(s, g))) {
+            entry.shadow = None;
+        }
+    }
+    changed();
+    for shadow in gone {
+        let held = Arc::strong_count(&shadow) - 1;
+        if held > 0 && shadow.pins {
+            tracing::warn!(
+                start = format_args!("{:#x}", shadow.start),
+                len = shadow.len,
+                held,
+                "title memory unmapped while lists or slots still hold its in-place copy: Windows refuses the unmap"
+            );
+        }
+    }
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
@@ -924,12 +1105,15 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        if let Some(shadow) = in_place(key.0, len) {
+            entry.shadow = Some(shadow.clone());
+            changed();
+            return Some(shadow);
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
@@ -943,7 +1127,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len, None));
+        entry.shadow = Some(Shadow::new(buffer, data, key.0, len, None, true));
         changed();
     }
     entry.shadow.clone()
@@ -966,16 +1150,17 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
+    if let Some(shadow) = in_place(address, end - address) {
+        return Some(shadow);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
         "loose memory copied to the host"
     );
-    let shadow = Shadow::new(buffer, data, gpu, start, len, None);
+    let shadow = Shadow::new(buffer, data, start, len, None, true);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1133,11 +1318,9 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
     };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     // A new copy takes every page (or the whole of untracked memory) at
     // its first refresh.
-    let shadow = Shadow::new(buffer, data, gpu, address, len, block);
+    let shadow = Shadow::new(buffer, data, address, len, block, false);
     map.insert((address, len), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {

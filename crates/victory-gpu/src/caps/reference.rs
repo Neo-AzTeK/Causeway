@@ -8,7 +8,7 @@
 //! what it reports and update the source with it; the profile's own comment
 //! says which figures that reading did not cover.
 
-use super::{AdapterInfo, Caps, MemoryCaps, ShaderModel, WaveLanes};
+use super::{AdapterInfo, Caps, ExistingHeaps, MemoryCaps, ShaderModel, WaveLanes};
 use std::collections::BTreeMap;
 
 const GIB: u64 = 1 << 30;
@@ -74,6 +74,7 @@ fn base(name: &str, vendor_id: u32, wave: (u32, u32), tiers: (u8, u8, u8)) -> Ca
         barycentrics: Some(true),
         uma: Some(false),
         memory: MemoryCaps { budget: Some(7 * GIB), dedicated: 8 * GIB, shared: 16 * GIB },
+        existing_heaps: ExistingHeaps::None,
         formats: BTreeMap::new(),
         workarounds: Vec::new(),
     }

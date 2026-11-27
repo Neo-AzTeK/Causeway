@@ -1,6 +1,6 @@
 # wave64-refusals: next steps (2026-11-26)
 
-Branch `claude/wave64-loop`. Problem claim and full notes: `cargo xtask problem
+Branch `claude/wave64-loop`. Full notes: `cargo xtask problem
 resume wave64-refusals`. Delete this file when the problem is proven.
 
 ## Done on this branch

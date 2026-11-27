@@ -3,17 +3,20 @@
 //! [`dump_stacks_on_schedule`], to find what a title waits on.
 
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationThread, ThreadBasicInformation, ThreadQuerySetWin32StartAddress,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext,
+    CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, SYMBOL_INFOW, SYMOPT_DEFERRED_LOADS,
+    SYMOPT_UNDNAME, SymFromAddrW, SymInitializeW, SymRefreshModuleList, SymSetOptions,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
@@ -116,7 +119,7 @@ pub fn dump_stacks() {
             locate(start_of(thread))
         );
         for (i, pc) in frames.into_iter().enumerate() {
-            eprintln!("    #{i:<2} {}", locate(pc as usize));
+            eprintln!("    #{i:<2} {}{}", locate(pc as usize), symbol_of(pc));
         }
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
@@ -171,6 +174,51 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         ResumeThread(thread);
     }
     (frames, (info.priority, info.base_priority))
+}
+
+/// ` function+offset` from the module's symbols (our PDB beside the exe, the
+/// system DLLs' exports), or nothing. Called only after every thread is
+/// resumed: dbghelp allocates and loads files. Only the dump thread calls
+/// dbghelp, which is not thread-safe.
+fn symbol_of(pc: u64) -> String {
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Our PDB is beside the exe, a folder dbghelp's default path leaves out.
+    let ready = *READY.get_or_init(|| {
+        let folder: Vec<u16> = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.as_os_str().to_owned()))
+            .unwrap_or_default()
+            .encode_wide()
+            .chain([0])
+            .collect();
+        // SAFETY: our own process; `folder` is a terminated string.
+        unsafe {
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+            SymInitializeW(GetCurrentProcess(), folder.as_ptr(), 1) != 0
+        }
+    });
+    // Modules loaded since (the title's image) become known.
+    // SAFETY: as above.
+    unsafe { SymRefreshModuleList(GetCurrentProcess()) };
+    if !ready {
+        return String::new();
+    }
+    const MAX_NAME: usize = 256;
+    // u64 words keep SYMBOL_INFOW aligned; the name runs past its end.
+    let mut words = [0u64; (size_of::<SYMBOL_INFOW>() + 2 * MAX_NAME) / 8 + 1];
+    let info = words.as_mut_ptr().cast::<SYMBOL_INFOW>();
+    let mut displacement = 0u64;
+    // SAFETY: `info` has room for the struct and MAX_NAME more characters.
+    unsafe {
+        (*info).SizeOfStruct = size_of::<SYMBOL_INFOW>() as u32;
+        (*info).MaxNameLen = MAX_NAME as u32;
+        if SymFromAddrW(GetCurrentProcess(), pc, &mut displacement, info) == 0 {
+            return String::new();
+        }
+        let len = ((*info).NameLen as usize).min(MAX_NAME);
+        let name = std::slice::from_raw_parts((&raw const (*info).Name).cast::<u16>(), len);
+        format!(" {}+{displacement:#x}", String::from_utf16_lossy(name))
+    }
 }
 
 fn start_of(thread: HANDLE) -> usize {
@@ -229,6 +277,14 @@ mod tests {
         // Waiting in the kernel, several frames down from the thread start.
         assert!(frames.len() >= 3, "{frames:?}");
         assert!(start_of(thread) != 0);
+        // Our frames print with their function names, from the PDB.
+        let named: Vec<String> = frames.iter().map(|&pc| symbol_of(pc)).collect();
+        assert!(
+            named
+                .iter()
+                .any(|n| n.contains("another_threads_stack_unwinds_to_its_start")),
+            "{named:?}"
+        );
         // SAFETY: opened above.
         unsafe { CloseHandle(thread) };
         dump_stacks();

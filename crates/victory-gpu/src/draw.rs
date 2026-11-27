@@ -1136,6 +1136,8 @@ impl State {
         self.probe_small(list, true);
         #[cfg(feature = "diagnostics")]
         self.probe_window(list);
+        #[cfg(feature = "diagnostics")]
+        self.probe_count(list, [x, y, z]);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
@@ -1701,6 +1703,59 @@ impl State {
                 });
             }
         }
+    }
+
+    /// With `VICTORY_PROBE_COUNT=<hash>[,<hash>…]`, for each dispatch of those
+    /// programs: the group count, the root constants, and the first 16 bytes
+    /// of each root view as title memory when recorded, and as title memory
+    /// and as its host copy once the list has run (what the GPU read, unless
+    /// a later command in the list wrote it). Tests whether a program that
+    /// loops over a count it reads from memory got a sane count
+    /// (`docs/frame-cost.md`, H6.2). Words in hex.
+    #[cfg(feature = "diagnostics")]
+    fn probe_count(&self, list: &HostList, groups: [u32; 3]) {
+        static SPEC: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+        let Some(hashes) = SPEC.get_or_init(|| {
+            std::env::var("VICTORY_PROBE_COUNT").ok().map(|s| s.split(',').map(|h| h.trim().to_owned()).collect())
+        }) else {
+            return;
+        };
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        let Some(stage) = p.stages.iter().find(|s| hashes.iter().any(|h| *h == s.shader.hash)) else { return };
+        fn words(bytes: &[u8]) -> Vec<u32> {
+            bytes.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        }
+        fn head(address: u64) -> Option<Vec<u32>> {
+            let mut b = [0u8; 16];
+            crate::host::read_into(address as *const u8, &mut b).then(|| words(&b))
+        }
+        let mut constants = Vec::new();
+        let mut views = Vec::new();
+        for root in self.roots_ref(true) {
+            match root {
+                Root::Constants(c) => constants.push(c.iter().take(8).copied().collect::<Vec<_>>()),
+                Root::View(address) => views.push((*address, head(*address))),
+                _ => {}
+            }
+        }
+        let who = format!(
+            "{} groups {groups:?} frame {} constants {constants:x?}",
+            stage.shader.hash,
+            crate::queue::presented() + 1
+        );
+        list.defer_after(move || {
+            let mut text = who.clone();
+            for (address, recorded) in &views {
+                let copy = crate::shadow::find(*address, 16).and_then(|s| s.peek_bytes(*address, 16)).map(|b| words(&b));
+                use std::fmt::Write as _;
+                let _ = write!(
+                    text,
+                    " | view {address:#x} recorded {recorded:x?} title {:x?} copy {copy:x?}",
+                    head(*address)
+                );
+            }
+            tracing::info!(target: "victory_gpu::trace", "count {text}");
+        });
     }
 
     /// In a listed frame, right after a dispatch: each 1D or 3D texture it

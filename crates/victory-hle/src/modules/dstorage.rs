@@ -23,7 +23,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
 
@@ -144,7 +144,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file: Arc::new(file) });
     put(out, file)
 }
 
@@ -257,7 +257,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    file: std::fs::File,
+    /// Shared with loads read again later (`victory_gpu::lazy`).
+    file: Arc<std::fs::File>,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -821,25 +822,21 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
+        if let Some(done) = lazily(request, size) {
+            return done.map_err(|hr| fail(hr, "copying"));
+        }
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
-    let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    if bc != 0 {
+        bcpack_tables()?;
+    }
+    if let Some(done) = lazily(request, size) {
+        return done.map_err(|hr| fail(hr, "decoding"));
+    }
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
-    };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    into_destination(request, size, |out| {
+        decode(options, request.intermediate_size as usize, &source, out).map_err(|(hr, why)| fail(hr, &why))
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -848,6 +845,214 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+/// Decodes a compressed request's `source` into `out`, returning the bytes
+/// written. The console's order: zlib first, then BCPack.
+fn decode(options: u64, intermediate: usize, source: &[u8], out: &mut [u8]) -> Result<usize, (HRESULT, String)> {
+    let bc = ((options & BCPACK) >> 1) as u8;
+    if bc == 0 {
+        return inflate(source, out).map_err(|hr| (hr, "zlib".into()));
+    }
+    let tables = bcpack_tables().map_err(|hr| (hr, "BCPack tables".into()))?;
+    let packed;
+    let source = if options & ZLIB != 0 {
+        let mut bytes = vec![0; intermediate];
+        let n = inflate(source, &mut bytes).map_err(|hr| (hr, "zlib".into()))?;
+        bytes.truncate(n);
+        packed = bytes;
+        &packed[..]
+    } else {
+        source
+    };
+    bcpack::decode(bc, source, out, tables).map(|()| out.len()).map_err(|e| (INVALID_DATA, e.to_string()))
+}
+
+/// A load read from its file again (`victory_gpu::lazy`): the request's
+/// file range, decoded as the request says.
+struct Disk {
+    file: Arc<std::fs::File>,
+    offset: u64,
+    source_size: usize,
+    /// Decoded bytes: the destination's.
+    len: usize,
+    options: u64,
+    intermediate: usize,
+}
+
+impl Disk {
+    fn read_file(&self, at: usize, out: &mut [u8]) -> bool {
+        let started = std::time::Instant::now();
+        let mut done = 0;
+        let ok = loop {
+            if done == out.len() {
+                break true;
+            }
+            match self.file.seek_read(&mut out[done..], self.offset + (at + done) as u64) {
+                Ok(0) | Err(_) => break false,
+                Ok(n) => done += n,
+            }
+        };
+        READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ok
+    }
+}
+
+impl victory_gpu::lazy::Source for Disk {
+    fn size(&self) -> usize {
+        self.len
+    }
+
+    fn whole(&self) -> bool {
+        self.options & (ZLIB | BCPACK) != 0
+    }
+
+    fn read(&self, at: usize, out: &mut [u8]) -> bool {
+        if !self.whole() {
+            return self.read_file(at, out);
+        }
+        let mut source = vec![0; self.source_size];
+        if !self.read_file(0, &mut source) {
+            return false;
+        }
+        let decoded = |into: &mut [u8]| match decode(self.options, self.intermediate, &source, into) {
+            Ok(_) => true,
+            Err((hr, why)) => {
+                tracing::warn!(hr = format_args!("{:#010x}", hr as u32), "dstorage: a load read again does not decode: {why}");
+                false
+            }
+        };
+        if at == 0 && out.len() == self.len {
+            return decoded(out);
+        }
+        let mut whole = vec![0; self.len];
+        if !decoded(&mut whole) {
+            return false;
+        }
+        out.copy_from_slice(&whole[at..at + out.len()]);
+        true
+    }
+}
+
+/// The first loads that could leave pages without bytes but left none:
+/// what memory they went to (`kind`), where, how long, and for page
+/// destinations how many of their pages are shown at an address.
+fn refused(kind: &str, at: usize, len: usize, shown: usize) {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+        tracing::info!(kind, at = format_args!("{at:#x}"), len, shown, "dstorage: a load wrote every page");
+    }
+}
+
+/// Leaves whole 64 KiB pages of a file request's destination without bytes
+/// (`docs/memory-design.md`, "Assets come from disk"): the GPU side takes
+/// them from the file when something reads them (`victory_gpu::lazy`). The
+/// rest of the destination is written now. `None` if no page could be left
+/// so (the caller writes the destination as before), or the request is not
+/// one to leave (memory sources, which the title may change).
+fn lazily(request: &Request, len: usize) -> Option<Result<(), HRESULT>> {
+    use victory_gpu::ledger::{Owner, add};
+    if request.options & MEMORY_SOURCE != 0 {
+        add(Owner::LoadsFromMemory, len as i64);
+    } else if len < PAGE {
+        add(Owner::LoadsSmall, len as i64);
+    }
+    if !victory_gpu::lazy::wanted() || request.options & MEMORY_SOURCE != 0 || len < PAGE {
+        return None;
+    }
+    // SAFETY: a file object we created; the title keeps it open.
+    let file = unsafe { &*request.source.cast::<Instance<File>>() }.state.file.clone();
+    let load = victory_gpu::lazy::Load::new(Box::new(Disk {
+        file,
+        offset: request.offset,
+        source_size: request.source_size as usize,
+        len,
+        options: request.options,
+        intermediate: request.intermediate_size as usize,
+    }));
+    // Destination byte ranges written now, in order.
+    let mut now: Vec<(usize, usize)> = Vec::new();
+    let mut left = false;
+    let mut written_to = 0;
+    let mut leave = |start: usize, now: &mut Vec<(usize, usize)>| {
+        if written_to < start {
+            now.push((written_to, start));
+        }
+        written_to = start + PAGE;
+    };
+    if request.options & PAGE_DESTINATION == 0 {
+        let d = request.destination as usize;
+        let mut p = d.next_multiple_of(PAGE);
+        while p + PAGE <= d + len {
+            // An address showing physical pages shown elsewhere too is
+            // written: the other addresses would not be left so.
+            let mut aliases = Vec::new();
+            super::xmem::aliases(p, PAGE, &mut aliases);
+            if aliases.is_empty() && victory_gpu::title_memory_lazy(&load, p, p - d) {
+                leave(p - d, &mut now);
+                left = true;
+            }
+            p += PAGE;
+        }
+        if !left {
+            refused(victory_gpu::memory_kind(d), d, len, 0);
+            return None;
+        }
+        if written_to < len {
+            now.push((written_to, len));
+        }
+        for (a, b) in now {
+            victory_gpu::ledger::add(victory_gpu::ledger::Owner::LoadsWritten, (b - a) as i64);
+            let _writing = victory_gpu::kernel_will_write(d + a, b - a);
+            // SAFETY: the title's destination holds `len` bytes, and nothing
+            // else writes it until completion.
+            let out = unsafe { std::slice::from_raw_parts_mut((d + a) as *mut u8, b - a) };
+            if !load.bytes(a, out) {
+                return Some(Err(INVALID_DATA));
+            }
+        }
+        return Some(Ok(()));
+    }
+    let offset = (request.page_offset & 0xffff) as usize;
+    // SAFETY: the title passes a page number per 64 KiB of destination.
+    let pages = unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), (offset + len).div_ceil(PAGE)) };
+    // A list not filled yet: the old path waits for it.
+    if pages.contains(&0) {
+        return None;
+    }
+    let shown = super::xmem::shown_each(pages);
+    for (k, addresses) in shown.iter().enumerate() {
+        let Some(start) = (k * PAGE).checked_sub(offset) else {
+            continue;
+        };
+        if start + PAGE > len {
+            break;
+        }
+        // Left so where every address showing it is; a page shown nowhere
+        // is written (nothing would fill it).
+        if !addresses.is_empty() && addresses.iter().all(|&at| victory_gpu::title_memory_lazy(&load, at, start)) {
+            leave(start, &mut now);
+            left = true;
+        }
+    }
+    if !left {
+        refused("pages", pages.first().copied().unwrap_or(0), len, shown.iter().filter(|s| !s.is_empty()).count());
+        return None;
+    }
+    if written_to < len {
+        now.push((written_to, len));
+    }
+    for (a, b) in now {
+        victory_gpu::ledger::add(victory_gpu::ledger::Owner::LoadsWritten, (b - a) as i64);
+        let mut data = vec![0; b - a];
+        if !load.bytes(a, &mut data) {
+            return Some(Err(INVALID_DATA));
+        }
+        if !super::xmem::write_physical(&pages[(offset + a) / PAGE..], (offset + a) % PAGE, &data) {
+            return Some(Err(E_INVALIDARG));
+        }
+    }
+    Some(Ok(()))
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
@@ -955,6 +1160,23 @@ fn into_destination(
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    victory_gpu::ledger::add(victory_gpu::ledger::Owner::LoadsWritten, len as i64);
+    // The probe of loads (H0.4): what was read (source, offset, options) and
+    // where to. A page destination is named by its first page number.
+    #[cfg(feature = "diagnostics")]
+    let fill = |out: &mut [u8]| {
+        let got = fill(out);
+        let (name, at) = if request.options & PAGE_DESTINATION == 0 {
+            ("DirectStorage to an address", request.destination as usize)
+        } else {
+            // SAFETY: the title passes at least one page number.
+            let first = unsafe { *request.destination.cast::<usize>() };
+            ("DirectStorage to pages", first << 12 | (request.page_offset & 0xffff) as usize)
+        };
+        let data = (request.source as u64).rotate_left(32) ^ request.offset ^ request.options.rotate_left(48);
+        victory_gpu::memclass::loaded(name, at, len, *got.as_ref().unwrap_or(&0), Some(data));
+        got
+    };
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
@@ -1214,6 +1436,44 @@ mod tests {
         assert_eq!(raw, plain[5000..6000]);
         assert_eq!(inflated, plain);
         void(queue, 0x40);
+    }
+
+    /// A file load into physical pages leaves the whole pages without bytes
+    /// at every address showing them, writes the partial ones, and an
+    /// access reads what the file holds.
+    #[test]
+    fn loads_leave_whole_pages_without_bytes() {
+        use super::super::xmem::{XMemAllocatePhysicalPages, XMemMapPhysicalPages, XMemVirtualAlloc};
+        let skip = 0x100;
+        let len = 3 * PAGE - skip;
+        let plain = pattern(len);
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let (_dir, file) = file_with(&packed);
+        let (mut pages, mut given) = (vec![0usize; 3], 3);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()), 1);
+        // MEM_RESERVE and 64 KiB pages, as titles reserve for mappings.
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, 0x2000 | 0x2000_0000 | 0x40_0000, 0, 4);
+        let (a, b) = (reserve() as usize, reserve() as usize);
+        assert_eq!(XMemMapPhysicalPages(a as *mut _, 3, pages.as_ptr()) as usize, a);
+        assert_eq!(XMemMapPhysicalPages((b + PAGE) as *mut _, 1, pages[2..].as_ptr()) as usize, b + PAGE);
+        let mut r = request(ZLIB, pages.as_mut_ptr().cast(), len, file, 0, packed.len());
+        r.options |= PAGE_DESTINATION;
+        r.page_offset = skip as u64;
+        let before = victory_gpu::ledger::bytes(victory_gpu::ledger::Owner::LazyPages);
+        assert_eq!(execute(&r), Ok(()));
+        let left = victory_gpu::ledger::bytes(victory_gpu::ledger::Owner::LazyPages) - before;
+        // Pages 1 and 2 at `a`, page 2 at `b` too.
+        assert_eq!(left, 3 * PAGE as i64, "whole pages left at every address");
+        // SAFETY: mapped pages: the partial one written, the others filled
+        // by the handler on access.
+        let read = |at: usize, n: usize| unsafe { std::slice::from_raw_parts(at as *const u8, n).to_vec() };
+        assert_eq!(read(a + skip, PAGE - skip), plain[..PAGE - skip]);
+        assert_eq!(read(a + PAGE, PAGE), plain[PAGE - skip..2 * PAGE - skip]);
+        assert_eq!(read(b + PAGE, PAGE), plain[2 * PAGE - skip..]);
+        assert_eq!(read(a + 2 * PAGE, PAGE), plain[2 * PAGE - skip..]);
+        for at in [a, b + PAGE] {
+            XMemMapPhysicalPages(at as *mut _, if at == a { 3 } else { 1 }, std::ptr::null());
+        }
     }
 
     #[test]

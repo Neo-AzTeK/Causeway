@@ -174,6 +174,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         mesh_stride: 0,
         min_lod_clamp: false,
         view_marks: false,
+        view_reads: false,
     })
     };
     let mut lowered = lower_as(&st)?;

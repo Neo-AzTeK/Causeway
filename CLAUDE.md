@@ -22,6 +22,7 @@ and ask the owner for the title's folder if none is set.
 | debug variables, smoke runs | `docs/debugging.md` |
 | frame record and replay (plan) | `docs/frame-replay.md` |
 | todo and problem list (update after each task); separate problem sessions (optional) | `docs/problems.md`; `docs/problem-sessions.md`, skill `problem-session` |
+| where frame time goes, implementation vs missing functionality; the memory design it leads to | `docs/frame-cost.md`, `docs/memory-design.md` |
 | capabilities, planners, fakes | `docs/hardware-range.md`, `docs/gpu-review-checklist.md` |
 | adapters verified / not verified | `docs/adapters.md` |
 | asset policy | `docs/asset-policy.md` |
@@ -36,12 +37,12 @@ and ask the owner for the title's folder if none is set.
   in `docs/problem-sessions.md`; offline `translate`/`census` scans do not
   count): it spoils that run's timings, and several crates' tests use the GPU.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
-- One main session does the work, debugging included, toward one goal at a
-  time. Now: one correct frame; fix the earliest missing or wrong step first,
-  then speed. Test a change on a frame replay (`docs/frame-replay.md`)
-  rather than reasoning from logs. Add a session or agent only for a
-  separate task with a clear test, or when the owner asks. No agents by
-  default.
+- One main session does the work, debugging included; it may work on several
+  problems at once (no locks). Now: one correct frame; fix the earliest
+  missing or wrong step first, then speed. Test a change on a frame replay
+  (`docs/frame-replay.md`) rather than reasoning from logs. Add a session or
+  agent only for a separate task with a clear test, or when the owner asks.
+  No agents by default.
 - Before working on a listed problem that has notes, also after compaction or
   a pause: `cargo xtask problem resume <id>` and read them.
 - One place per kind of note, so old notes cannot contradict new ones: live

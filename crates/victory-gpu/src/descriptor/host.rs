@@ -127,7 +127,20 @@ struct Made {
     writes: u64,
     /// The last frame the queue was served in (plus one; 0: never).
     served: u64,
+    /// Per title slot, the frame (plus one; 0: never) shaders last read it
+    /// by index (read marks), wrapping.
+    read_at: Vec<u32>,
+    /// Slots the queue made, by title slot, with their records: given back (null, waiting
+    /// again) once shaders stop reading them and memory is short
+    /// ([`HostHeap::give_back_unread`]).
+    from_queue: std::collections::BTreeMap<u32, u64>,
 }
+
+/// Frames without a read (read marks) after which a slot the queue made may
+/// be given back when video memory is short.
+const UNREAD_FRAMES: u32 = 120;
+/// Slots given back in one frame at most.
+const GIVEN_BACK_PER_FRAME: usize = 1024;
 
 /// A postponed slot in [`Made::queue`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +151,8 @@ struct Waiting {
     write: u64,
     /// Its record in title memory.
     handle: u64,
+    /// Shaders read its slot (read marks): made before the others.
+    read: bool,
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's:
@@ -161,6 +176,32 @@ const SERVED_PER_FRAME: usize = 256;
 /// long enough that a texture the host has no memory for does not take the
 /// frame's share every frame.
 const RETRY_FRAMES: u64 = 30;
+
+/// Host view heap slots shaders read since the last served frame (read
+/// marks, [`note_reads`]), sorted.
+static READ: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// After a submission: the host view heap slots its shaders read (read
+/// marks, `crate::shadow::take_reads`), for the next heap that serves its
+/// texture queue ([`HostHeap::serve_textures`]).
+pub(crate) fn note_reads(slots: Vec<u32>) {
+    if slots.is_empty() {
+        return;
+    }
+    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    read.extend(slots);
+    read.sort_unstable();
+    read.dedup();
+}
+
+/// Read marks since the last queue line: slots read, of them waiting in
+/// the queue (null when read), not traced to a title slot, and made for
+/// being read.
+#[cfg(feature = "diagnostics")]
+static READS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Slots given back since the last queue line ([`HostHeap::give_back_unread`]).
+#[cfg(feature = "diagnostics")]
+static GIVEN_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -331,6 +372,8 @@ impl HostHeap {
                 queue: std::collections::BTreeMap::new(),
                 writes: 0,
                 served: 0,
+                read_at: vec![0; title_count as usize],
+                from_queue: Default::default(),
             }),
             kept: Mutex::new(vec![None; total as usize]),
             next: Mutex::new((0, vec![false; extra as usize], extra.saturating_sub(1))),
@@ -934,6 +977,8 @@ impl HostHeap {
                     due: if lately { frame + TABLED_GRACE } else { frame },
                     write: made.writes,
                     handle,
+                    // A slot shaders read keeps that standing when rewritten.
+                    read: made.queue.get(&index).is_some_and(|w| w.read),
                 };
                 made.queue.insert(index, waiting);
             }
@@ -1047,42 +1092,188 @@ impl HostHeap {
     /// then uploaded with the others its heap views (`crate::bindless`).
     /// Returns how many were made.
     pub(crate) fn serve_textures(&self, frame: u64) -> usize {
-        let picked: Vec<(u32, u64)> = {
+        let picked: Vec<(u32, u64, bool)> = {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if made.served == frame + 1 || made.queue.is_empty() {
+            if made.served == frame + 1 {
+                return 0;
+            }
+            self.take_reads(&mut made, frame);
+            if made.queue.is_empty() {
+                made.served = frame + 1;
                 return 0;
             }
             made.served = frame + 1;
-            let mut due: Vec<(u64, u32, u64)> = made
+            // Slots shaders were seen reading first (read marks), then the
+            // newest write. With read marks, only slots shaders read: what
+            // no shader picked is not made ahead (it is, one frame after a
+            // shader first reads it).
+            let marks = crate::shader_cache::read_marks();
+            let mut due: Vec<((bool, u64), u32, u64)> = made
                 .queue
                 .iter()
-                .filter(|(_, w)| w.due <= frame)
-                .map(|(&index, w)| (w.write, index, w.handle))
+                .filter(|(_, w)| w.due <= frame && (w.read || !marks))
+                .map(|(&index, w)| ((w.read, w.write), index, w.handle))
                 .collect();
             if due.len() > SERVED_PER_FRAME {
                 due.select_nth_unstable_by(SERVED_PER_FRAME - 1, |a, b| b.0.cmp(&a.0));
                 due.truncate(SERVED_PER_FRAME);
             }
             due.sort_unstable_by_key(|d| std::cmp::Reverse(d.0));
-            due.into_iter().map(|(_, index, handle)| (index, handle)).collect()
+            due.into_iter().map(|((read, _), index, handle)| (index, handle, read)).collect()
         };
+        if crate::shader_cache::read_marks() && !picked.is_empty() && !crate::vram::room() {
+            self.give_back_unread(frame);
+        }
         let mut served = 0;
-        for (index, handle) in picked {
+        for (index, handle, read) in picked {
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = read;
+            // Read slots come first but share the line of the rest: past it,
+            // eviction runs against textures kept resident by the heap, and
+            // memory thrashes (one world run then timed out on the GPU).
             if !crate::vram::room() {
                 break;
             }
+            #[cfg(feature = "diagnostics")]
+            if read {
+                READS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // Made as for a draw: the slot leaves the queue there.
             self.make_slot(index, handle, true, false);
+            self.made.lock().unwrap_or_else(|e| e.into_inner()).from_queue.insert(index, handle);
             served += 1;
         }
         // For the measurement of this queue (how many wait, how many a
         // frame makes, whether memory stops it): every 64th frame.
         #[cfg(feature = "diagnostics")]
         if frame.is_multiple_of(64) {
-            let waiting = self.made.lock().unwrap_or_else(|e| e.into_inner()).queue.len();
-            tracing::info!(frame, waiting, served, room = crate::vram::room(), "texture queue");
+            let handles: Vec<u64> =
+                self.made.lock().unwrap_or_else(|e| e.into_inner()).queue.values().map(|w| w.handle).collect();
+            let waiting = handles.len();
+            let given_back = GIVEN_BACK.swap(0, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(frame, waiting, served, given_back, room = crate::vram::room(), "texture queue");
+            let r: Vec<u64> = READS.iter().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed)).collect();
+            tracing::info!(
+                "read marks since the last queue line: {} slots read, {} of them waiting (null), {} not traced, {} made for being read",
+                r[0], r[1], r[2], r[3]
+            );
+            if crate::levels::sampled() {
+                // What making every waiting slot would add: distinct title
+                // textures without a host texture, and their host bytes.
+                let mut seen = std::collections::BTreeSet::new();
+                let (mut new, mut bytes, mut unknown) = (0u64, 0u64, 0u64);
+                for h in handles {
+                    let Some(View::Placed(false, resource, desc)) = super::view(h) else { continue };
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    if !seen.insert((address, resource)) {
+                        continue;
+                    }
+                    match crate::resource::placed_cost(address, &resource) {
+                        Some(0) => {}
+                        Some(n) => (new, bytes) = (new + 1, bytes + n),
+                        None => unknown += 1,
+                    }
+                }
+                tracing::info!(
+                    "texture queue (probe): {} distinct textures waiting, {new} without a host texture needing {} MB, {unknown} not sized",
+                    seen.len(),
+                    bytes >> 20,
+                );
+            }
         }
         served
+    }
+
+    /// With read marks, while video memory is short: slots the queue made
+    /// that neither shaders (by index) nor tables read for [`UNREAD_FRAMES`]
+    /// are given back, up to [`GIVEN_BACK_PER_FRAME`]: they read null and
+    /// wait again, made again one frame after a shader reads them or when a
+    /// draw's table does. Their textures, which the heap then no longer
+    /// views, are no longer kept resident for it (`crate::bindless`) and go
+    /// the way of any texture no list uses (`crate::resource`).
+    fn give_back_unread(&self, frame: u64) {
+        let now = (frame as u32).wrapping_add(1);
+        let old = |stamp: u32| stamp == 0 || now.wrapping_sub(stamp) > UNREAD_FRAMES;
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let picked: Vec<(u32, u64)> = made
+            .from_queue
+            .iter()
+            .filter(|&(&i, _)| {
+                !made.postponed[i as usize] && old(made.read_at[i as usize]) && old(made.tabled[i as usize])
+            })
+            .take(GIVEN_BACK_PER_FRAME)
+            .map(|(&i, &h)| (i, h))
+            .collect();
+        for (index, handle) in picked {
+            made.from_queue.remove(&index);
+            // Made from this record still (a rewrite makes it anew).
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag != VIEW_TAG || made.keys[index as usize] != key {
+                continue;
+            }
+            let (Some(view), Some(slot)) = (view_at(i, generation), self.slot_of(index, false)) else {
+                continue;
+            };
+            made.postponed[index as usize] = true;
+            made.writes += 1;
+            let write = made.writes;
+            made.queue.insert(index, Waiting { due: u64::MAX, write, handle, read: false });
+            self.set_mark(slot, None);
+            null_for(&view, self.cpu(slot));
+            self.viewed.set(index, Some(&view), false);
+            self.keep(slot, None);
+            #[cfg(feature = "diagnostics")]
+            GIVEN_BACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Applies the read marks taken since the last call ([`note_reads`]):
+    /// a postponed slot shaders read waits no longer and goes first.
+    // shortcut: marks do not name their heap; the first heap served after
+    // a submission takes them all (the title binds one view heap for its
+    // heap-indexing shaders, as far as seen).
+    fn take_reads(&self, made: &mut Made, frame: u64) {
+        let slots = std::mem::take(&mut *READ.lock().unwrap_or_else(|e| e.into_inner()));
+        if slots.is_empty() {
+            return;
+        }
+        // Host slots past the title's own are pool slots: their title slot.
+        let pooled: std::collections::HashMap<u32, u32> = if slots.last().is_some_and(|&s| s >= self.count) {
+            let remapped = self.remapped.lock().unwrap_or_else(|e| e.into_inner());
+            remapped.0.iter().enumerate().filter(|&(_, &s)| s != 0).map(|(past, &s)| (s, self.count + past as u32)).collect()
+        } else {
+            Default::default()
+        };
+        #[cfg(feature = "diagnostics")]
+        let (mut null, mut unknown) = (0u64, 0u64);
+        for &slot in &slots {
+            let index = if slot < self.count { Some(slot) } else { pooled.get(&slot).copied() };
+            let Some(index) = index.filter(|&i| i < self.title_count) else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    unknown += 1;
+                }
+                continue;
+            };
+            made.read_at[index as usize] = (frame as u32).wrapping_add(1).max(1);
+            if let Some(w) = made.queue.get_mut(&index) {
+                w.read = true;
+                w.due = w.due.min(frame);
+                #[cfg(feature = "diagnostics")]
+                {
+                    null += 1;
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            READS[0].fetch_add(slots.len() as u64, Relaxed);
+            READS[1].fetch_add(null, Relaxed);
+            READS[2].fetch_add(unknown, Relaxed);
+        }
     }
 
     /// The postponed slots waiting in the queue ([`HostHeap::serve_textures`]).

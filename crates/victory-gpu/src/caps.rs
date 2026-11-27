@@ -71,6 +71,20 @@ pub struct MemoryCaps {
     pub shared: u64,
 }
 
+/// How the device opens memory it did not allocate as a heap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExistingHeaps {
+    /// It does not (no `ID3D12Device3`).
+    #[default]
+    None,
+    /// Whole allocations only: an address that starts one
+    /// (`ID3D12Device3::OpenExistingHeapFromAddress`).
+    Whole,
+    /// Any page-aligned part of an allocation
+    /// (`ID3D12Device13::OpenExistingHeapFromAddress1`).
+    Part,
+}
+
 /// Who the adapter is. For logs and [`WORKAROUNDS`] only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdapterInfo {
@@ -115,6 +129,10 @@ pub struct Caps {
     /// required).
     pub uma: Option<bool>,
     pub memory: MemoryCaps,
+    /// Which form of opening existing memory as a heap the device has
+    /// (`OpenExistingHeapFromAddress`): the GPU then uses title memory in
+    /// place, without a host copy (`crate::shadow`).
+    pub existing_heaps: ExistingHeaps,
     /// `D3D12_FORMAT_SUPPORT1` bits of each format the probe was asked for,
     /// by `DXGI_FORMAT` value. A format that was not asked for is absent,
     /// and absent means unsupported.
@@ -178,7 +196,7 @@ impl Caps {
         }
         format!(
             "{} (vendor {:#06x}, device {:#06x}{}): waves {}, SM {}, binding tier {}, \
-             tiled tier {}, mesh tier {}, UMA {}, budget {}, workarounds {:?}",
+             tiled tier {}, mesh tier {}, UMA {}, budget {}, existing heaps {:?}, workarounds {:?}",
             self.adapter.name,
             self.adapter.vendor_id,
             self.adapter.device_id,
@@ -190,6 +208,7 @@ impl Caps {
             o(self.mesh_tier),
             o(self.uma),
             o(self.memory.budget),
+            self.existing_heaps,
             self.workarounds,
         )
     }

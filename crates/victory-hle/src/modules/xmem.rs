@@ -100,6 +100,9 @@ pub extern "system" fn XMemVirtualAlloc(
             0
         },
     };
+    // The console bits dropped below (GPU access, caching), for the probe.
+    #[cfg(feature = "diagnostics")]
+    let console_protect = protect & !0xff;
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -152,6 +155,9 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleVirtual, size as i64);
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -174,6 +180,10 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    #[cfg(feature = "diagnostics")]
+    if !at.is_null() {
+        victory_gpu::memclass::note(at as usize, size, victory_gpu::memclass::Class::Virtual(console_protect));
     }
     at
 }
@@ -266,14 +276,21 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    match hooks()[0] {
+    let at = match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
             // SAFETY: the title's own routine of this type.
             let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
             alloc(size, attributes)
         }
+    };
+    // The attributes without the alignment, for the probe.
+    #[cfg(feature = "diagnostics")]
+    if !at.is_null() {
+        let class = victory_gpu::memclass::Class::Alloc(attributes & !(0x1f << ALIGNMENT_SHIFT));
+        victory_gpu::memclass::note(at as usize, size, class);
     }
+    at
 }
 
 /// See [`XMemAlloc`].
@@ -308,6 +325,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // reservation below 2^40 if one does.
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
+    if !block.is_null() {
+        victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleHeap, layout.size() as i64);
+    }
     if block.is_null() {
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
@@ -332,11 +352,13 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::title_memory_freed(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleHeap, -(size as i64));
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -356,7 +378,19 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section, the flags the title allocated its pages with, its size, and
+/// a number naming it for the process's life (the GPU side opens it whole,
+/// `victory_gpu::title_memory_section`), and whether it is committed.
+struct Section(
+    HANDLE,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] u64,
+    usize,
+    usize,
+    bool,
+);
+
+/// The next [`Section`] number.
+static SECTIONS: AtomicUsize = AtomicUsize::new(1);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -365,6 +399,9 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        if self.4 {
+            victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleSections, -(self.2 as i64));
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -436,12 +473,29 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Reports writes into physical pages through our own views at every title
-/// view showing them (DirectStorage's page destinations).
-fn report_written(shown: &[usize]) {
-    for &page in shown {
-        drop(victory_gpu::kernel_will_write(page, PAGE));
-    }
+/// The addresses of title views showing each of `pages`: none for a page
+/// unknown or not mapped.
+pub(crate) fn shown_each(pages: &[usize]) -> Vec<Vec<usize>> {
+    let physical = physical();
+    pages
+        .iter()
+        .map(|p| {
+            physical
+                .pages
+                .get(p)
+                .and_then(|slice| physical.shown.get(&slice.key(0)))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Before writes into physical pages through our own views: tells every
+/// title view showing them (DirectStorage's page destinations), which
+/// also fills pages a disk load left without bytes there, so the write
+/// lands on them. Done when dropped.
+fn will_write(shown: &[usize]) -> Vec<victory_gpu::KernelWrite> {
+    shown.iter().map(|&page| victory_gpu::kernel_will_write(page, PAGE)).collect()
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -470,44 +524,34 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    // Pagefile-backed sections of at most `SECTION_LIMIT` bytes each. The
+    // GPU side opens a section whole to use its memory in place
+    // (`victory_gpu::title_memory_section`), which devices refuse for
+    // reserved sections and for sections of 4 GiB or more: so committed
+    // ones, where the host can commit them, else reserved ones whose pages
+    // are committed when first mapped (`commit`; the GPU then copies them).
+    let mut sections = Vec::new();
+    for at in (0..size).step_by(SECTION_LIMIT) {
+        let Some(section) = section((size - at).min(SECTION_LIMIT), flags) else {
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        };
+        sections.push(section);
     }
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
+        sections = sections.len(),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
-            section: section.clone(),
-            index,
+            section: sections[index * PAGE / SECTION_LIMIT].clone(),
+            index: index % (SECTION_LIMIT / PAGE),
         };
         let number = first + index * FRAMES;
         physical.pages.insert(number, slice);
@@ -515,6 +559,50 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { pages.add(index).write(number) };
     }
     1
+}
+
+/// Largest section behind physical pages: under the 4 GiB devices open
+/// whole, and small enough that committing one rarely meets the limit.
+const SECTION_LIMIT: usize = 1 << 30;
+
+/// One section of `size` bytes for physical pages: committed unless the
+/// GPU side does not use sections in place (`VICTORY_IN_PLACE=0`) or the
+/// host cannot commit it now (error 1450 on a busy host), then reserved.
+/// Under Wine a committed section is a sparse file, free until touched, and
+/// committing a reserved one page by page costs a wineserver request each
+/// that scans every range committed so far: committed there always.
+fn section(size: usize, flags: u64) -> Option<Arc<Section>> {
+    let in_place = std::env::var("VICTORY_IN_PLACE").map_or(true, |v| v != "0");
+    let kinds: &[u32] = if on_wine() {
+        &[SEC_COMMIT]
+    } else if in_place {
+        &[SEC_COMMIT, SEC_RESERVE]
+    } else {
+        &[SEC_RESERVE]
+    };
+    let mut error = None;
+    for &kind in kinds {
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | kind,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if !handle.is_null() {
+            if kind == SEC_COMMIT {
+                victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleSections, size as i64);
+            }
+            return Some(Arc::new(Section(handle, flags, size, SECTIONS.fetch_add(1, Ordering::Relaxed), kind == SEC_COMMIT)));
+        }
+        error = Some(std::io::Error::last_os_error());
+    }
+    tracing::warn!(size, error = ?error, "XMemAllocatePhysicalPages failed");
+    None
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -615,6 +703,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         return false;
     };
     let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
+    let _writing = will_write(&shown);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -624,7 +713,6 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    report_written(&shown);
     true
 }
 
@@ -635,14 +723,9 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
-    /// Title views showing the pages, told when the window is done.
-    shown: Vec<usize>,
-}
-
-impl Drop for PageWindow {
-    fn drop(&mut self) {
-        report_written(&self.shown);
-    }
+    /// The title views showing the pages, told before the window is
+    /// written and done with it when it goes.
+    _writing: Vec<victory_gpu::KernelWrite>,
 }
 
 impl PageWindow {
@@ -666,7 +749,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
+        _writing: will_write(&shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]))),
     })
 }
 
@@ -808,6 +891,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::memclass::note(base, len, victory_gpu::memclass::Class::Physical(slice.section.1));
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     for k in 0..len / PAGE {
@@ -816,6 +901,15 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         victory_gpu::title_memory_aliased(base + k * PAGE, shown);
         shown.push(base + k * PAGE);
     }
+    // The GPU side uses the section in place where it can open it whole.
+    victory_gpu::title_memory_section(
+        base,
+        len,
+        slice.section.3,
+        slice.section.0 as isize,
+        slice.section.2 as u64,
+        (slice.index * PAGE) as u64,
+    );
     physical.views.insert(base, (len, slice));
     true
 }
@@ -977,9 +1071,37 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
+    #[cfg(feature = "diagnostics")]
+    answered(_which, &stats);
     // SAFETY: checked non-null; the title passes room for the structure.
     unsafe { out.write(stats) };
     1
+}
+
+/// With `VICTORY_PROBE_CLASSES=1`: the title's memory questions and our
+/// answers, at most one line per 10 s with the calls since (H0.5 in
+/// `docs/frame-cost.md`: whether our answers make it evict and reload).
+#[cfg(feature = "diagnostics")]
+fn answered(which: u32, stats: &WorkingSet) {
+    static LAST: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    if !victory_gpu::memclass::wanted() {
+        return;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (at, calls) = last.get_or_insert((std::time::Instant::now() - std::time::Duration::from_secs(10), 0));
+    *calls += 1;
+    if at.elapsed() >= std::time::Duration::from_secs(10) {
+        tracing::info!(
+            target: "victory_gpu::trace",
+            which,
+            calls = *calls,
+            used_mb = stats.title_used >> 20,
+            limit_mb = stats.title_limit >> 20,
+            gpu_optimal_limit_mb = stats.gpu_optimal_limit >> 20,
+            "memory asked"
+        );
+        *last = Some((std::time::Instant::now(), 0));
+    }
 }
 
 /// Hands title memory (standard, in 2 MiB pages) to the system. The other

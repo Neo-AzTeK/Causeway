@@ -9,26 +9,33 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | Variable | Effect |
 | --- | --- |
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | stack dump per thread at listed seconds |
-| `VICTORY_WATCH=<rva>,...` | logs title `u32` changes at RVAs |
-| `VICTORY_DRAW_BUDGET_MS=33` | test mode: skips draws past that many ms (small draws, compute and copies still run); H in the game window draws one whole frame and holds the game there until H again |
-| `VICTORY_PROFILE=<file>` | CSV line of times and draw counts per presented frame (keep outside repo) |
-| `VICTORY_KEYS=30:Enter,12-280/4:Enter,285-300:W` | presses keys at seconds, intervals, or holds through ranges regardless of focus |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | dumps title memory to cache folder on crash |
+| `VICTORY_STACKS=20,60` | every thread's stack at those seconds, with function names (diagnostics build); `cargo xtask stacks <run>` lists the title's threads in our code and tallies where they ran or waited |
+| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_DRAW_BUDGET_MS=33` | test mode: skips draws past what should fit in that many ms (small draws, compute and copies run); H in the game window draws one whole frame in full (a few more while pipelines are being made) and holds the game at it until H is pressed again |
+| `VICTORY_PROFILE=<file>` | writes a CSV line of times and draw counts for each presented frame (outside the repository) |
+| `VICTORY_KEYS=30:Enter,12-280/4:Enter,285-300:W` | presses keys at those seconds, every 4 s in a range, or holds them through one, focus or not |
+| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with capture flags above, saves all render targets for captured frames; read with `cargo xtask dumps <run> --frame <n>` (list, `--only <part>`), or measure one dump split by another under masks (`--measure <part> --by <part> --mask <part>:<min>`) |
-| `VICTORY_D3D12_DEBUG=1` | enables host D3D12 debug layer |
-| `VICTORY_D3D12_GBV=1` | with debug layer, GPU-based validation (reports bad descriptors without fault; slow) |
-| `VICTORY_D3D12_DRED=1` | on GPU failure, logs hit allocation and in-flight commands |
-| `VICTORY_SURVIVE_REMOVAL=1` | logs post-submission device removal and continues without GPU (no further draws); set by `cargo xtask smoke` |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | skips draws and dispatches (including indirect) using a pipeline with a listed 16-digit shader hash |
-| `VICTORY_DUMP_SHADERS=<dir>` | writes translated layout, resources, and decoded instructions to `<dir>\<hash>.txt` (filtered by `VICTORY_DUMP_HASHES=<h>,...` if set); keep `<dir>` outside repo |
-| `VICTORY_PROBE_WINDOW=<hash>:<user data index>[:big]` | in listed frames (or all frames with `:big`), logs words of table buffers >64 B (title and host copy) at user-data byte offset; with `:big`, only when loop counts at `+4` / `+0x374` exceed 4096 or window passes view |
-| `VICTORY_GPU_TIMING=1` | with probe window, runs/times each submission list separately and logs slow lists and commands |
-| `VICTORY_D3D12_WARP=1` | runs host device on WARP software adapter (slow; no driver reset) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | caps translated shader loops at `n` iterations/lane instead of the stage limits (pixel 128, vertex and mesh 256, compute 4,096, lower when deeply nested; 2^20 means the stage limits; separate cache entries); faster world frames at lower `n` indicate loop-bound slowness |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records process audio output to WAV |
-| `VICTORY_XMA_DUMP=<dir>` | dumps context and input for first 32 XMA voices |
+| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames; read them with `cargo xtask dumps <run> --frame <n>` (list, `--only <part of a name>`), or measure one dump split by another under masks (`--measure <part> --by <part> --mask <part>:<min>`) |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer |
+| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
+| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight; on by default in smoke runs, it formats a note per draw (about 1.5x the draw cost): `--env VICTORY_D3D12_DRED=0` for timing runs |
+| `VICTORY_IN_PLACE=0` or `=1` | by default the GPU uses title memory mapped from physical-page sections in place: each section is opened whole (`OpenExistingHeapFromFileMapping`) and a buffer is placed over each run of consecutive pages, without host copies, refreshes, snapshots or copy-backs (log "section opened for the GPU in place"). `=0` copies all of it as before. `=1` also opens other section views by address (`OpenExistingHeapFromAddress`): in a world run the title then unmapped views its copies still held, Windows refused, and the title crashed (warning "refuses the unmap") |
+| `VICTORY_LAZY_LOADS=0` | by default DirectStorage file loads leave whole 64 KiB pages of their destination without bytes and without access; our reads of title memory take those bytes from the file (compressed loads decoded once, 96 MiB cache), and a title access or any write fills the page first (`crate::lazy`, `watch`). `=0` writes every load as before. The line "memory: private ..." every 5 s shows bytes left so, filled, and read from files |
+| `VICTORY_SURVIVE_REMOVAL=1` | a device removal after a submission is logged and the run goes on without the GPU (nothing draws after it); `cargo xtask smoke` sets it |
+| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_DUMP_SHADERS=<dir>` | writes each translated program's layout, resources and decoded instructions to `<dir>\<hash>.txt` (only the hashes in `VICTORY_DUMP_HASHES=<h>,...` when set); derived from the title: keep `<dir>` outside the repository |
+| `VICTORY_PROBE_WINDOW=<hash>:<user data index>[:big]` | in listed frames, for dispatches of that program, logs the words of each table buffer over 64 bytes (title memory and host copy) at the byte offset that user data holds; with `:big` in every frame, only where the loop counts at +4 / +0x374 exceed 4096 or the window lies past the view |
+| `VICTORY_PROBE_COUNT=<hash>[,<hash>…]` | for every dispatch of those programs, logs (`count …`) the group count, root constants and the first 16 bytes of each root view: title memory when recorded, title memory and host copy after the list ran. For programs that loop over a count read from memory (`docs/frame-cost.md` H6.2) |
+| `VICTORY_PROBE_CLASSES=1` | keeps the console bits the title allocated each range with (virtual protection above the host's, physical-page flags, `XMemAlloc` attributes) and every 60 frames logs (`classes, …`) tracked and CPU-written 64 KiB pages per frame by them (`docs/frame-cost.md` H0.2); every 100 frames also `writers …`: MB of title memory tracked or written in the window, by class and by who wrote it (w1 the title's code, w2 the kernel, w4 GPU work, w0 nobody; H0.1), and `loads …`: per load path (DirectStorage, `ReadFile`, `fread`) calls, bytes asked and got, pages, loads repeated to the same destination or of the same data (H0.4); and `memory asked`: the title's `XMemGetWorkingSetStatistics` calls and our answers, one line per 10 s (H0.5) |
+| `VICTORY_PROBE_VRAM_COPIES=1` | host copies of title buffers (not of single views) go in video memory while the budget has room; refreshes still write the system copy, and one list per submission copies what they wrote to video memory. GPU writes are not copied back, so the picture may be wrong: it measures GPU time only (`docs/frame-cost.md` H6.1). Logs `video-memory copies (probe): …` (copies made, MB per frame copied) |
+| `VICTORY_PROBE_LEVELS=1` | with each host textures line: of the resident host textures made for title memory, the host bytes in mip levels the title has not mapped now, and how many hold no level (`levels.rs`; problem `placed-texture-slots`). Also, with the texture queue line, the distinct textures its slots wait for and the host bytes making them would add (`texture queue (probe)`). Diagnostics builds always log `levels not mapped (probe), at made / at first upload` |
+| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_READ_MARKS=1` | translated shaders mark the heap slots they read by index (own shader cache entries), and the texture queue makes read slots first; "read marks since the last queue line" counts them. Off by default: they cost GPU work on every heap read |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops of every stage stop after `n` iterations per lane (own shader cache entries) instead of the stage limits: pixel 128, vertex and mesh 256, compute 4,096, lower in deeply nested loops; 2^20 itself means the stage limits; if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
+| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Crashes and host GPU failures append to `crashes.log` in the title's data folder after the title's crash filter returns, followed by latest debug output and report path if saved. An access violation's report names the reservation an uncommitted address lies in and the faulting thread's stack range. On `int3` breakpoints and access violations in diagnostics builds, unhandled reports also log up to eight quadwords at each register target except `rsp` (excluding loaded images; title memory in log/console—do not copy into repo).
 

@@ -148,6 +148,18 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
+/// Recording on the title's threads (`list::with_state`): state calls, then
+/// draws and dispatches; each a count, nanoseconds, and of those the
+/// nanoseconds spent waiting for the list's state.
+static RECORDED: [[AtomicU64; 3]; 2] = [const { [const { AtomicU64::new(0) }; 3] }; 2];
+
+pub(crate) fn recorded(took: std::time::Duration, waiting: std::time::Duration, draw: bool) {
+    let r = &RECORDED[usize::from(draw)];
+    r[0].fetch_add(1, Relaxed);
+    r[1].fetch_add(took.as_nanos() as u64, Relaxed);
+    r[2].fetch_add(waiting.as_nanos() as u64, Relaxed);
+}
+
 /// Heap slots made (again) by view kind (`View::kind`): count, microseconds.
 static MADE: [[AtomicU64; 2]; 8] = [const { [const { AtomicU64::new(0) }; 2] }; 8];
 
@@ -402,6 +414,17 @@ pub(crate) fn log(frames: f64) {
         })
         .collect();
     tracing::info!("  heap slots made per frame by kind: {}", made.join(", "));
+    let [state, draws] = RECORDED.each_ref().map(|r| r.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames));
+    tracing::info!(
+        "  recording per frame on title threads: state calls {:.0} in {:.1} ms ({:.1} ms waiting for a list), \
+         draws and dispatches {:.0} in {:.1} ms ({:.1} ms waiting)",
+        state[0],
+        state[1] / 1e6,
+        state[2] / 1e6,
+        draws[0],
+        draws[1] / 1e6,
+        draws[2] / 1e6
+    );
     let [mk, viewed, keep, for_view, exact_n, exact] = [0, 1, 2, 3, 4, 5].map(|i| PARTS[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
         "  placed buffer parts per frame: make {:.1} ms, bindless {:.1} ms, keep {:.1} ms; for_view (all) {:.1} ms, view copies made {exact_n:.0} in {:.1} ms",

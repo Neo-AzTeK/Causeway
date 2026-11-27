@@ -939,6 +939,9 @@ struct Deferred {
     /// Written-pages bitmaps the list's shaders mark: read back and zeroed
     /// after each submission of the list (`Host::read_marks`).
     marks: Vec<MarkBits>,
+    /// Copies the GPU uses in place that the list reads, by address: held
+    /// until the list is reset, with nothing to refresh.
+    in_place: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
 }
 
 impl Host {
@@ -1127,6 +1130,14 @@ impl Host {
             .zip(firsts.iter().skip(1).chain([&lists.len()]))
             .map(|(&a, &b)| &lists[a..b])
             .collect();
+        // First, with the probe on: what the refreshes wrote, to the copies
+        // in video memory (`crate::vramcopy`).
+        #[cfg(feature = "diagnostics")]
+        let to_video = [crate::vramcopy::list(&self.device)];
+        #[cfg(feature = "diagnostics")]
+        if to_video[0].is_some() {
+            groups.insert(0, &to_video);
+        }
         // Last: the written-pages bitmaps the lists marked, read back.
         #[cfg(feature = "diagnostics")]
         let marking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarksUs);
@@ -1264,6 +1275,7 @@ impl Host {
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
         crate::shadow::copy_back_marks(&withheld);
+        crate::descriptor::host::note_reads(crate::shadow::take_reads());
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1944,6 +1956,11 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
+    /// The list reads a copy the GPU uses in place: held until the reset.
+    pub(crate) fn keep_in_place(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        self.deferred().in_place.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| shadow.clone());
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -2371,7 +2388,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     // The kernel writes the destination: it must not be guarded meanwhile.
-    let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
+    let _writing = title_dst.then(|| crate::watch::gpu_writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
@@ -2414,8 +2431,14 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
 /// page is not readable or a destination page not writable (the bytes
-/// before that page may have been copied).
+/// before that page may have been copied). Pages disk loads left without
+/// bytes are read from their loads (`crate::lazy`).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_kernel(src, dst, len) || crate::watch::read_lazy(src as usize, dst, len)
+}
+
+/// [`read`] of memory alone.
+pub(crate) fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -2786,6 +2809,7 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            tracing::info!("{}", crate::ledger::line());
             let (refused, flat_pipelines, flat_draws) = crate::pipeline::fallback_counts();
             if refused > 0 {
                 tracing::info!(
@@ -2811,7 +2835,9 @@ impl Meter {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
+                crate::levels::sample();
                 crate::shadow::log_views(copy_frames);
+                crate::vramcopy::log(copy_frames);
                 let [refused, compiling, other] =
                     crate::pipeline::drops_by_cause(&drops).map(|n| n as f64 / frames);
                 tracing::info!(

@@ -41,7 +41,15 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
+#[cfg(windows)]
+pub mod lazy;
+#[cfg(windows)]
+pub mod ledger;
 pub mod list;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod memclass;
 #[cfg(windows)]
 mod memory;
 mod mesh;
@@ -63,19 +71,25 @@ pub mod signature;
 mod switch;
 #[cfg(windows)]
 mod tdr;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod levels;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod twin;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod vram;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod vramcopy;
 #[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use inplace::title_memory_section;
+#[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
-    writing as kernel_will_write,
+    Writing as KernelWrite, memory_kind, title_memory_aliased, title_memory_freed, title_memory_lazy, title_memory_remapped,
+    kernel_will_write,
 };

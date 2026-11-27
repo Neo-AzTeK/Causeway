@@ -956,6 +956,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         mesh_compute: false,
         wave64_native: false,
         view_marks: false,
+        view_reads: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

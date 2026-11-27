@@ -2,7 +2,7 @@
 //! failure leaves its field `None` (Microsoft's advice for older runtimes
 //! that do not know a feature structure).
 
-use super::{AdapterInfo, Caps, MemoryCaps, ShaderModel, WORKAROUNDS, WaveLanes};
+use super::{AdapterInfo, Caps, ExistingHeaps, MemoryCaps, ShaderModel, WORKAROUNDS, WaveLanes};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::Win32::Graphics::Dxgi::*;
@@ -71,6 +71,7 @@ impl Caps {
             barycentrics: o3.map(|o| o.BarycentricsSupported.as_bool()),
             uma: arch.map(|a| a.UMA.as_bool()),
             memory,
+            existing_heaps: existing_heaps(device),
             formats: formats
                 .iter()
                 .filter_map(|&f| {
@@ -92,6 +93,18 @@ impl Caps {
         caps.apply_workarounds(WORKAROUNDS);
         tracing::info!("host caps (generation {}): {}", caps.generation, caps.summary());
         caps
+    }
+}
+
+/// The newest interface that opens existing memory as a heap.
+fn existing_heaps(device: &ID3D12Device) -> ExistingHeaps {
+    use windows::core::Interface;
+    if device.cast::<ID3D12Device13>().is_ok() {
+        ExistingHeaps::Part
+    } else if device.cast::<ID3D12Device3>().is_ok() {
+        ExistingHeaps::Whole
+    } else {
+        ExistingHeaps::None
     }
 }
 

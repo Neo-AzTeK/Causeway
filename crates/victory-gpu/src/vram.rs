@@ -130,7 +130,9 @@ mod host {
     use super::*;
     use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
-    use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3};
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3,
+    };
 
     struct Monitor {
         adapter: Option<IDXGIAdapter3>,
@@ -191,14 +193,24 @@ mod host {
         let decision = decide(budget, counted(asked.is_some(), usage, lowest));
         if state.logged.is_none_or(|t| now.duration_since(t).as_millis() >= u128::from(LOG_MS)) {
             state.logged = Some(now);
+            // System memory the driver holds for our GPU objects (upload
+            // heaps, what it moved out of video memory): part of the
+            // process's private memory that no owner of `crate::ledger` names.
+            let system = monitor.adapter.as_ref().map_or(0, |a| {
+                let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                // SAFETY: a live adapter and an out structure.
+                unsafe { a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut info) }
+                    .map_or(0, |()| info.CurrentUsage)
+            });
             tracing::info!(
-                "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB ({:.0} MB at the lowest priority), lowering {:.0} MB",
+                "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB ({:.0} MB at the lowest priority), lowering {:.0} MB; system memory the GPU uses {:.0} MB",
                 usage as f64 / 1e6,
                 budget as f64 / 1e6,
                 if asked.is_some() { "DXGI" } else { "query failed: caps plan" },
                 own as f64 / 1e6,
                 lowest as f64 / 1e6,
                 decision.free as f64 / 1e6,
+                system as f64 / 1e6,
             );
         }
         Some(decision)
