@@ -151,18 +151,22 @@ const SERVED_PER_FRAME: usize = 256;
 /// frame's share every frame.
 const RETRY_FRAMES: u64 = 30;
 
-/// What a fresh table holds (`crate::draw`): the generation of host copies
-/// and textures it was made in, then per entry the record words (tag, view
-/// index, generation) of its title slot. Views made from the same records,
-/// copies and textures are the same.
+/// What a fresh table holds (`crate::draw`): the generation it was made in,
+/// then per entry the record words (tag, view index, generation) of its
+/// title slot. Views made from the same records are the same while the host
+/// copies and textures they view are.
 pub(crate) type TableKey = (u64, Box<[u32]>);
 
-/// The generation fresh tables are made in ([`TableKey`]): it changes when
-/// a host copy is made or a title buffer released (`crate::shadow`), and
-/// when a title texture's memory gets a new host texture (`crate::resource`,
-/// the last count of `texture_counts`), as what a made view shows can then.
+/// The generation fresh tables are made and shared in ([`TableKey`]): it
+/// changes with the frame, and when a title texture's memory gets a new
+/// host texture (`crate::resource`, the last count of `texture_counts`).
+/// A table made from a host copy that another has since replaced views the
+/// old one, as a list's own table did for as long as the list lived; sharing
+/// within a frame keeps that to about a list's life. Host copies change many
+/// times a frame (`crate::shadow::generation`), too often to share across.
+/// Both counts only grow, so their sum changes when either does.
 pub(crate) fn table_generation() -> u64 {
-    crate::shadow::generation() + crate::resource::texture_counts().5
+    crate::frame::current() + crate::resource::texture_counts().5
 }
 
 /// Fresh tables lists share, by what they hold; those no list holds, oldest
