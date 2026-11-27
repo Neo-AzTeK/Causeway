@@ -81,17 +81,17 @@ fn key(translator: &str, encoding: &[u8], limit: u32, reads: bool) -> [u8; 32] {
 }
 
 /// Whether translations mark the heap slots shaders read by index
-/// (`descriptor::host::note_reads`). A diagnostics build turns them off with
-/// `VICTORY_NO_READ_MARKS=1`, to measure what they cost on the GPU.
+/// (`descriptor::host::note_reads`): only with `VICTORY_READ_MARKS=1` in a
+/// diagnostics build. They cost GPU work on every heap read, and the
+/// texture queue cannot make most read slots within the memory budget.
 fn read_marks() -> bool {
     static READS: OnceLock<bool> = OnceLock::new();
     *READS.get_or_init(|| {
-        let off = cfg!(feature = "diagnostics")
-            && std::env::var_os("VICTORY_NO_READ_MARKS").is_some_and(|v| v == "1");
-        if off {
-            tracing::warn!("VICTORY_NO_READ_MARKS: shaders do not mark the heap slots they read");
+        let on = cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_READ_MARKS").is_some_and(|v| v == "1");
+        if on {
+            tracing::warn!("VICTORY_READ_MARKS: shaders mark the heap slots they read");
         }
-        !off
+        on
     })
 }
 
@@ -123,7 +123,7 @@ pub fn host_shader_for(
 ) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`). Heap slots shaders pick by index
-    // are marked read: the texture queue makes those first
+    // are marked read where [`read_marks`] says: the texture queue makes those first
     // (`descriptor::host::note_reads`).
     let options =
         victory_shader::emit::Options { view_marks: true, view_reads: read_marks(), min_lod_clamp, mesh_as_compute, wave64_native };

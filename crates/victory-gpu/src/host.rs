@@ -939,6 +939,9 @@ struct Deferred {
     /// Written-pages bitmaps the list's shaders mark: read back and zeroed
     /// after each submission of the list (`Host::read_marks`).
     marks: Vec<MarkBits>,
+    /// Copies the GPU uses in place that the list reads, by address: held
+    /// until the list is reset, with nothing to refresh.
+    in_place: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
 }
 
 impl Host {
@@ -1930,6 +1933,11 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The list reads a copy the GPU uses in place: held until the reset.
+    pub(crate) fn keep_in_place(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        self.deferred().in_place.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| shadow.clone());
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
