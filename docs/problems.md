@@ -11,6 +11,12 @@ Goal: **one correct frame** (`docs/agent-workflow.md`).
 
 Each item names its problem in the ranked table below.
 
+- [ ] Read the Windows minidumps of the host stops (`host-bugcheck`): they
+      need an administrator to copy them out of `C:\Windows\Minidump` and a
+      kernel debugger (`!analyze -v`) to name the stack; until then the cause
+      is not known. Fewer GPU timeouts (`gpu-long-lists`) is the likeliest
+      way to make them rarer, not proven
+
 - [ ] Find the pass that should put lit people and ground into the scene's
       colour before tonemap (`scene-blocker`). Traced on the newest build:
       most surfaces have no base colour in the main pass, the earliest wrong
@@ -97,6 +103,7 @@ measure what the picture loses.
 | 13 | `gpu-tests-hang` | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
 | 14 | `device-methods-missing` | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
 | 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charges the rest of the list to its last timed command, so slow-command lines mislead on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list |
+| 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay, on a day with many GPU timeouts, near the video memory budget, on a Windows Insider build (rank not confirmed by the owner) | seen twice on 2026-11-27 on the GTX 1070; dumps not read, cause unknown |
 
 ## Finding what keeps the 3D scene from showing
 
