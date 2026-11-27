@@ -57,9 +57,13 @@ Each item names its problem in the ranked table below.
       buffer descriptors read as their title address through the page table,
       not one host view each (23-28k placed-buffer slots a frame, 190-645 ms,
       `for_view` up to 1.1 s, on title threads, all behind one heap lock);
-      (3) title memory the GPU uses in place (`OpenExistingHeapFromAddress`,
-      committed private memory below 4 GiB per heap): only for memory that is
-      not physical-page views, so a measure of how much that is comes first
+      (3) title memory the GPU uses in place (`OpenExistingHeapFromAddress`):
+      host copies of buffers are system memory already, so the GPU reads at
+      today's cost and refresh, snapshot and copy-back go. Probes
+      (`inplace.rs`, RTX 2060 SUPER) open committed pools and physical-page
+      section views in placeholders, GPU writes land in place; the sized form
+      opens part of an allocation. Open: pages committed on use, views the
+      title unmaps while a heap pins them, the other adapters (caps query)
 
 ## Done lately
 
