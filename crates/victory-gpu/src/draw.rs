@@ -114,6 +114,9 @@ pub(crate) struct State {
     /// line, `descriptor::host::held`).
     #[cfg(feature = "diagnostics")]
     holding_since: Option<std::time::Instant>,
+    /// Times the list was executed since it was made or reset.
+    #[cfg(feature = "diagnostics")]
+    executions: u32,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -153,6 +156,10 @@ impl Drop for State {
             held::table(key, 0, false);
         }
         #[cfg(feature = "diagnostics")]
+        if self.executions == 0 {
+            held::pending(-self.title_slots());
+        }
+        #[cfg(feature = "diagnostics")]
         if let Some(since) = self.holding_since {
             held::given_back(since.elapsed().as_millis() as u64);
         }
@@ -160,6 +167,18 @@ impl Drop for State {
 }
 
 impl State {
+    /// The list's submission has run.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn executed(&mut self) {
+        self.executions += 1;
+        if self.executions == 1 {
+            held::pending(-self.title_slots());
+        }
+        if self.executions == 2 {
+            held::AGAIN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Takes note that the list holds `n` dynamic slots from `first` of view
     /// heap `heap` (a title heap's key, or [`MEMORY_HEAP`]) for `what`.
     fn hold(&mut self, heap: usize, first: u32, n: u32, what: Use) {
@@ -172,8 +191,18 @@ impl State {
                 }
             }
             held::add(what, i64::from(n));
+            #[cfg(feature = "diagnostics")]
+            if self.executions == 0 {
+                held::pending(i64::from(n));
+            }
         }
         self.dynamic.push((heap, first, n, what));
+    }
+
+    /// The dynamic slots of title heaps the list holds.
+    #[cfg(feature = "diagnostics")]
+    fn title_slots(&self) -> i64 {
+        self.dynamic.iter().filter(|&&(h, ..)| h != MEMORY_HEAP).map(|&(_, _, n, _)| i64::from(n)).sum()
     }
 }
 

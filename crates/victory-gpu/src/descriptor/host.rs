@@ -1209,6 +1209,21 @@ pub(crate) mod held {
         }
     }
 
+    /// Lists executed again without a reset between (since the start).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) static AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Slots held by lists not yet executed since made or reset; and the
+    /// most since the last line.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) static PENDING: [std::sync::atomic::AtomicI64; 2] = [const { std::sync::atomic::AtomicI64::new(0) }; 2];
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pending(n: i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = PENDING[0].fetch_add(n, Relaxed) + n;
+        PENDING[1].fetch_max(now, Relaxed);
+    }
+
     /// A list gave its slots back after holding them `ms`.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn given_back(ms: u64) {
@@ -1220,18 +1235,28 @@ pub(crate) mod held {
     pub(super) fn line() -> String {
         use std::sync::atomic::Ordering::Relaxed;
         let [tables, runs, used, clears, pairs, lists] = [0, 1, 2, 3, 4, 5].map(|k| HELD[k].load(Relaxed));
-        let (distinct, slots, large) = {
+        let (distinct, slots, large, contents) = {
             let g = TABLES.lock().unwrap_or_else(|e| e.into_inner());
             let map = g.as_ref();
             let all = map.into_iter().flat_map(|m| m.values());
-            all.fold((0, 0, 0), |(d, s, l), &(n, _)| (d + 1, s + n, l + if n >= 64 { n } else { 0 }))
+            let (d, s, l) = all.fold((0, 0, 0), |(d, s, l), &(n, _)| (d + 1, s + n, l + if n >= 64 { n } else { 0 }));
+            // The same descriptors at other table addresses, once.
+            let mut by_contents = std::collections::HashMap::new();
+            for (&(_, hash), &(n, _)) in map.into_iter().flatten() {
+                by_contents.insert(hash, n);
+            }
+            (d, s, l, by_contents.values().sum::<u32>())
         };
         let [back, ms] = [0, 1].map(|k| GIVEN_BACK[k].swap(0, Relaxed));
         let age = ms.checked_div(back).unwrap_or(0);
         format!(
-            "tables {tables} ({distinct} distinct of {slots} slots, {large} in tables of 64 or more), \
+            "tables {tables} ({distinct} distinct of {slots} slots, {contents} slots by contents alone, {large} in tables of 64 or more), \
              root runs {runs} ({used} used), clears {clears}, pairs {pairs}, by {lists} lists; \
-             {back} lists gave slots back, held {age} ms on average"
+             {back} lists gave slots back, held {age} ms on average; {} lists executed again before a reset; \
+             held by lists not yet executed {} (most {})",
+            AGAIN.load(Relaxed),
+            PENDING[0].load(Relaxed),
+            PENDING[1].swap(PENDING[0].load(Relaxed), Relaxed)
         )
     }
 }
