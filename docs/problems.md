@@ -77,7 +77,19 @@ otesork-scan.md`
 - [ ] Reach one fixed test scene that every run can repeat (`scene-blocker`)
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
-- [ ] Frame replay tool, if the owner chooses it
+- [ ] Frame replay matches the run (branch `frame-record`, not merged;
+      `docs/frame-replay.md`). Now on the replay: descriptors translated,
+      compute-written textures and base colour on people come through,
+      GPU-written counters start as in the run, the run's host copies of
+      title memory are made. Still wrong: no world geometry (emulated mesh
+      draws) reaches depth. Two replay lists read ~43,000 pages of tiled
+      memory (where the title maps page-pool pages) that no host copy of the
+      run covered, so they read zeros and withhold all their writes: the
+      replay computes addresses the run never read. Next: find the first
+      dispatch whose reads leave the run's copies, and which input differs
+- [ ] Recording runs crash the title at `+0x23cf683` (write to 0), most
+      likely when a snapshot stalls the submitting thread for seconds
+      (9 recordings, no other run); being fixed on its own branch
 - [ ] Speed, after the picture: look at waiting for the GPU after every batch
       sent, and at the copies between the two views of memory; the gain is not
       measured (`frame-preparing-cost`)
