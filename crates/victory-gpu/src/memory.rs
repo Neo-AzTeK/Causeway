@@ -464,8 +464,23 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A submission of a list bound to our page table, as any test's list
+    /// using title memory makes: it asks for every host copy whole
+    /// ([`prepare`]). Tests that read shader output from a host copy run it
+    /// between their submission and their read: on another test's thread it
+    /// lands there at random.
+    pub(crate) fn ask_for_every_copy() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        bind(&list, OURS).expect("a page table");
+        list.close();
+        host.execute(&[&list]);
+    }
 
     /// The shader's lookup (`victory_shader` lowering) over a table's
     /// dwords: the view index and the byte offset in that view.

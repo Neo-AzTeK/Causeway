@@ -2380,9 +2380,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A buffer's resource description as words.
+    fn buffer_words(bytes: u64) -> [u32; 14] {
+        [1, 0, 0, 0, bytes as u32, (bytes >> 32) as u32, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0]
+    }
+
     /// A title buffer of `bytes` in memory of its own.
     fn buffer(bytes: u64) -> This {
-        let desc: [u32; 14] = [1, 0, 0, 0, bytes as u32, (bytes >> 32) as u32, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let desc = buffer_words(bytes);
         let properties = [1u32, 0, 0, 0, 0];
         let mut out = std::ptr::null();
         let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
@@ -2471,14 +2476,19 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// the root address (a fixed 1 MiB window would miss it) reads right;
     /// reads past the copy's end read 0 (through a host root descriptor
     /// they would read whatever lay there). Two root addresses in one copy
-    /// share its view.
+    /// share its view. The output is read from its host copy, which another
+    /// test's submission may bring up to date in between (the one run here
+    /// does): its memory is write-watched, as the title's pools, and taken by
+    /// each submission before the dispatch, so that the title's memory, never
+    /// written, is not copied over what the shader wrote.
     #[test]
     fn root_views_reach_their_copy_and_read_zeros_past_it() {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
         const MIB: u64 = 1 << 20;
-        let (src, dst) = (buffer(4 * MIB), buffer(256));
+        let src = buffer(4 * MIB);
+        let dst = resource_at_address(crate::watch::tests::pool(1) as u64, &buffer_words(256));
         let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
         let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
         let null = std::ptr::null();
@@ -2524,6 +2534,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 list.list.SetPipelineState(&pso);
                 list.list.Dispatch(1, 1, 1);
             }
+            out.refresh(&list, dst_bytes as u64, 256);
             list.close();
             for k in 0..16u64 {
                 let at = address + u64::from(offset) + 64 * k;
@@ -2534,6 +2545,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 }
             }
             host.execute(&[&list]);
+            crate::memory::tests::ask_for_every_copy();
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
         }
     }
@@ -2550,8 +2562,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         [3, 0, 0, 0, width, 0, height, 1 | 1 << 16, format, 1, 0, layout, flags, 0]
     }
 
-    /// A title texture (resource object) at `address`.
-    fn texture_at_address(address: u64, words: &[u32; 14]) -> This {
+    /// A title resource (object) at `address`.
+    fn resource_at_address(address: u64, words: &[u32; 14]) -> This {
         let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
         let mut out = std::ptr::null();
         let made = crate::resource::create_at_address(std::ptr::null(), address, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut out);
@@ -2688,7 +2700,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         ];
         for (round, (written, size, put, format, read_size, want, shared)) in cases.into_iter().enumerate() {
             let address = title_memory(1 << 20);
-            let object = texture_at_address(address, &texture_words(size, size, written, 0x105, 4));
+            let object = resource_at_address(address, &texture_words(size, size, written, 0x105, 4));
             let view = placed_view(address, texture_words(read_size, read_size, format, 0x105, 0));
             let Some(View::Shader(placed, _)) = crate::descriptor::host::placed_texture(&view) else {
                 panic!("round {round}: a placed texture");
@@ -2735,7 +2747,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let slots = Slots::new(4);
         let address = title_memory(1 << 22);
-        let depth = texture_at_address(address, &texture_words(64, 64, 118, 0, 2));
+        let depth = resource_at_address(address, &texture_words(64, 64, 118, 0, 2));
         let copy = crate::resource::host_copy(depth).expect("a host depth texture");
         let planes = [
             View::Unordered(depth as usize, 0, Some([56, 4, 0, 0, 0, 0, 0, 0, 0, 0])),
@@ -2918,7 +2930,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         for (round, (d, uav, srv, put, get, groups, want)) in cases.into_iter().enumerate() {
             let address = title_memory(1 << 22);
             let words = [d[0], 0, 0, 0, d[1], 0, d[2], d[3], d[4], 1, 0, 0, 4, 0];
-            let texture = texture_at_address(address, &words);
+            let texture = resource_at_address(address, &words);
             let unordered = View::Unordered(texture as usize, 0, Some(uav));
             let shader = View::Shader(texture as usize, Some(srv));
             slots.make(0, &unordered);

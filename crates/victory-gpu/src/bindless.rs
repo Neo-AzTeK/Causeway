@@ -520,7 +520,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// copy.
     #[test]
     fn heap_views_are_current() {
-        let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
+        let (src, dst) = (resource(1, 256, 1, 0, 1), output());
         let tex = resource(3, 4, 1, 28, LINEAR);
         let write = |base: u32, texel: u8| {
             let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
@@ -544,7 +544,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// texels, not the null view's zeros.
     #[test]
     fn placed_textures_picked_by_index_are_read() {
-        let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
+        let (src, dst) = (resource(1, 256, 1, 0, 1), output());
         let tex = resource(3, 4, 1, 28, LINEAR);
         let (tex_bytes, tex_desc) = crate::resource::texture_memory(tex).unwrap();
         let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0].layout.size as usize;
@@ -585,7 +585,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (a, b) = crate::watch::tests::twin_views(2);
         let src = resource_at(a, 1, 256, 1, 0, 1);
         let tex = resource_at(a + PAGE_BYTES, 3, 4, 1, 28, LINEAR);
-        let dst = resource(1, 256, 1, 0, 1);
+        let dst = output();
         let (_, tex_desc) = crate::resource::texture_memory(tex).unwrap();
         let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0].layout.size as usize;
         let write = |base: u32, texel: u8| {
@@ -603,10 +603,21 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     const PAGE_BYTES: usize = crate::watch::PAGE;
 
+    /// The output buffer, 256 bytes in write-watched memory (as the title's
+    /// pools): the submission's heap refresh takes it before the dispatch,
+    /// so a later refresh (another test's submission, at random) finds the
+    /// title's bytes unchanged and leaves what the shader wrote in the copy.
+    /// A copy of untracked memory (the C heap, a committed resource's in
+    /// tests) is copied whole each time, over the shader's bytes.
+    fn output() -> This {
+        resource_at(crate::watch::tests::pool(1), 1, 256, 1, 0, 1)
+    }
+
     /// Three rounds of: record a dispatch reading slots 0 and 2 and writing
-    /// slot 1, let the title `write` (after recording, before submitting),
-    /// submit, check the output's host copy. `texture` writes the view of a
-    /// texture at the slot handle it is given (slot 2).
+    /// slot 1 (`dst`, made by [`output`]), let the title `write` (after
+    /// recording, before submitting), submit, let a submission asking for
+    /// every copy run, check the output's host copy. `texture` writes the
+    /// view of a texture at the slot handle it is given (slot 2).
     fn rounds(src: This, dst: This, texture: impl Fn(u64), write: impl Fn(u32, u8)) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
@@ -655,6 +666,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             // The title writes after recording, before submitting.
             write(base, texel);
             host.execute(&[&list]);
+            crate::memory::tests::ask_for_every_copy();
             let words = out.read_host(dst_bytes as u64, 64);
             for (i, &v) in words.iter().enumerate() {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
