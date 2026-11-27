@@ -53,6 +53,8 @@ pub(crate) struct Shadow {
     /// `data` is title memory itself, and there is nothing to refresh,
     /// snapshot or copy back.
     in_place: Option<ID3D12Heap>,
+    /// Whether that heap pins the title's view (`crate::inplace::Opened::pins`).
+    pins: bool,
     /// The system-memory buffer `data` maps, when shaders use `buffer` in
     /// video memory instead (diagnostics probe, `crate::vramcopy`).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
@@ -268,6 +270,7 @@ impl Shadow {
             marks,
             block,
             in_place: None,
+            pins: false,
             home,
         });
         if let Some(base) = marks {
@@ -292,6 +295,7 @@ impl Shadow {
             marks: None,
             block: None,
             in_place: Some(o.heap),
+            pins: o.pins,
             home: None,
         })
     }
@@ -1029,9 +1033,10 @@ fn in_place(at: u64, n: u64) -> Option<Arc<Shadow>> {
 }
 
 /// Before the runtime unmaps title memory `[at, at + len)`: the in-place
-/// copies over it let go of their heaps, which pin the pages (Windows
-/// refuses to unmap them while one does). Buffers there are copied again on
-/// their next use.
+/// copies over it go: what those addresses show changes. A heap opened from
+/// the view's address also pins its pages (Windows refuses the unmap while
+/// one lives); one opened from its section does not. Buffers there are
+/// opened or copied again on their next use.
 pub(crate) fn let_go(at: u64, len: u64) {
     let end = at.saturating_add(len);
     let gone: Vec<Arc<Shadow>> = {
@@ -1050,7 +1055,7 @@ pub(crate) fn let_go(at: u64, len: u64) {
     changed();
     for shadow in gone {
         let held = Arc::strong_count(&shadow) - 1;
-        if held > 0 {
+        if held > 0 && shadow.pins {
             tracing::warn!(
                 start = format_args!("{:#x}", shadow.start),
                 len = shadow.len,

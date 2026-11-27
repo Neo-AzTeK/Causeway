@@ -370,8 +370,18 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-/// A section, and the flags the title allocated its pages with.
-struct Section(HANDLE, #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] u64);
+/// A section, the flags the title allocated its pages with, its size, and
+/// a number naming it for the process's life (the GPU side opens it whole,
+/// `victory_gpu::title_memory_section`).
+struct Section(
+    HANDLE,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] u64,
+    usize,
+    usize,
+);
+
+/// The next [`Section`] number.
+static SECTIONS: AtomicUsize = AtomicUsize::new(1);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -515,7 +525,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle, flags));
+    let section = Arc::new(Section(handle, flags, size, SECTIONS.fetch_add(1, Ordering::Relaxed)));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -833,6 +843,15 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         victory_gpu::title_memory_aliased(base + k * PAGE, shown);
         shown.push(base + k * PAGE);
     }
+    // The GPU side uses the section in place where it can open it whole.
+    victory_gpu::title_memory_section(
+        base,
+        len,
+        slice.section.3,
+        slice.section.0 as isize,
+        slice.section.2 as u64,
+        (slice.index * PAGE) as u64,
+    );
     physical.views.insert(base, (len, slice));
     true
 }

@@ -77,21 +77,230 @@ fn regions(at: u64) -> Vec<Region> {
     out
 }
 
-/// Opened title memory: a buffer placed over the whole heap, which starts
-/// at title address `start` and holds `len` bytes.
+/// Opened title memory: a buffer placed in a heap, showing title addresses
+/// `[start, start + len)`.
 pub(crate) struct Opened {
     pub(crate) buffer: ID3D12Resource,
     pub(crate) heap: ID3D12Heap,
     pub(crate) start: u64,
     pub(crate) len: u64,
+    /// Whether the heap pins the title's view (opened from its address):
+    /// Windows then refuses the title's unmap while the heap lives. A
+    /// section opened whole pins no address.
+    pub(crate) pins: bool,
 }
 
-/// Whether title memory is opened in place: `VICTORY_IN_PLACE=1`. Off by
+/// Whether title views are opened by address: `VICTORY_IN_PLACE=1`. Off by
 /// default: in a world run the title unmapped views whose copies lists or
 /// slots still held, Windows refused, and the title crashed.
 fn wanted() -> bool {
     static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WANTED.get_or_init(|| std::env::var("VICTORY_IN_PLACE").is_ok_and(|v| v == "1"))
+}
+
+/// Whether the physical-page sections title memory is mapped from are
+/// opened whole, so the GPU uses that memory in place: on unless
+/// `VICTORY_IN_PLACE=0`.
+fn sections_wanted() -> bool {
+    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var("VICTORY_IN_PLACE").map_or(true, |v| v != "0"))
+}
+
+/// A section the runtime maps title memory from: our own handle to it, its
+/// size, and its heap once asked for (`Some(None)`: the device refused).
+/// Kept for the process's life: the heap holds the section's memory, and a
+/// list may still use it after the title frees its pages.
+struct Section {
+    handle: windows::Win32::Foundation::HANDLE,
+    size: u64,
+    heap: Option<Option<ID3D12Heap>>,
+}
+
+/// A title view of a section: its length and its offset in the section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SectionView {
+    len: u64,
+    section: usize,
+    offset: u64,
+}
+
+#[derive(Default)]
+struct Sections {
+    /// Title views by address.
+    views: std::collections::BTreeMap<u64, SectionView>,
+    /// Sections by the runtime's identity for them.
+    sections: std::collections::HashMap<usize, Section>,
+}
+
+// SAFETY: a handle and a COM heap (agile), used under the lock.
+unsafe impl Send for Sections {}
+
+fn sections() -> std::sync::MutexGuard<'static, Sections> {
+    static SECTIONS: std::sync::LazyLock<std::sync::Mutex<Sections>> = std::sync::LazyLock::new(Default::default);
+    SECTIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The runtime mapped `[at, at + len)` of title memory from `offset` of a
+/// section of `size` bytes (`handle`, which it may close later; `section`
+/// names it while it lives). Called after the mapping.
+pub fn title_memory_section(at: usize, len: usize, section: usize, handle: isize, size: u64, offset: u64) {
+    if !sections_wanted() || len == 0 {
+        return;
+    }
+    let mut s = sections();
+    if let std::collections::hash_map::Entry::Vacant(entry) = s.sections.entry(section) {
+        use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let mut own = HANDLE::default();
+        // SAFETY: duplicates a live handle of this process into a local.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                HANDLE(handle as *mut _),
+                GetCurrentProcess(),
+                &mut own,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok.is_err() {
+            return;
+        }
+        entry.insert(Section { handle: own, size, heap: None });
+    }
+    s.views.insert(at as u64, SectionView { len: len as u64, section, offset });
+}
+
+/// The runtime unmaps or remaps `[at, at + len)`: the section views there
+/// go (buffers already placed keep their section's memory).
+pub(crate) fn forget(at: u64, len: u64) {
+    let mut s = sections();
+    if s.views.is_empty() {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let first = s.views.range(..=at).next_back().filter(|(b, v)| **b + v.len > at).map(|(b, _)| *b);
+    let hit: Vec<u64> = first.into_iter().chain(s.views.range(at.saturating_add(1)..end).map(|(b, _)| *b)).collect();
+    for b in hit {
+        s.views.remove(&b);
+    }
+}
+
+/// Largest run of title memory one placed buffer shows: buffers stay well
+/// under every device's size limit, and finding a run walks its views.
+const RUN_LIMIT: u64 = 1 << 30;
+
+/// The run of title memory around `[at, at + n)` mapped from consecutive
+/// offsets of one section: `(start, len, section, offset)`. None where the
+/// range is not mapped that way throughout.
+fn run(views: &std::collections::BTreeMap<u64, SectionView>, at: u64, n: u64) -> Option<(u64, u64, usize, u64)> {
+    let end_wanted = at.checked_add(n.max(1))?;
+    let (&base, v) = views.range(..=at).next_back().filter(|(b, v)| at < **b + v.len)?;
+    let (section, mut start, mut offset, mut end) = (v.section, base, v.offset, base + v.len);
+    while end - start < RUN_LIMIT {
+        let Some((&b, p)) = views.range(..start).next_back() else { break };
+        if b + p.len != start || p.section != section || p.offset + p.len != offset {
+            break;
+        }
+        (start, offset) = (b, p.offset);
+    }
+    while end < end_wanted || end - start < RUN_LIMIT {
+        let Some(next) = views.get(&end) else { break };
+        if next.section != section || next.offset != offset + (end - start) {
+            break;
+        }
+        end += next.len;
+    }
+    (end >= end_wanted).then_some((start, end - start, section, offset))
+}
+
+/// The heap of section `id`, opened on first use. A section the runtime
+/// reserved and commits per mapped page is committed whole first, where
+/// the device refuses it as it is.
+fn section_heap(device: &ID3D12Device3, s: &mut Section) -> Option<ID3D12Heap> {
+    if let Some(heap) = &s.heap {
+        return heap.clone();
+    }
+    // SAFETY: our own handle to a live section.
+    let mut heap: windows::core::Result<ID3D12Heap> = unsafe { device.OpenExistingHeapFromFileMapping(s.handle) };
+    if heap.is_err() && commit_whole(s.handle, s.size) {
+        // SAFETY: as above.
+        heap = unsafe { device.OpenExistingHeapFromFileMapping(s.handle) };
+    }
+    let heap = match heap {
+        Ok(heap) => {
+            tracing::info!(size = s.size, "title memory section opened for the GPU in place");
+            Some(heap)
+        }
+        Err(e) => {
+            refused(&e, 0, s.size);
+            None
+        }
+    };
+    s.heap = Some(heap.clone());
+    heap
+}
+
+/// Commits every page of a section through a view of our own, unmapped
+/// after (the pages stay committed). False where the system refuses.
+fn commit_whole(handle: windows::Win32::Foundation::HANDLE, size: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MapViewOfFile3, PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: maps a section we hold anywhere, commits that view, unmaps it.
+    unsafe {
+        let view = MapViewOfFile3(handle.0, GetCurrentProcess(), std::ptr::null(), 0, size as usize, 0, PAGE_READWRITE, std::ptr::null_mut(), 0);
+        if view.Value.is_null() {
+            return false;
+        }
+        let ok = !VirtualAlloc(view.Value, size as usize, MEM_COMMIT, PAGE_READWRITE).is_null();
+        if !ok {
+            tracing::warn!(size, error = %std::io::Error::last_os_error(), "a title memory section could not be committed: its buffers are copied");
+        }
+        UnmapViewOfFile2(GetCurrentProcess(), view, 0);
+        ok
+    }
+}
+
+/// Title memory around `[at, at + n)` used in place from its section: a
+/// buffer placed at the run's offset in the section's heap.
+fn open_section(device: &ID3D12Device, at: u64, n: u64) -> Option<Opened> {
+    if !sections_wanted() {
+        return None;
+    }
+    let device3 = device.cast::<ID3D12Device3>().ok()?;
+    let mut s = sections();
+    let (start, len, id, offset) = run(&s.views, at, n)?;
+    let heap = section_heap(&device3, s.sections.get_mut(&id)?)?;
+    drop(s);
+    let buffer = placed(device, &heap, offset, len)?;
+    Some(Opened { buffer, heap, start, len, pins: false })
+}
+
+/// A buffer of `len` bytes at `offset` in an opened heap.
+fn placed(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, len: u64) -> Option<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        // An opened heap is shared across adapters; shaders write buffers.
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: a buffer inside the heap, at a 64 KiB-aligned offset.
+    let placed = unsafe { device.CreatePlacedResource(heap, offset, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer) };
+    match (placed, buffer) {
+        (Ok(()), Some(buffer)) => Some(buffer),
+        (r, _) => {
+            refused(&r.err().unwrap_or_else(windows::core::Error::empty), offset, len);
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +317,12 @@ pub(crate) fn open(at: u64, n: u64) -> Option<Opened> {
     let forced = FORM.with(std::cell::Cell::get);
     #[cfg(not(test))]
     let forced = None;
+    if forced.is_none()
+        && host.caps.existing_heaps != ExistingHeaps::None
+        && let Some(opened) = open_section(&host.device, at, n)
+    {
+        return Some(opened);
+    }
     let form = match forced {
         Some(form) => form,
         None if wanted() => host.caps.existing_heaps,
@@ -147,7 +362,7 @@ pub(crate) fn open(at: u64, n: u64) -> Option<Opened> {
     // SAFETY: a buffer as large as the heap, at its start.
     let placed = unsafe { host.device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer) };
     match (placed, buffer) {
-        (Ok(()), Some(buffer)) => Some(Opened { buffer, heap, start, len }),
+        (Ok(()), Some(buffer)) => Some(Opened { buffer, heap, start, len, pins: true }),
         (r, _) => {
             refused(&r.err().unwrap_or_else(windows::core::Error::empty), start, len);
             None
