@@ -34,6 +34,12 @@ up in the replay.
 The inline fast paths can't bypass this: `List::put` is zero, so every inline
 check fails and the title calls us.
 
+The tables are type-erased `(slot, fn)` arrays (`list.rs` `METHODS`,
+`MORE_METHODS`, `NEWER_METHODS`; about 150 methods across list, queue,
+resource, device and others), so one generic wrapper can't copy the arguments.
+Each method gets a typed recorder next to it. A test walks the same arrays, so
+a method without a recorder fails the build rather than being missed.
+
 ## What a recording holds
 
 A folder outside the repository (rule #1), by default
