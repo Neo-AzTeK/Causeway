@@ -104,14 +104,10 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh that this list reads: (title heap, what it holds)
-    /// → first dynamic slot.
-    fresh_tables: std::collections::HashMap<(usize, TableKey), u32>,
-    /// Those of them the heap shares ([`HostHeap::find_table`]), given back
-    /// to it when the list is reset or released.
-    ///
-    /// [`HostHeap::find_table`]: crate::descriptor::host::HostHeap::find_table
-    shared_tables: Vec<(usize, TableKey)>,
+    /// Tables made afresh that this list reads: (title heap, the record
+    /// words (tag, view index, generation) of its title slots) → first
+    /// dynamic slot. Views made from the same records are the same.
+    fresh_tables: std::collections::HashMap<(usize, Box<[u32]>), u32>,
     /// The dynamic slots the list holds: title heap, first, count, what
     /// for; given back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32, Use)>,
@@ -156,9 +152,6 @@ impl Drop for State {
         held::add(Use::RootUsed, -(used as i64));
         if title_heaps {
             held::add(Use::Lists, -1);
-        }
-        for (heap, key) in &self.shared_tables {
-            crate::descriptor::with_host(*heap, |host| host.drop_table(key));
         }
         #[cfg(feature = "diagnostics")]
         if self.executions == 0 {
@@ -211,7 +204,6 @@ impl State {
     }
 }
 
-use crate::descriptor::host::TableKey;
 use crate::descriptor::host::held::{self, Use};
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
@@ -1488,11 +1480,12 @@ impl State {
                     unsafe { (at as *const [u32; 3]).read_unaligned() }
                 })
                 .collect();
-            #[cfg(feature = "diagnostics")]
             if let Some(base) = heap.index(table) {
+                #[cfg(feature = "diagnostics")]
                 crate::descriptor::host::past::note(base, n, entries.len(), &words);
+                host.tabled(base, n);
             }
-            let key = (heap_key, (crate::descriptor::host::table_generation(), words));
+            let key = (heap_key, words);
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -1503,61 +1496,34 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            // Made already for another list, or by this one now: the whole
-            // range (a shader may index past the entries its used-resource
-            // list names: descriptor arrays). Either way this list reads
-            // what the entries view.
-            let views: Vec<Option<View>> =
-                (0..n).map(|k| crate::descriptor::view(table + u64::from(k) * 32)).collect();
-            let (first, new) = match host.find_table(&key.1, &views) {
-                Some(first) => {
-                    self.shared_tables.push(key.clone());
-                    (first, false)
-                }
-                None => match host.dynamic(n) {
-                    Some(first) => (first, true),
-                    None => {
-                        // Without its fresh table the shader would read the
-                        // title's slots, which for constant buffer tables
-                        // hold no constant view: a texture or null
-                        // descriptor read as a buffer gives a wild address
-                        // on AMD and the device is removed (#59). The draw
-                        // or dispatch is dropped instead.
-                        self.table_failed = true;
-                        continue;
-                    }
-                },
+            let Some(first) = host.dynamic(n) else {
+                // Without its fresh table the shader would read the title's
+                // slots, which for constant buffer tables hold no constant
+                // view: a texture or null descriptor read as a buffer gives
+                // a wild address on AMD and the device is removed (#59). The
+                // draw or dispatch is dropped instead.
+                self.table_failed = true;
+                continue;
             };
-            let mut complete = true;
-            for (k, view) in (0..n).zip(&views) {
+            self.hold(heap_key, first, n, Use::Tables);
+            // The whole range: a shader may index past the entries its
+            // used-resource list names (descriptor arrays).
+            for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match view {
+                match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(view) => {
-                        if new {
-                            complete &= host.make_at(index, view);
-                        }
+                        host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, view, true);
+                            readable(list, u, &view, true);
                         }
                     }
                     None => {
-                        if new {
-                            host.make_null(index);
-                        }
+                        host.make_null(index);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
-                }
-            }
-            if new {
-                // A table with a view the host could not make yet (a
-                // texture not made) stays this list's: later draws try again.
-                if complete && host.share_table(&key.1, first, n, &views) {
-                    self.shared_tables.push(key.clone());
-                } else {
-                    self.hold(heap_key, first, n, Use::Tables);
                 }
             }
             self.fresh_tables.insert(key, first);

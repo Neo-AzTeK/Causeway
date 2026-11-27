@@ -20,7 +20,8 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else [`MIN_DYNAMIC`]; in a capped view
+    /// heap [`REMAP_SLOTS`] more, which its pool slots come from.
     dynamic: u32,
     sampler: bool,
     /// The title heap's slots: more than `count` in a view heap the host
@@ -28,13 +29,11 @@ pub(crate) struct HostHeap {
     title_count: u32,
     /// The heap's slots.
     total: u32,
-    /// The pool slots (start, end): [`REMAP_SLOTS`] after the dynamic ones
-    /// in a capped view heap, else none (both the dynamic slots' end).
-    pool: (u32, u32),
     /// Capped view heaps: per title slot from `count` on, the pool slot it
-    /// is made in (0: none); the pool slot next never taken, those given
-    /// back.
-    remapped: Mutex<(Vec<u32>, u32, Vec<u32>)>,
+    /// is made in (0: none), and how many it has. Pool slots are dynamic
+    /// ones, single and taken from the range's top, [`REMAP_SLOTS`] at
+    /// most, so lists keep [`MIN_DYNAMIC`] for theirs. Locked before `next`.
+    remapped: Mutex<(Vec<u32>, u32)>,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Made>,
     /// The host resource each slot views, held while the slot does: shaders
@@ -43,12 +42,10 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
-    /// Fresh tables lists share ([`HostHeap::find_table`]). Locked before
-    /// `next`.
-    tables: Mutex<Tables>,
+    /// Where the search for free dynamic slots starts, which are taken (by
+    /// lists not yet reset, pairs, pool slots), and where the search from
+    /// the range's top end down starts.
+    next: Mutex<(u32, Vec<bool>, u32)>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -143,6 +140,12 @@ struct Waiting {
 /// VIctory-Belobug-AMD (descriptor/host.rs, GPL-3.0-or-later).
 const TABLED_FRAMES: u64 = 240;
 const TABLED_GRACE: u64 = 8;
+/// Whether a slot last read through a table at `stamp` ([`Made::tabled`])
+/// counts as a table's in `frame` ([`TABLED_FRAMES`]).
+fn lately(stamp: u32, frame: u64) -> bool {
+    stamp != 0 && u64::from((frame as u32).wrapping_sub(stamp - 1)) <= TABLED_FRAMES
+}
+
 /// Slots the queue makes in one frame at most, per heap: making a host
 /// texture and uploading it costs time in the frame that does it.
 const SERVED_PER_FRAME: usize = 256;
@@ -150,67 +153,6 @@ const SERVED_PER_FRAME: usize = 256;
 /// long enough that a texture the host has no memory for does not take the
 /// frame's share every frame.
 const RETRY_FRAMES: u64 = 30;
-
-/// What a fresh table holds (`crate::draw`): the generation it was made in,
-/// then per entry the record words (tag, view index, generation) of its
-/// title slot. Views made from the same records are the same while the host
-/// copies and textures they view are.
-pub(crate) type TableKey = (u64, Box<[u32]>);
-
-/// The generation fresh tables are made and shared in ([`TableKey`]): it
-/// changes when a title texture's memory gets a new host texture
-/// (`crate::resource`, the last count of `texture_counts`). Host copies
-/// change many times a frame (`crate::shadow::generation`), too often to
-/// key tables by: a shared table is checked instead against the host
-/// resources its views read now ([`viewed_now`]).
-pub(crate) fn table_generation() -> u64 {
-    crate::resource::texture_counts().5
-}
-
-/// The host resource (its interface pointer) a view made now reads, as
-/// [`make`] picks it: a constant or buffer view's host copy, a texture
-/// view's host texture; None where that cannot be told without making the
-/// view (a table holding one is not shared).
-fn viewed_now(view: &View) -> Option<usize> {
-    use windows::core::Interface;
-    match view {
-        &View::Constant(address, size) => {
-            Some(crate::shadow::find(address, u64::from(size))?.buffer.as_raw() as usize)
-        }
-        View::Placed(false, resource, _) if resource[0] != 1 => viewed_now(&placed_texture(view)?),
-        View::Shader(r, _) | View::Unordered(r, ..)
-            if let Some(copy) = crate::resource::host_copy(*r as crate::object::This) =>
-        {
-            Some(copy.texture.as_raw() as usize)
-        }
-        _ => Some(view_copy(view)?.0.buffer.as_raw() as usize),
-    }
-}
-
-/// Fresh tables lists share, by what they hold; those no list holds, oldest
-/// first (by when they were given up); the generation tables are found in.
-#[derive(Default)]
-struct Tables {
-    made: std::collections::HashMap<TableKey, Table>,
-    idle: std::collections::BTreeMap<u64, TableKey>,
-    tick: u64,
-    generation: u64,
-}
-
-/// A shared fresh table: its slots, how many lists hold it, when the last
-/// gave it up, per slot the host resource it views (0: none), and whether
-/// one of those is no longer what its view reads (not found again).
-struct Table {
-    first: u32,
-    n: u32,
-    holders: u32,
-    idle_at: u64,
-    viewed: Box<[usize]>,
-    stale: bool,
-}
-
-/// Slots of idle shared tables given back at a time when a run is wanted.
-const GIVE_BACK: u32 = 1024;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -229,7 +171,9 @@ const MIN_DYNAMIC: u32 = 1 << 16;
 const PAIR_SLOTS: u32 = 1 << 15;
 
 /// Pool slots of a view heap the host caps, for the title slots past its
-/// own that hold a view; sized above the most one world run was seen to use.
+/// own that hold a view shaders may pick by index; sized above the most one
+/// world run was seen to use. They are dynamic slots, which lists' tables
+/// have while the pool does not.
 const REMAP_SLOTS: u32 = 1 << 15;
 
 /// Slots at the end of a view heap that are neither the title's nor a
@@ -273,11 +217,11 @@ impl HostHeap {
         let samplers = victory_shader::emit::HEAP_SAMPLERS;
         let title_count = count;
         // A capped heap: the title's slots that fit, the smaller dynamic
-        // range, the pool, the null views.
+        // range with the pool's room, the null views.
         let capped = |limit: u32| {
-            make(limit)
-                .ok()
-                .map(|heap| (heap, limit - MIN_DYNAMIC - REMAP_SLOTS - NULL_VIEWS, MIN_DYNAMIC))
+            make(limit).ok().map(|heap| {
+                (heap, limit - MIN_DYNAMIC - REMAP_SLOTS - NULL_VIEWS, MIN_DYNAMIC + REMAP_SLOTS)
+            })
         };
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
@@ -324,11 +268,6 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
-        let pool = if count < title_count {
-            (count + extra, count + extra + REMAP_SLOTS)
-        } else {
-            (count + extra, count + extra)
-        };
         // The view-stride table: shaders read it as a root view, which has no
         // bounds, at indices clamped to the last slot its header names, and
         // remap entries clamped to the last.
@@ -375,8 +314,7 @@ impl HostHeap {
             sampler,
             title_count,
             total,
-            pool,
-            remapped: Mutex::new((vec![0; (title_count - count) as usize], pool.0, Vec::new())),
+            remapped: Mutex::new((vec![0; (title_count - count) as usize], 0)),
             made: Mutex::new(Made {
                 keys: vec![0; title_count as usize],
                 postponed: vec![false; title_count as usize],
@@ -385,17 +323,10 @@ impl HostHeap {
                 writes: 0,
                 served: 0,
             }),
-            kept: Mutex::new(vec![None; pool.1 as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
-            tables: Mutex::default(),
+            kept: Mutex::new(vec![None; total as usize]),
+            next: Mutex::new((0, vec![false; extra as usize], extra.saturating_sub(1))),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: if sampler {
-                total
-            } else if pool.1 > pool.0 {
-                pool.0
-            } else {
-                total - NULL_VIEWS
-            },
+            pairs_end: if sampler { total } else { total - NULL_VIEWS },
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
@@ -486,44 +417,15 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index. Shared tables no list
-    /// holds are given back for them if none are free.
+    /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        self.take_or_give_back(n, false, None)
+        self.take_or_warn(n, false)
     }
 
-    /// `n` consecutive free dynamic slots, searched from the range's top
-    /// end down (`top`: slots held long, apart from the lists' short-lived
-    /// ones) or from where the last search ended; while there is no such
-    /// run, shared tables no list holds are given back, oldest first.
-    /// `tables`: their lock, if the caller has it.
-    fn take_or_give_back(&self, n: u32, top: bool, tables: Option<&mut Tables>) -> Option<u32> {
+    /// [`HostHeap::take`], warning the first time there is no such run.
+    fn take_or_warn(&self, n: u32, top: bool) -> Option<u32> {
         if let Some(first) = self.take(n, top) {
             return Some(first);
-        }
-        let mut guard;
-        let tables = match tables {
-            Some(t) => t,
-            None => {
-                guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-                &mut *guard
-            }
-        };
-        while !tables.idle.is_empty() {
-            // Enough back for the run, if they lie together; more at a time,
-            // so that each search of the range finds more.
-            let mut back = 0;
-            while back < n.max(GIVE_BACK) {
-                let Some((_, key)) = tables.idle.pop_first() else { break };
-                if let Some(t) = tables.made.remove(&key) {
-                    self.release(t.first, t.n);
-                    held::add(held::Use::IdleTables, -i64::from(t.n));
-                    back += t.n;
-                }
-            }
-            if let Some(first) = self.take(n, top) {
-                return Some(first);
-            }
         }
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -539,20 +441,33 @@ impl HostHeap {
         None
     }
 
-    /// `n` consecutive free dynamic slots, taken; see
-    /// [`HostHeap::take_or_give_back`].
+    /// `n` consecutive free dynamic slots, taken: searched from the range's
+    /// top end down (`top`: slots held long, pairs and pool slots, apart
+    /// from the lists' short-lived ones) or up, each from where its last
+    /// search ended.
     fn take(&self, n: u32, top: bool) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let (next, taken, down) = &mut *guard;
         let n = n as usize;
         let end = self.dynamic as usize;
         let mut run = 0;
         let mut found = None;
         if top {
-            for at in (0..end).rev() {
+            // Down from where the last such search ended, then from the top
+            // down to there (by n - 1 more, for runs crossing it): one pass
+            // over the range per lap, not per slot (pool slots are taken
+            // thousands of times a frame).
+            let cursor = (*down as usize).min(end - 1);
+            let starts = (0..=cursor).rev().chain((cursor.saturating_sub(n - 1)..end).rev());
+            let mut last = usize::MAX;
+            for at in starts {
+                if at.wrapping_add(1) != last {
+                    run = 0;
+                }
+                last = at;
                 run = if taken[at] { 0 } else { run + 1 };
                 if run == n {
                     found = Some(at);
@@ -584,132 +499,12 @@ impl HostHeap {
         self.note_usage(taken, found.is_none().then_some(n));
         let first = found?;
         taken[first..first + n].fill(true);
-        if !top {
+        if top {
+            *down = first.checked_sub(1).unwrap_or(end - 1) as u32;
+        } else {
             *next = ((first + n) % end) as u32;
         }
         Some(self.count + first as u32)
-    }
-
-    /// The first slot of a fresh table made already holding the descriptors
-    /// `key` names, held once more until [`HostHeap::drop_table`]; None if
-    /// there is none (the caller makes one in [`HostHeap::dynamic`] slots,
-    /// and may then share it, [`HostHeap::share_table`]). Lists share
-    /// tables: the title writes the same descriptors at many table
-    /// addresses, and made per list they took most of a capped heap's
-    /// dynamic slots. Tables no list holds stay for later draws until their
-    /// slots are wanted.
-    /// `views`: what the table's title slots hold now, which the found
-    /// table's slots must still view.
-    pub(crate) fn find_table(&self, key: &TableKey, views: &[Option<View>]) -> Option<u32> {
-        let (first, viewed) = {
-            let mut guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-            let tables = &mut *guard;
-            if tables.generation != key.0 {
-                // Tables of earlier host textures are not found again.
-                tables.generation = key.0;
-                let old: Vec<u64> = tables.idle.iter().filter(|(_, k)| k.0 != key.0).map(|(&at, _)| at).collect();
-                for at in old {
-                    if let Some(key) = tables.idle.remove(&at)
-                        && let Some(t) = tables.made.remove(&key)
-                    {
-                        self.release(t.first, t.n);
-                        held::add(held::Use::IdleTables, -i64::from(t.n));
-                    }
-                }
-            }
-            let t = tables.made.get(key).filter(|t| !t.stale)?;
-            (t.first, t.viewed.clone())
-        };
-        // Checked outside the lock: what a view reads takes other locks
-        // (copies, textures).
-        let current = viewed.len() == views.len()
-            && views.iter().zip(&viewed).all(|(v, &was)| v.as_ref().map_or(Some(0), viewed_now) == Some(was));
-        let mut guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-        let tables = &mut *guard;
-        let t = tables.made.get_mut(key).filter(|t| t.first == first && !t.stale)?;
-        if !current {
-            // A copy or texture it views was replaced: made again by the
-            // caller, given back when no list holds it.
-            t.stale = true;
-            if t.holders == 0 {
-                let at = t.idle_at;
-                tables.idle.remove(&at);
-                let t = tables.made.remove(key)?;
-                held::add(held::Use::IdleTables, -i64::from(t.n));
-                self.release(t.first, t.n);
-            }
-            return None;
-        }
-        if t.holders == 0 {
-            tables.idle.remove(&t.idle_at);
-            held::add(held::Use::IdleTables, -i64::from(t.n));
-            held::add(held::Use::Tables, i64::from(t.n));
-        }
-        t.holders += 1;
-        held::add(held::Use::SharedHits, 1);
-        Some(t.first)
-    }
-
-    /// Lets other lists find the table the caller made in `n` dynamic slots
-    /// from `first` holding what `key` names from `views`, every view in it
-    /// made: true if the heap now holds it for the caller (given back with
-    /// [`HostHeap::drop_table`], not [`HostHeap::release`]); false if
-    /// another list made the same one first, or a slot views what cannot be
-    /// checked later ([`viewed_now`]): the caller keeps its own.
-    pub(crate) fn share_table(&self, key: &TableKey, first: u32, n: u32, views: &[Option<View>]) -> bool {
-        use windows::core::Interface;
-        if views.len() != n as usize {
-            return false;
-        }
-        let mut viewed = Vec::with_capacity(views.len());
-        for (k, view) in views.iter().enumerate() {
-            let Some(view) = view else {
-                viewed.push(0);
-                continue;
-            };
-            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner())[(first as usize) + k]
-                .as_ref()
-                .map(|(r, _)| r.as_raw() as usize);
-            match (viewed_now(view), kept) {
-                (Some(now), Some(kept)) if now == kept => viewed.push(now),
-                _ => return false,
-            }
-        }
-        let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-        if key.0 != tables.generation || tables.made.contains_key(key) {
-            return false;
-        }
-        let table = Table {
-            first,
-            n,
-            holders: 1,
-            idle_at: 0,
-            viewed: viewed.into_boxed_slice(),
-            stale: false,
-        };
-        tables.made.insert(key.clone(), table);
-        held::add(held::Use::Tables, i64::from(n));
-        true
-    }
-
-    /// A list no longer holds the table it shared or found.
-    pub(crate) fn drop_table(&self, key: &TableKey) {
-        let mut guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-        let tables = &mut *guard;
-        let Some(t) = tables.made.get_mut(key) else { return };
-        t.holders -= 1;
-        if t.holders > 0 {
-            return;
-        }
-        held::add(held::Use::Tables, -i64::from(t.n));
-        if key.0 == tables.generation && !t.stale {
-            tables.tick += 1;
-            t.idle_at = tables.tick;
-            tables.idle.insert(tables.tick, key.clone());
-            held::add(held::Use::IdleTables, i64::from(t.n));
-        } else if let Some(t) = tables.made.remove(key) {
-            self.release(t.first, t.n);
-        }
     }
 
     /// Two consecutive slots (view heaps only) kept until
@@ -730,7 +525,7 @@ impl HostHeap {
                 return Some(pairs.0 - 2);
             }
         }
-        let index = self.take_or_give_back(2, true, None)?;
+        let index = self.take_or_warn(2, true)?;
         if self.count > 0 {
             held::add(held::Use::Pairs, 2);
         }
@@ -1070,6 +865,17 @@ impl HostHeap {
         // Made from this record already; one left for draws (postponed)
         // is made now if a draw needs it.
         let done = made.keys[index as usize] == key && !(for_draw && made.postponed[index as usize]);
+        if !done && index >= self.count && lately(made.tabled[index as usize], frame) {
+            // A table's slot past the host's ([`HostHeap::tabled`]): no pool
+            // slot; its record is kept, so a sync finding it unchanged
+            // leaves it.
+            made.keys[index as usize] = key;
+            if std::mem::take(&mut made.postponed[index as usize]) {
+                made.queue.remove(&index);
+            }
+            self.unmap(index);
+            return Some(view);
+        }
         if !done {
             let Some(slot) = self.slot_of(index, true) else {
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1100,8 +906,7 @@ impl HostHeap {
             let later = !for_draw && is_placed_texture(&view);
             made.keys[index as usize] = key;
             if later {
-                let stamp = made.tabled[index as usize];
-                let lately = stamp != 0 && u64::from((frame as u32).wrapping_sub(stamp - 1)) <= TABLED_FRAMES;
+                let lately = lately(made.tabled[index as usize], frame);
                 made.writes += 1;
                 let waiting = Waiting {
                     due: if lately { frame + TABLED_GRACE } else { frame },
@@ -1271,21 +1076,18 @@ impl HostHeap {
             return Some(index);
         };
         let mut guard = self.remapped.lock().unwrap_or_else(|e| e.into_inner());
-        let (slots, next, free) = &mut *guard;
+        let (slots, mapped) = &mut *guard;
         match *slots.get(past as usize)? {
             0 => {}
             slot => return Some(slot),
         }
-        if !take {
+        if !take || *mapped >= REMAP_SLOTS {
             return None;
         }
-        let slot = free.pop().or_else(|| {
-            (*next < self.pool.1).then(|| {
-                *next += 1;
-                *next - 1
-            })
-        })?;
+        let slot = self.take(1, true)?;
         slots[past as usize] = slot;
+        *mapped += 1;
+        held::add(held::Use::Pool, 1);
         self.write_remap(past, slot);
         Some(slot)
     }
@@ -1295,13 +1097,36 @@ impl HostHeap {
     fn unmap(&self, index: u32) {
         let Some(past) = index.checked_sub(self.count) else { return };
         let mut guard = self.remapped.lock().unwrap_or_else(|e| e.into_inner());
-        let (slots, _, free) = &mut *guard;
+        let (slots, mapped) = &mut *guard;
         let Some(slot) = slots.get_mut(past as usize).filter(|s| **s != 0) else {
             return;
         };
-        free.push(std::mem::take(slot));
+        let slot = std::mem::take(slot);
+        *mapped -= 1;
+        held::add(held::Use::Pool, -1);
         self.write_remap(past, self.total - 1);
+        self.release(slot, 1);
         self.viewed.set(index, None, false);
+    }
+
+    /// Draws read title slots `[first, first + n)` through a table: those
+    /// past `count` (a capped heap) are made afresh in the lists' slots for
+    /// that (`crate::draw`), so they give their pool slots back and take
+    /// none when the title writes them again within [`TABLED_FRAMES`]. The
+    /// title rewrites its tables' slots every few frames (thousands a
+    /// frame), and made in the pool when written they took all of it.
+    /// shortcut: a shader picking such a slot by index reads null.
+    pub(crate) fn tabled(&self, first: u32, n: u32) {
+        let (from, to) = (first.max(self.count), first.saturating_add(n).min(self.title_count));
+        if from >= to {
+            return;
+        }
+        let stamp = (crate::frame::current() as u32).wrapping_add(1).max(1);
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for index in from..to {
+            made.tabled[index as usize] = stamp;
+            self.unmap(index);
+        }
     }
 
     /// Remap entry `past` (title slot `count + past`) names host slot `slot`.
@@ -1494,21 +1319,19 @@ pub(crate) mod past {
 pub(crate) mod held {
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum Use {
-        /// Slots of fresh tables lists hold, their own or shared.
+        /// Slots of fresh tables lists hold.
         Tables,
-        /// Slots of shared tables no list holds.
-        IdleTables,
-        /// Shared tables found (a count, not slots).
-        SharedHits,
         RootRuns,
         RootUsed,
         Clears,
         Pairs,
         Lists,
+        /// Pool slots of title slots past a capped heap's own.
+        Pool,
     }
 
     #[cfg(feature = "diagnostics")]
-    static HELD: [std::sync::atomic::AtomicI64; 8] = [const { std::sync::atomic::AtomicI64::new(0) }; 8];
+    static HELD: [std::sync::atomic::AtomicI64; 7] = [const { std::sync::atomic::AtomicI64::new(0) }; 7];
 
     /// `n` more (or fewer) slots, or lists, held for `what`.
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
@@ -1545,14 +1368,12 @@ pub(crate) mod held {
     #[cfg(feature = "diagnostics")]
     pub(super) fn line() -> String {
         use std::sync::atomic::Ordering::Relaxed;
-        let [tables, idle, hits, runs, used, clears, pairs, lists] =
-            [0, 1, 2, 3, 4, 5, 6, 7].map(|k| HELD[k].load(Relaxed));
-        HELD[Use::SharedHits as usize].store(0, Relaxed);
+        let [tables, runs, used, clears, pairs, lists, pool] = [0, 1, 2, 3, 4, 5, 6].map(|k| HELD[k].load(Relaxed));
         let [back, ms] = [0, 1].map(|k| GIVEN_BACK[k].swap(0, Relaxed));
         let age = ms.checked_div(back).unwrap_or(0);
         format!(
-            "tables {tables} (shared {hits} times since the last line; {idle} idle), \
-             root runs {runs} ({used} used), clears {clears}, pairs {pairs}, by {lists} lists; \
+            "tables {tables}, root runs {runs} ({used} used), clears {clears}, pairs {pairs}, pool {pool}, \
+             by {lists} lists; \
              {back} lists gave slots back, held {age} ms on average; {} lists executed again before a reset; \
              held by lists not yet executed {} (most {})",
             AGAIN.load(Relaxed),
@@ -1596,14 +1417,9 @@ impl HostHeap {
         }
         tracing::info!(
             refused = ?refused,
-            "dynamic view slots: {used} of {} taken, largest free run {largest}, {runs256} free 256-runs; held: {}; \
-             pool slots taken {}{}",
+            "dynamic view slots: {used} of {} taken, largest free run {largest}, {runs256} free 256-runs; held: {}{}",
             self.dynamic,
             held::line(),
-            {
-                let r = self.remapped.lock().unwrap_or_else(|e| e.into_inner());
-                (r.1 - self.pool.0) as usize - r.2.len()
-            },
             past::line()
         );
     }
@@ -2684,71 +2500,75 @@ mod tests {
         super::super::record(handle(&mut slots, 9), View::Placed(false, resource, desc));
         assert!(heap.mirror(9, handle(&mut slots, 9), false).is_some());
         let slot = remap(9);
-        assert!((heap.pool.0..heap.pool.1).contains(&slot), "a pool slot: {slot}");
+        assert_eq!(slot, heap.count + heap.dynamic - 1, "a dynamic slot, from the top");
         assert!(heap.kept.lock().unwrap()[slot as usize].is_some(), "made there");
         assert_eq!(word(VIEW_TABLE_HEADER + slot), 32, "its stride (32-byte elements)");
         // The title rewrites slot 9 with no view: the pool slot goes back.
         slots[9] = [0; 8];
         assert!(heap.mirror(9, handle(&mut slots, 9), false).is_none());
         assert_eq!(remap(9), limit - 1, "null again");
+        assert!(!heap.next.lock().unwrap().1[(slot - heap.count) as usize], "given back");
         super::super::record(handle(&mut slots, 11), View::Placed(false, resource, desc));
         assert!(heap.mirror(11, handle(&mut slots, 11), false).is_some());
-        assert_eq!(remap(11), slot, "taken again");
+        assert_ne!(remap(11), limit - 1, "taken");
     }
 
-    /// A heap the host caps after the title's first 4 slots: the smaller
-    /// dynamic range, no pair slots.
-    fn capped() -> Option<HostHeap> {
-        HostHeap::with_limit(false, 40_000, Some(MIN_DYNAMIC + REMAP_SLOTS + NULL_VIEWS + 4))
-    }
-
-    /// Lists making the same fresh table share its slots; a table no list
-    /// holds stays for the next, until its slots are wanted or its
-    /// generation is gone. Without sharing, every list's copy took slots of
-    /// a capped heap's dynamic range until it was reset.
+    /// Title slots past a capped heap's own that draws read through tables
+    /// (made afresh in the lists' slots) give their pool slots back and take
+    /// none when written again; the lists have the pool's room. The title
+    /// rewrites thousands of such slots a frame: made in the pool when
+    /// written, they took all of it, and lists had 65,536 slots in all.
     #[test]
-    fn lists_share_fresh_tables_until_their_slots_are_wanted() {
+    fn title_slots_read_through_tables_take_no_pool_slots() {
+        use victory_shader::emit::VIEW_TABLE_HEADER;
         let Some(heap) = capped() else {
             return; // no host GPU
         };
-        assert_eq!(heap.dynamic, MIN_DYNAMIC);
-        let key = |generation: u64, word: u32| (generation, vec![word; 24].into_boxed_slice());
-        let none: Vec<Option<View>> = vec![None; 8];
-        let a = key(1, 7);
-        // The first list makes it, a second finds it.
-        assert_eq!(heap.find_table(&a, &none), None);
-        let first = heap.dynamic(8).unwrap();
-        assert!(heap.share_table(&a, first, 8, &none));
-        assert_eq!(heap.find_table(&a, &none), Some(first), "shared");
-        let other = heap.dynamic(8).unwrap();
-        assert!(!heap.share_table(&a, other, 8, &none), "made already: the second keeps its own");
-        heap.release(other, 8);
-        // Given up by both, it stays for a later list.
-        heap.drop_table(&a);
-        heap.drop_table(&a);
-        assert_eq!(heap.find_table(&a, &none), Some(first), "kept while idle");
-        heap.drop_table(&a);
-        // Every other slot taken: a run is had by giving the idle table back.
-        let rest = heap.dynamic(MIN_DYNAMIC - 8).expect("the rest");
-        assert_eq!(heap.dynamic(8), Some(first), "the idle table's slots");
-        assert_eq!(heap.find_table(&a, &none), None, "given back");
-        heap.release(first, 8);
-        // Idle tables of an earlier generation go when a later one is looked up.
-        let b = key(1, 9);
-        assert_eq!(heap.find_table(&b, &none), None);
-        assert!(heap.share_table(&b, heap.dynamic(8).unwrap(), 8, &none));
-        heap.drop_table(&b);
-        let c = key(2, 9);
-        assert_eq!(heap.find_table(&c, &none), None, "another generation's");
-        assert!(heap.dynamic(8).is_some(), "b's slots back");
-        assert!(!heap.share_table(&b, first, 8, &none), "an old generation is not shared");
-        heap.release(rest, MIN_DYNAMIC - 8);
-        // A view whose host resource cannot be told now (a constant buffer
-        // without a host copy) keeps its table the list's own.
-        let d = key(2, 11);
-        let one = heap.dynamic(1).unwrap();
-        assert!(!heap.share_table(&(d.0, vec![11; 3].into_boxed_slice()), one, 1, &[Some(View::Constant(0x10, 16))]));
-        assert!(!heap.share_table(&d, one, 1, &none), "views one per slot");
+        let (_, table) = heap.strides.as_ref().unwrap();
+        // SAFETY: remap entries of the mapped table, one per title slot from 4 on.
+        let remap = |title: u32| unsafe {
+            (*table as *const u32).add((VIEW_TABLE_HEADER + heap.total + title - 4) as usize).read_volatile()
+        };
+        let null = heap.total - 1;
+        let mut slots = vec![[0u32; 8]; 12];
+        let handle = |slots: &mut [[u32; 8]], i: usize| slots[i].as_mut_ptr() as u64;
+        let memory = crate::watch::tests::owned_window(1024);
+        let at = (memory as u64).next_multiple_of(32);
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, 16 * 32);
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2]) = (1, 0x1688);
+        (desc[4], desc[6], desc[7]) = (1, 4, 32);
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        super::super::record(handle(&mut slots, 9), View::Placed(false, resource, desc));
+        assert!(heap.mirror(9, handle(&mut slots, 9), false).is_some());
+        let slot = remap(9);
+        assert_ne!(slot, null, "written before any table read it: a pool slot");
+        // A draw reads title slots 8 to 11 through a table.
+        heap.tabled(8, 4);
+        assert_eq!(remap(9), null, "given back");
+        assert!(!heap.next.lock().unwrap().1[(slot - heap.count) as usize]);
+        // Written again (another view): still none.
+        desc[6] = 2;
+        super::super::record(handle(&mut slots, 9), View::Placed(false, resource, desc));
+        assert!(heap.mirror(9, handle(&mut slots, 9), false).is_some());
+        assert_eq!(remap(9), null, "a table's slot takes no pool slot");
+        // A slot no table reads still takes one.
+        super::super::record(handle(&mut slots, 11), View::Placed(false, resource, desc));
+        heap.mirror(11, handle(&mut slots, 11), false);
+        assert_eq!(remap(11), null, "11 was in the table too");
+        super::super::record(handle(&mut slots, 7), View::Placed(false, resource, desc));
+        heap.mirror(7, handle(&mut slots, 7), false);
+        assert_ne!(remap(7), null);
+        // Lists have the pool's free room too.
+        assert_eq!(heap.dynamic, MIN_DYNAMIC + REMAP_SLOTS);
+        assert!(heap.dynamic(MIN_DYNAMIC + REMAP_SLOTS / 2).is_some());
+    }
+
+    /// A heap the host caps after the title's first 4 slots: the smaller
+    /// dynamic range with the pool's room, no pair slots.
+    fn capped() -> Option<HostHeap> {
+        HostHeap::with_limit(false, 40_000, Some(MIN_DYNAMIC + REMAP_SLOTS + NULL_VIEWS + 4))
     }
 
     /// A capped heap's host-copy view pairs, held for a copy's life, come
@@ -2763,7 +2583,8 @@ mod tests {
         assert_eq!(heap.pair(), Some(top - 4));
         assert_eq!(heap.dynamic(4), Some(heap.count), "lists' from the bottom");
         heap.free_pair(top - 2);
-        assert_eq!(heap.pair(), Some(top - 2), "given back, taken again");
+        assert!(!heap.next.lock().unwrap().1[(top - 2 - heap.count) as usize], "given back");
+        assert_eq!(heap.pair(), Some(top - 6), "the search goes on down from where it ended");
     }
 
     #[test]
