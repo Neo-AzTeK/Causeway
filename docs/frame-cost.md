@@ -108,6 +108,19 @@ watch, change checks on every declared read, before-images and copy-back.
   churn is more likely its own reaction to what it sees (H0.6). Not
   checked: the two device methods we do not implement, in case either
   asks about memory.
+
+  **H0.6, first split, 2026-11-27** (`loads` lines with repeat delays, one
+  400 s run). The reloads are not retries of requests the title thought
+  failed:
+  - same data to the same place again: none within a second, ~70 later,
+    against ~5,000-8,600 reloads of the same data per window;
+  - no load produced less than asked.
+
+  So the title evicts and loads the data again somewhere else: its own
+  streaming decisions. What drives them (GPU feedback, distance, LOD
+  timers) is not known. Testing that needs the title's streaming inputs
+  found first, so it is **parked**: the payoff is unclear next to the
+  memory-design findings above.
 - **H0.2 (missing): the title already says which memory is GPU-only, and we
   drop it.** Heaps and committed resources come with a heap kind (default,
   upload, readback). `resource.rs` uses it only for the title-side
@@ -166,6 +179,9 @@ frame, ~3,600 are marked through another mapping of the same memory, and
   copy them in again. GPU work then pays twice, and it is counted as CPU work.
   Test: keep the set of pages our copy-back wrote this frame, and count how
   much of the next refreshes falls in it.
+  **Bounded by the H0.1 data:** pages our GPU write-backs touch are ~0.1 GB
+  of ~11 GB over two minutes (~1%). Whatever they bounce into, it is a
+  small share. **Mostly refuted as a large cost**; not worth its own probe.
 - **H1.3 (design): one title page lives in several host copies.** These are the
   whole buffer, a 4 MiB loose window, single-view copies and page-table
   copies. Each is refreshed separately. Earlier probe notes: ~1.6 copies per
