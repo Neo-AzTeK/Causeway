@@ -7,6 +7,10 @@ this machine. This table changes rarely: when the owner re-ranks, or a diff adds
 splits or closes a problem. Live state, evidence with run folders and shader
 hashes stay in the machine-local registry, never here (rule #1).
 
+Picture before speed: speed problems (`compile-backlog`,
+`frame-preparing-cost`, `texture-refresh-menus`) wait until one world frame is
+correct, unless they keep runs from reaching the world at all.
+
 `owner` is `here`, or who else owns it: no session here claims it.
 **No rank below 1 is proven.** Nothing yet shows which loss keeps the 3D scene
 from showing; the order is a guess from dropped-work counts, which do not
@@ -36,7 +40,9 @@ the owner accepts, not a visible scene.
    run reaches it. Say whether it is the intro or the playable world: geometry
    in one does not prove the other.
 2. Capture it with all its render targets (`VICTORY_CAPTURE_FRAMES`,
-   `VICTORY_DUMP_TARGETS=1`; dumps stay outside the repository).
+   `VICTORY_DUMP_TARGETS=1`; dumps stay outside the repository). Once the
+   frame replay exists (`docs/frame-replay.md`), record it once and do steps
+   3 to 5 on the replay.
 3. Walk back from the presented image to the earliest target that is flat or
    wrong although the title writes it. Whether the log can say which draws and
    dispatches write each target is not verified; adding that is part of the work.

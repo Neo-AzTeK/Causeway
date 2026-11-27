@@ -20,6 +20,7 @@ and ask the owner for the title's folder if none is set.
 | cost, delegation, reading, output | `docs/agent-workflow.md` |
 | cross-crate flow, import resolution | `docs/architecture.md` |
 | debug variables, smoke runs | `docs/debugging.md` |
+| frame record and replay (plan) | `docs/frame-replay.md` |
 | problem sessions, problem list | `docs/problem-sessions.md`, `docs/problems.md`; skill `problem-session` |
 | capabilities, planners, fakes | `docs/hardware-range.md`, `docs/gpu-review-checklist.md` |
 | adapters verified / not verified | `docs/adapters.md` |
@@ -36,9 +37,14 @@ and ask the owner for the title's folder if none is set.
   count): it spoils that run's timings, and several crates' tests use the GPU.
 - Descriptor and view-heap work belongs to another AI.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
-- The main session coordinates and does not debug: a problem goes to its own
-  problem session, which owns it until fixed (`/problem-session <id>`). No
-  agents by default.
+- One main session works the current goal (one correct world frame, then
+  speed) end to end, problems included. Start another session or agent only
+  for a separate task that has its own test. Problems keep their notes and
+  claims (`/problem-session <id>`), and the main session holds the
+  connected ones. No agents by default.
+- Fix the earliest missing or wrong step of the frame first. Speed work waits
+  until the frame is correct. Test a change on a frame replay
+  (`docs/frame-replay.md`) once one exists, rather than reasoning from logs.
 - A problem session, after compaction or a pause: `cargo xtask problem resume
   <id>` and read its notes before acting.
 - Merge only on the owner's explicit yes; push only with their OK.
