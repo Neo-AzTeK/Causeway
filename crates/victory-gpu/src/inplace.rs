@@ -215,19 +215,15 @@ fn run(views: &std::collections::BTreeMap<u64, SectionView>, at: u64, n: u64) ->
     (end >= end_wanted).then_some((start, end - start, section, offset))
 }
 
-/// The heap of section `id`, opened on first use. A section the runtime
-/// reserved and commits per mapped page is committed whole first, where
-/// the device refuses it as it is.
+/// The heap of section `id`, opened on first use. Devices open committed
+/// sections under 4 GiB (probe `sections_the_device_opens`); the runtime
+/// makes physical-page sections so where the host can commit them.
 fn section_heap(device: &ID3D12Device3, s: &mut Section) -> Option<ID3D12Heap> {
     if let Some(heap) = &s.heap {
         return heap.clone();
     }
     // SAFETY: our own handle to a live section.
-    let mut heap: windows::core::Result<ID3D12Heap> = unsafe { device.OpenExistingHeapFromFileMapping(s.handle) };
-    if heap.is_err() && commit_whole(s.handle, s.size) {
-        // SAFETY: as above.
-        heap = unsafe { device.OpenExistingHeapFromFileMapping(s.handle) };
-    }
+    let heap: windows::core::Result<ID3D12Heap> = unsafe { device.OpenExistingHeapFromFileMapping(s.handle) };
     let heap = match heap {
         Ok(heap) => {
             tracing::info!(size = s.size, "title memory section opened for the GPU in place");
@@ -240,26 +236,6 @@ fn section_heap(device: &ID3D12Device3, s: &mut Section) -> Option<ID3D12Heap> {
     };
     s.heap = Some(heap.clone());
     heap
-}
-
-/// Commits every page of a section through a view of our own, unmapped
-/// after (the pages stay committed). False where the system refuses.
-fn commit_whole(handle: windows::Win32::Foundation::HANDLE, size: u64) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MapViewOfFile3, PAGE_READWRITE, UnmapViewOfFile2, VirtualAlloc};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    // SAFETY: maps a section we hold anywhere, commits that view, unmaps it.
-    unsafe {
-        let view = MapViewOfFile3(handle.0, GetCurrentProcess(), std::ptr::null(), 0, size as usize, 0, PAGE_READWRITE, std::ptr::null_mut(), 0);
-        if view.Value.is_null() {
-            return false;
-        }
-        let ok = !VirtualAlloc(view.Value, size as usize, MEM_COMMIT, PAGE_READWRITE).is_null();
-        if !ok {
-            tracing::warn!(size, error = %std::io::Error::last_os_error(), "a title memory section could not be committed: its buffers are copied");
-        }
-        UnmapViewOfFile2(GetCurrentProcess(), view, 0);
-        ok
-    }
 }
 
 /// Title memory around `[at, at + n)` used in place from its section: a
@@ -827,5 +803,35 @@ mod tests {
         crate::shadow::unregister(0x1a_5eee, buffer);
         drop(copy);
         assert!(unmap(at));
+    }
+
+    /// Which sections this device opens whole: prints each kind's answer
+    /// (a probe, run by hand with `--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn sections_the_device_opens() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE, SEC_COMMIT, SEC_RESERVE};
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let device = host.device.cast::<ID3D12Device3>().unwrap();
+        for (what, kind, size) in [
+            ("reserved 64 MiB", SEC_RESERVE, 64u64 << 20),
+            ("committed 64 MiB", SEC_COMMIT, 64 << 20),
+            ("committed 1 GiB", SEC_COMMIT, 1 << 30),
+            ("committed 4 GiB + 64 KiB", SEC_COMMIT, (4 << 30) + (64 << 10)),
+        ] {
+            // SAFETY: a plain pagefile-backed section.
+            let h = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | kind, (size >> 32) as u32, size as u32, std::ptr::null()) };
+            assert!(!h.is_null(), "{what}: no section");
+            // SAFETY: a live section handle.
+            let heap: windows::core::Result<ID3D12Heap> = unsafe { device.OpenExistingHeapFromFileMapping(windows::Win32::Foundation::HANDLE(h)) };
+            eprintln!("{what}: {:?}", heap.as_ref().map(|_| "opened").map_err(|e| e.message()));
+            drop(heap);
+            // SAFETY: our handle.
+            unsafe { CloseHandle(h) };
+        }
     }
 }

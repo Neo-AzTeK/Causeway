@@ -495,44 +495,34 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    // Pagefile-backed sections of at most `SECTION_LIMIT` bytes each. The
+    // GPU side opens a section whole to use its memory in place
+    // (`victory_gpu::title_memory_section`), which devices refuse for
+    // reserved sections and for sections of 4 GiB or more: so committed
+    // ones, where the host can commit them, else reserved ones whose pages
+    // are committed when first mapped (`commit`; the GPU then copies them).
+    let mut sections = Vec::new();
+    for at in (0..size).step_by(SECTION_LIMIT) {
+        let Some(section) = section((size - at).min(SECTION_LIMIT), flags) else {
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        };
+        sections.push(section);
     }
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
+        sections = sections.len(),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle, flags, size, SECTIONS.fetch_add(1, Ordering::Relaxed)));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
-            section: section.clone(),
-            index,
+            section: sections[index * PAGE / SECTION_LIMIT].clone(),
+            index: index % (SECTION_LIMIT / PAGE),
         };
         let number = first + index * FRAMES;
         physical.pages.insert(number, slice);
@@ -540,6 +530,47 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { pages.add(index).write(number) };
     }
     1
+}
+
+/// Largest section behind physical pages: under the 4 GiB devices open
+/// whole, and small enough that committing one rarely meets the limit.
+const SECTION_LIMIT: usize = 1 << 30;
+
+/// One section of `size` bytes for physical pages: committed unless the
+/// GPU side does not use sections in place (`VICTORY_IN_PLACE=0`) or the
+/// host cannot commit it now (error 1450 on a busy host), then reserved.
+/// Under Wine a committed section is a sparse file, free until touched, and
+/// committing a reserved one page by page costs a wineserver request each
+/// that scans every range committed so far: committed there always.
+fn section(size: usize, flags: u64) -> Option<Arc<Section>> {
+    let in_place = std::env::var("VICTORY_IN_PLACE").map_or(true, |v| v != "0");
+    let kinds: &[u32] = if on_wine() {
+        &[SEC_COMMIT]
+    } else if in_place {
+        &[SEC_COMMIT, SEC_RESERVE]
+    } else {
+        &[SEC_RESERVE]
+    };
+    let mut error = None;
+    for &kind in kinds {
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | kind,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if !handle.is_null() {
+            return Some(Arc::new(Section(handle, flags, size, SECTIONS.fetch_add(1, Ordering::Relaxed))));
+        }
+        error = Some(std::io::Error::last_os_error());
+    }
+    tracing::warn!(size, error = ?error, "XMemAllocatePhysicalPages failed");
+    None
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
