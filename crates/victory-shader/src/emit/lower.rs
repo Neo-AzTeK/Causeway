@@ -3882,6 +3882,9 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        if matches!(inst.fields, Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }) {
+            self.mark_reads((b, i));
+        }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -5583,7 +5586,6 @@ impl<'a> Lower<'a> {
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 let index = self.buffer_guard(src, index, sampler, props);
-                self.mark_view_read(src, index, sampler);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -5705,7 +5707,6 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
                 let index = self.buffer_guard(src, phi, sampler, props);
-                self.mark_view_read(src, index, sampler);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Select { scc, args } => {
@@ -5725,7 +5726,6 @@ impl<'a> Lower<'a> {
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 let index = self.buffer_guard(src, index, sampler, props);
-                self.mark_view_read(src, index, sampler);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -5734,7 +5734,6 @@ impl<'a> Lower<'a> {
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
                 let index = self.buffer_guard(src, index, sampler, props);
-                self.mark_view_read(src, index, sampler);
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
@@ -5944,18 +5943,49 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// For a descriptor `src` taken from the resource heap itself (not a
-    /// table, not a sampler), marks host heap slot `index` as read (module
-    /// notes, "Read marks"):
-    /// bit [`super::VIEW_WRITE_BITS`] + `index` of the bitmap, set only
-    /// where still clear; slots past [`super::VIEW_READ_BITS`] mark its
-    /// last bit. Every lane marks, active or not: a slot marked that no
-    /// lane read only keeps its texture longer. Nothing without
-    /// [`Parts::view_reads`].
-    fn mark_view_read(&mut self, src: &Source, index: V, sampler: bool) {
-        if !self.x.view_reads || sampler || !self.is_heap_direct(src) {
+    /// Before the image, buffer or scalar access at `site` (module notes, "Read
+    /// marks"): when its descriptor comes from the resource heap itself (not
+    /// a table), marks the host slot it reads. Here, not where the handle is
+    /// made: the mark branches, and the access's own code keeps using the
+    /// block it started in. Nothing without [`Parts::view_reads`].
+    // shortcut: descriptors joined by control flow or each lane's own
+    // (waterfalls) are not marked; their textures wait in the queue's
+    // newest-write order.
+    fn mark_reads(&mut self, site: Site) {
+        if !self.x.view_reads {
             return;
         }
+        let Some(&src) = self.descriptors.get(&(site, false)) else {
+            return;
+        };
+        if !self.is_heap_direct(src) {
+            return;
+        }
+        let index = match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, false),
+            Source::Select { scc, args } => match (&args[..], self.get(*scc)) {
+                ([Source::Loaded { load: a, first: fa }, Source::Loaded { load: b, first: fb }], Ok(Val::Bit(cond))) => {
+                    let (a, fa, b, fb) = (*a, *fa, *b, *fb);
+                    self.heap_index(a, fa, false).and_then(|set| {
+                        let clear = self.heap_index(b, fb, false)?;
+                        Ok(self.s.m.select(self.cur, cond, set, clear))
+                    })
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        if let Ok(index) = index {
+            self.mark_view_read(index);
+        }
+    }
+
+    /// Marks host heap slot `index` as read: bit
+    /// [`super::VIEW_WRITE_BITS`] + `index` of the bitmap, set only where
+    /// still clear; slots past [`super::VIEW_READ_BITS`] mark its last bit.
+    /// Every lane marks, active or not: a slot marked that no lane read only
+    /// keeps its texture longer.
+    fn mark_view_read(&mut self, index: V) {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let c = self.cur;
         let cap = k(self, super::VIEW_READ_BITS - 1);
