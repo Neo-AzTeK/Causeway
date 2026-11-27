@@ -84,7 +84,7 @@ fn key(translator: &str, encoding: &[u8], limit: u32, reads: bool) -> [u8; 32] {
 /// (`descriptor::host::note_reads`): only with `VICTORY_READ_MARKS=1` in a
 /// diagnostics build. They cost GPU work on every heap read, and the
 /// texture queue cannot make most read slots within the memory budget.
-fn read_marks() -> bool {
+pub(crate) fn read_marks() -> bool {
     static READS: OnceLock<bool> = OnceLock::new();
     *READS.get_or_init(|| {
         let on = cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_READ_MARKS").is_some_and(|v| v == "1");
