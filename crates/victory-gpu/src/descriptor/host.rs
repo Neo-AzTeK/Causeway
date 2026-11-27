@@ -109,7 +109,40 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 struct Made {
     keys: Vec<u64>,
     postponed: Vec<bool>,
+    /// Per title slot, the frame (plus one; 0: never) a draw last read it
+    /// through a table, wrapping.
+    tabled: Vec<u32>,
+    /// The postponed slots, waiting to be made for shaders that pick
+    /// textures by index ([`HostHeap::serve_textures`]).
+    queue: std::collections::BTreeMap<u32, Waiting>,
+    /// Writes into `queue` so far: its order, newest first.
+    writes: u64,
+    /// The last frame the queue was served in (plus one; 0: never).
+    served: u64,
 }
+
+/// A postponed slot in [`Made::queue`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waiting {
+    /// The frame from which it is made.
+    due: u64,
+    /// Which write put it there (higher: newer).
+    write: u64,
+    /// Its record in title memory.
+    handle: u64,
+}
+
+/// Frames for which a slot a draw read through a table counts as a table's:
+/// its texture is likely made by that draw, so a new write of it waits
+/// [`TABLED_GRACE`] frames before the queue makes it. The title builds
+/// tables per draw and writes thousands of such views a frame; served first,
+/// they would hold back the textures shaders pick by index. Figures from
+/// VIctory-Belobug-AMD (descriptor/host.rs, GPL-3.0-or-later).
+const TABLED_FRAMES: u64 = 240;
+const TABLED_GRACE: u64 = 8;
+/// Slots the queue makes in one frame at most, per heap: making a host
+/// texture and uploading it costs time in the frame that does it.
+const SERVED_PER_FRAME: usize = 256;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -279,6 +312,10 @@ impl HostHeap {
             made: Mutex::new(Made {
                 keys: vec![0; title_count as usize],
                 postponed: vec![false; title_count as usize],
+                tabled: vec![0; title_count as usize],
+                queue: std::collections::BTreeMap::new(),
+                writes: 0,
+                served: 0,
             }),
             kept: Mutex::new(vec![None; pool.1 as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
@@ -734,6 +771,12 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.make_slot(index, handle, for_draw, for_draw)
+    }
+
+    /// [`HostHeap::mirror`]; `tabled`: a draw reads the slot through a
+    /// table (not the queue making it).
+    fn make_slot(&self, index: u32, handle: u64, for_draw: bool, tabled: bool) -> Option<View> {
         #[cfg(feature = "diagnostics")]
         if self.count < self.title_count {
             census::note(index, self.count, handle);
@@ -746,12 +789,19 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current();
+        if tabled {
+            made.tabled[index as usize] = (frame as u32).wrapping_add(1).max(1);
+        }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made.keys[index as usize] != 0 {
                 made.keys[index as usize] = 0;
+                if made.postponed[index as usize] {
+                    made.queue.remove(&index);
+                }
                 made.postponed[index as usize] = false;
                 if let Some(slot) = self.slot_of(index, false) {
                     self.make_null(slot);
@@ -782,15 +832,30 @@ impl HostHeap {
             self.note_address(slot, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
             // are made when written.
-            // shortcut: views of textures the title placed itself are made
-            // when a draw reads them through a table: a host texture (and a
-            // staging copy) for each of the ~20,000 the title has views of
-            // ran the host out of memory (run b2). The slot reads null until
+            // shortcut: views of textures the title placed itself are made when a draw
+            // reads them through a table, or by the queue for shaders that
+            // pick them by index ([`HostHeap::serve_textures`]), while video
+            // memory has room: a host texture (and a staging copy) for each
+            // of the ~20,000 the title has views of, made when written, ran
+            // the host out of memory (run b2). The slot reads null until
             // then. Its record is kept: a sync finding it unchanged leaves
             // the slot alone (making it again at each sync of its page is
             // what made syncing cost tens of ms per world frame).
             let later = !for_draw && is_placed_texture(&view);
             made.keys[index as usize] = key;
+            if later {
+                let stamp = made.tabled[index as usize];
+                let lately = stamp != 0 && u64::from((frame as u32).wrapping_sub(stamp - 1)) <= TABLED_FRAMES;
+                made.writes += 1;
+                let waiting = Waiting {
+                    due: if lately { frame + TABLED_GRACE } else { frame },
+                    write: made.writes,
+                    handle,
+                };
+                made.queue.insert(index, waiting);
+            } else if made.postponed[index as usize] {
+                made.queue.remove(&index);
+            }
             made.postponed[index as usize] = later;
             #[cfg(feature = "diagnostics")]
             let (placed, mut at) = (making.1 == 4, std::time::Instant::now());
@@ -876,6 +941,59 @@ impl HostHeap {
         for index in changed {
             self.mirror(index, handle(index), false);
         }
+    }
+
+    /// Makes postponed slots ([`HostHeap::mirror`]) for shaders that pick
+    /// textures by index, once a frame (`frame`) at most: up to
+    /// [`SERVED_PER_FRAME`] of those due, the newest write first (served in
+    /// slot order, a backlog of tens of thousands kept the textures of the
+    /// shot on screen waiting: VIctory-Belobug-AMD's finding), while video
+    /// memory has room ([`crate::vram::room`]). A made slot's texture is
+    /// then uploaded with the others its heap views (`crate::bindless`).
+    /// Returns how many were made.
+    pub(crate) fn serve_textures(&self, frame: u64) -> usize {
+        let picked: Vec<(u32, u64)> = {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made.served == frame + 1 || made.queue.is_empty() {
+                return 0;
+            }
+            made.served = frame + 1;
+            let mut due: Vec<(u64, u32, u64)> = made
+                .queue
+                .iter()
+                .filter(|(_, w)| w.due <= frame)
+                .map(|(&index, w)| (w.write, index, w.handle))
+                .collect();
+            if due.len() > SERVED_PER_FRAME {
+                due.select_nth_unstable_by(SERVED_PER_FRAME - 1, |a, b| b.0.cmp(&a.0));
+                due.truncate(SERVED_PER_FRAME);
+            }
+            due.sort_unstable_by_key(|d| std::cmp::Reverse(d.0));
+            due.into_iter().map(|(_, index, handle)| (index, handle)).collect()
+        };
+        let mut served = 0;
+        for (index, handle) in picked {
+            if !crate::vram::room() {
+                break;
+            }
+            // Made as for a draw: the slot leaves the queue there.
+            self.make_slot(index, handle, true, false);
+            served += 1;
+        }
+        // For the measurement of this queue (how many wait, how many a
+        // frame makes, whether memory stops it): every 64th frame.
+        #[cfg(feature = "diagnostics")]
+        if frame.is_multiple_of(64) {
+            let waiting = self.made.lock().unwrap_or_else(|e| e.into_inner()).queue.len();
+            tracing::info!(frame, waiting, served, room = crate::vram::room(), "texture queue");
+        }
+        served
+    }
+
+    /// The postponed slots waiting in the queue ([`HostHeap::serve_textures`]).
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.made.lock().unwrap_or_else(|e| e.into_inner()).queue.len()
     }
 
     /// The host slot title slot `index` is made in: its own below `count`;
@@ -1813,6 +1931,70 @@ mod tests {
     std::thread_local! {
         /// Slots `HostHeap::mirror` made (again) on this thread.
         pub(super) static MADE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Records a placed texture view `n` (its description word 1) at `handle`.
+    fn place(handle: u64, n: u32) {
+        let mut resource = [0u32; 14];
+        resource[0] = 2;
+        let mut desc = [0u32; 16];
+        desc[1] = n;
+        super::super::record(handle, View::Placed(false, resource, desc));
+    }
+
+    /// A postponed slot waits in the queue and is made once a frame by
+    /// `serve_textures` (as a draw would make it), not twice in a frame; a
+    /// slot a draw read through a table waits `TABLED_GRACE` frames when
+    /// written again; the newest write is made first.
+    #[test]
+    fn the_queue_makes_postponed_slots_for_shaders() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let mut slots = vec![[0u32; 8]; 4];
+        let base = slots.as_mut_ptr() as u64;
+        let handle = |i: u32| base + u64::from(i) * 32;
+        let made = || MADE.with(std::cell::Cell::get);
+        let frame = crate::frame::current();
+        let postponed = |i: usize| heap.made.lock().unwrap().postponed[i];
+
+        place(handle(1), 4);
+        heap.sync(0, 4, handle);
+        assert!(postponed(1));
+        assert_eq!(heap.queued(), 1);
+        let before = made();
+        assert_eq!(heap.serve_textures(frame), 1);
+        assert_eq!(made() - before, 1, "made by the queue");
+        assert!(!postponed(1), "made as a draw makes it");
+        assert_eq!(heap.queued(), 0);
+        assert_eq!(heap.made.lock().unwrap().tabled[1], 0, "the queue is not a table read");
+
+        // Once a frame: a slot written after the frame's pass waits.
+        place(handle(2), 4);
+        heap.sync(0, 4, handle);
+        assert_eq!(heap.serve_textures(frame), 0);
+        assert_eq!(heap.queued(), 1);
+        assert_eq!(heap.serve_textures(frame + 1), 1);
+
+        // A table's slot written again waits for the draw that reads it.
+        heap.mirror(3, handle(3), true);
+        place(handle(3), 5);
+        heap.sync(0, 4, handle);
+        assert!(postponed(3));
+        let due = heap.made.lock().unwrap().queue[&3].due;
+        assert_eq!(due, frame + TABLED_GRACE);
+        assert_eq!(heap.serve_textures(frame + 2), 0, "not due yet");
+        // Newest first: slot 1 written after slot 3.
+        place(handle(1), 6);
+        heap.sync(0, 4, handle);
+        let order = {
+            let m = heap.made.lock().unwrap();
+            (m.queue[&1].write, m.queue[&3].write)
+        };
+        assert!(order.0 > order.1);
+        assert_eq!(heap.serve_textures(frame + TABLED_GRACE), 2);
+        assert_eq!(heap.queued(), 0);
     }
 
     /// A slot holding a view of a texture the title placed is left null for

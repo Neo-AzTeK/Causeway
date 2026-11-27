@@ -682,6 +682,9 @@ impl State {
                 .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                 .flatten()
             {
+                // Textures shaders pick by index that no table made yet:
+                // made now, so that the submission uploads them.
+                host.serve_textures(crate::frame::current());
                 list.defer_heap(&host.viewed);
             }
             crate::bindless::note_draw(writes);
