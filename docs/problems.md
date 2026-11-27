@@ -47,8 +47,11 @@ Each item names its problem in the ranked table below.
       same build that plays (`compile-backlog`)
 - [ ] Frame replay tool, if the owner chooses it
 - [ ] Speed and memory (`frame-preparing-cost`): the design the tests point
-      to is `docs/memory-design.md` (4 steps, being built; step 1, the
-      changed-page count, is in). Remaining hypotheses in
+      to is `docs/memory-design.md` (4 steps, being built). Step 1, the
+      changed-page count, is in and tested; two world runs show no clear
+      change in refresh batches (the spread between runs is larger), and
+      the time spent in checks is not measured yet: time it before step 2.
+      Remaining hypotheses in
       `docs/frame-cost.md`, one at a time, writing each result there. Order
       (cheap tests first, then by bytes touched):
       - [x] H6.2 the slow GPU copy programs read a wrong or stale count:
