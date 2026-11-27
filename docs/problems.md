@@ -59,8 +59,7 @@ Each item names its problem in the ranked table below.
             tracked memory; ~44% written by nobody in two minutes)
       - [ ] H0.4 ~5.7 GB of distinct heap pages streamed in two minutes of
             a still scene: re-requested loads?
-      - [ ] H0.3 (rest of the old item:)
-            CPU reads of written-back pages
+      - [ ] H0.3 CPU reads of pages the GPU writes
       - [ ] H1.2 our own write-backs refreshed back in as CPU writes
       - [ ] H1.3 one title page in several host copies
       - [ ] H1.1 changed 64-byte pieces per copied page
