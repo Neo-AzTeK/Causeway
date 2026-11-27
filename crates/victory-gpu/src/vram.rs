@@ -4,7 +4,9 @@
 //! the OS gives a process part of it (`IDXGIAdapter3::QueryVideoMemoryInfo`,
 //! local segment: on an integrated GPU that is the shared memory it may use).
 //! [`decide`] is a pure function of (budget, usage): past [`START_PCT`] of the
-//! budget, host textures no list reached for a while are evicted, longer-idle
+//! budget, host textures no list reached for a while are lowered to the
+//! lowest residency priority (the memory manager moves them out first; they
+//! stay resident, as heap-indexing shaders may reach them), longer-idle
 //! first, until usage is back to [`TARGET_PCT`]; the closer to the budget, the
 //! shorter the idle time that qualifies. No size is fixed: every figure is a
 //! share of the budget. [`resolve`] picks the (budget, usage) pair: the
@@ -13,16 +15,15 @@
 //! fixed guess) against the bytes the host made resident. This module asks the
 //! adapter for no capability: only the live usage, which `Caps` leaves out.
 //!
-//! Eviction runs under the submission lock, before the lists run
-//! (`resource::make_resident`): the host waits for every submission, so no
-//! evicted texture is in flight. Evicted textures are made resident again
-//! the next time anything hands them to the GPU (`resource::residency`).
+//! Lowering runs under the submission lock, before the lists run
+//! (`resource::make_resident`). A lowered texture is raised again the next
+//! time anything hands it to the GPU (`resource::residency`).
 
 use crate::caps::MemoryPlan;
 
-/// Usage, in percent of the budget, from which idle textures are evicted.
+/// Usage, in percent of the budget, from which idle textures are lowered.
 pub(crate) const START_PCT: u64 = 75;
-/// Usage, in percent of the budget, eviction frees down to (below
+/// Usage, in percent of the budget, lowering frees down to (below
 /// [`START_PCT`]: it does not start again at once).
 pub(crate) const TARGET_PCT: u64 = 70;
 /// Usage from which idle time stops mattering much ([`IDLE_HIGH_MS`]).
@@ -41,10 +42,10 @@ pub(crate) const SAMPLE_MS: u64 = 250;
 /// Time between log lines of budget and usage.
 pub(crate) const LOG_MS: u64 = 1000;
 
-/// What to evict.
+/// What to lower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Decision {
-    /// Bytes to free (0: nothing is evicted).
+    /// Bytes to free (0: nothing is lowered).
     pub(crate) free: u64,
     /// Only textures no list reached for this long qualify.
     pub(crate) idle_ms: u64,
@@ -58,7 +59,7 @@ fn percent(budget: u64, usage: u64) -> u64 {
     (u128::from(usage) * 100 / u128::from(budget)).min(u128::from(u64::MAX)) as u64
 }
 
-/// What to evict at `usage` bytes of a `budget`.
+/// What to lower at `usage` bytes of a `budget`.
 pub(crate) fn decide(budget: u64, usage: u64) -> Decision {
     let pct = percent(budget, usage);
     if pct < START_PCT {
@@ -83,7 +84,7 @@ pub(crate) fn resolve(query: Option<(u64, u64)>, plan: MemoryPlan, own: u64) -> 
     }
 }
 
-/// Textures to evict: of `(key, idle_ms, bytes)`, those idle for at least
+/// Textures to lower: of `(key, idle_ms, bytes)`, those idle for at least
 /// `decision.idle_ms`, longest idle first, until `decision.free` bytes are
 /// freed (the one that crosses the line included). Keys, in that order.
 pub(crate) fn pick<K: Copy>(decision: Decision, candidates: &[(K, u64, u64)]) -> Vec<K> {
@@ -145,7 +146,7 @@ mod host {
     }
 
     /// At most every [`SAMPLE_MS`]: samples budget and usage, logs them at
-    /// most every [`LOG_MS`], and returns what to evict given `own` bytes
+    /// most every [`LOG_MS`], and returns what to lower given `own` bytes
     /// of host textures resident. `None` between samples.
     pub(crate) fn tick(own: u64) -> Option<Decision> {
         let monitor = MONITOR.get()?;
@@ -161,7 +162,7 @@ mod host {
         if state.logged.is_none_or(|t| now.duration_since(t).as_millis() >= u128::from(LOG_MS)) {
             state.logged = Some(now);
             tracing::info!(
-                "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB, evicting {:.0} MB",
+                "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB, lowering {:.0} MB",
                 usage as f64 / 1e6,
                 budget as f64 / 1e6,
                 if asked.is_some() { "DXGI" } else { "query failed: caps plan" },

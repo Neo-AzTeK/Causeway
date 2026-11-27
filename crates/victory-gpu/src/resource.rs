@@ -803,8 +803,9 @@ pub(crate) struct HostTexture {
 /// residency. Raised textures are made resident before the next submission
 /// runs ([`make_resident`], under the submission lock): a texture raised
 /// while recording a list is resident when the list runs.
-// Evicted again when video memory nears the adapter's budget and no list
-// reached the texture for a while ([`evict_idle`], policy in `crate::vram`).
+// Lowered to the lowest priority again (never evicted) when video memory
+// nears the adapter's budget and no list reached the texture for a while
+// ([`evict_idle`], policy in `crate::vram`).
 #[cfg(windows)]
 mod residency {
     /// Not resident: made so, nothing reached it yet.
@@ -918,15 +919,18 @@ fn now_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
-/// Evicts resident host textures no list reached for a while when video
-/// memory nears the adapter's budget (`crate::vram`). Called with the
-/// [`RAISED`] lock held and the GPU idle (the host waits for every
-/// submission), before the next lists run: textures a list will use were
-/// stamped at its submission ([`HostTexture::touch`]) and are too recent.
+/// Lowers resident host textures no list reached for a while to the lowest
+/// residency priority when video memory nears the adapter's budget
+/// (`crate::vram`): the memory manager moves them out of video memory
+/// first, and back in when the GPU reaches them. They are not evicted:
+/// heap-indexing shaders reach any view of the heap without a list naming
+/// its texture, so no texture with a view is known to be unreachable, and
+/// the GPU reaching an evicted one hangs it (problem gpu-long-dispatch: a
+/// clear writing a texture only through the heap). Called with the
+/// [`RAISED`] lock held, before the next lists run.
 #[cfg(windows)]
 fn evict_idle(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
-    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-    use windows::Win32::Graphics::Direct3D12::ID3D12Pageable;
+    use std::sync::atomic::Ordering::Relaxed;
     let Some(decision) = crate::vram::tick(RESIDENT.load(Relaxed)) else {
         return;
     };
@@ -935,30 +939,47 @@ fn evict_idle(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
     }
     let now = now_ms();
     let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    // Textures at the lowest priority already are not lowered again.
     let candidates: Vec<(usize, u64, u64)> = live
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.residency.load(Acquire) != NOT_RESIDENT)
+        .filter(|(_, l)| l.residency.load(std::sync::atomic::Ordering::Acquire) == NORMAL)
         .map(|(i, l)| (i, now.saturating_sub(l.last_used.load(Relaxed)), l.bytes))
         .collect();
-    let picked = crate::vram::pick(decision, &candidates);
-    if picked.is_empty() {
-        return;
+    let picked: Vec<&Live> = crate::vram::pick(decision, &candidates).into_iter().map(|i| &live[i]).collect();
+    let lowered = lower(device, &picked);
+    if lowered > 0 {
+        tracing::info!("lowered {} idle host textures ({:.0} MB) to the lowest residency priority", picked.len(), lowered as f64 / 1e6);
     }
-    let pageables: Vec<Option<ID3D12Pageable>> = picked.iter().map(|&i| Some(live[i].pageable.clone())).collect();
-    // SAFETY: live resources, none in flight (the host waits for every
-    // submission) and none of the current batch (stamped just now).
-    if let Err(e) = unsafe { device.Evict(&pageables) } {
-        tracing::warn!(error = %e, count = pageables.len(), "idle host textures not evicted");
-        return;
+}
+
+/// Sets `textures` to the lowest residency priority, keeping them
+/// resident ([`LOW`]); a later use raises them again
+/// ([`HostTexture::raise`]). The bytes lowered; 0 if the host has no
+/// residency priorities.
+#[cfg(windows)]
+fn lower(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, textures: &[&Live]) -> u64 {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_RESIDENCY_PRIORITY_MINIMUM, ID3D12Device1, ID3D12Pageable};
+    use windows::core::Interface;
+    if textures.is_empty() {
+        return 0;
     }
-    let mut freed = 0;
-    for &i in &picked {
-        live[i].residency.store(NOT_RESIDENT, Release);
-        freed += live[i].bytes;
+    let Ok(device) = device.cast::<ID3D12Device1>() else {
+        return 0;
+    };
+    let objects: Vec<Option<ID3D12Pageable>> = textures.iter().map(|l| Some(l.pageable.clone())).collect();
+    let priorities = vec![D3D12_RESIDENCY_PRIORITY_MINIMUM; objects.len()];
+    // SAFETY: as many priorities as live objects.
+    if let Err(e) = unsafe { device.SetResidencyPriority(objects.len() as u32, objects.as_ptr(), priorities.as_ptr()) } {
+        tracing::warn!(error = %e, count = objects.len(), "idle host textures not lowered");
+        return 0;
     }
-    RESIDENT.fetch_sub(freed, Relaxed);
-    tracing::info!("evicted {} idle host textures ({:.0} MB)", picked.len(), freed as f64 / 1e6);
+    // A use racing this store keeps the texture resident, at the lowest
+    // priority until its next raise.
+    for l in textures {
+        l.residency.store(LOW, std::sync::atomic::Ordering::Release);
+    }
+    textures.iter().map(|l| l.bytes).sum()
 }
 
 /// Bytes of live host textures resident, and milliseconds spent making
@@ -2558,6 +2579,43 @@ pub(crate) mod tests {
         // A list clears it: made resident before it runs.
         crate::list::tests::clear(image);
         assert_eq!(copy.residency(), NORMAL);
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop(copy);
+        assert_eq!(resource_release(image), 0);
+    }
+
+    /// Idle textures are lowered, never evicted: one a list used stays
+    /// resident at the lowest priority (heap-indexing shaders may still
+    /// reach it with no list naming it), and its next use raises it again.
+    #[test]
+    fn idle_textures_are_lowered_not_evicted() {
+        use super::residency::{LOW, NORMAL};
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let mut desc = texture(64, 64, 28, 1);
+        desc.flags = 1;
+        let mut image = null;
+        let clear = [28, 0, 0, 0, 0];
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0x4, clear.as_ptr().cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let copy = resource(image).host.clone().expect("a host texture");
+        crate::list::tests::clear(image);
+        assert_eq!(copy.residency(), NORMAL);
+        {
+            let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            let key = copy.texture.as_raw() as usize;
+            let entry = live.iter().find(|l| l.key == key).expect("a live entry");
+            assert_eq!(lower(&host.device, &[entry]), entry.bytes);
+        }
+        assert_eq!(copy.residency(), LOW, "still resident, at the lowest priority");
+        crate::list::tests::clear(image);
+        assert_eq!(copy.residency(), NORMAL, "raised again by its next use");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         drop(copy);
