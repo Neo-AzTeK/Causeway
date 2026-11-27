@@ -703,13 +703,23 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
+    if code == EXCEPTION_ACCESS_VIOLATION {
+        // Whether the access is near this thread's stack: a local array
+        // indexed past its end lands above the stack, a deep frame below it.
+        let (mut low, mut high) = (0, 0);
+        // SAFETY: writes the current thread's stack bounds.
+        unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+        line(format!("  this thread's stack {low:#x}..{high:#x}"));
+    }
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     // A title that stops itself (`int3`) has often just tested what its
-    // registers point at: an object's counts and sizes say which check failed.
+    // registers point at: an object's counts and sizes say which check
+    // failed. A bad access's address was most often computed from them: a
+    // table's index, a pointer read from an object.
     #[cfg(feature = "diagnostics")]
-    if what == UNHANDLED && code == EXCEPTION_BREAKPOINT {
+    if what == UNHANDLED && matches!(code, EXCEPTION_BREAKPOINT | EXCEPTION_ACCESS_VIOLATION) {
         register_memory(context).into_iter().for_each(&mut line);
     }
     if to_file {
@@ -892,7 +902,15 @@ fn memory_at(address: usize) -> String {
     }
     let protect = match info.State {
         MEM_FREE => return "nothing mapped there".into(),
-        MEM_RESERVE => return "reserved, never committed".into(),
+        // Which reservation, and how far its uncommitted run goes: says
+        // whose memory it is (a heap, a stack, a neighbour of the intended
+        // buffer) and whether the access ran off committed pages next to it.
+        MEM_RESERVE => {
+            return format!(
+                "reserved, never committed: {:#x}+{:#x} of the reservation at {:#x}",
+                info.BaseAddress as usize, info.RegionSize, info.AllocationBase as usize
+            );
+        }
         _ if info.Protect & PAGE_GUARD != 0 => return "a guard page".into(),
         _ => match info.Protect & 0xff {
             PAGE_NOACCESS => "no access".into(),
@@ -1095,7 +1113,9 @@ mod tests {
             page(3, PAGE_NOACCESS);
             base as usize
         };
-        assert_eq!(memory_at(base + 8), "reserved, never committed");
+        let reserved =
+            format!("reserved, never committed: {base:#x}+0x1000 of the reservation at {base:#x}");
+        assert_eq!(memory_at(base + 8), reserved);
         assert_eq!(memory_at(base + 0x1008), "read-only");
         assert_eq!(memory_at(base + 0x2008), "a guard page");
         assert_eq!(memory_at(base + 0x3008), "no access");
