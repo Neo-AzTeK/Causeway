@@ -450,6 +450,8 @@ impl HostHeap {
                 break;
             }
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_usage(taken, found.is_none().then_some(n));
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -487,7 +489,11 @@ impl HostHeap {
                 return Some(pairs.0 - 2);
             }
         }
-        self.dynamic(2)
+        let index = self.dynamic(2)?;
+        if self.count > 0 {
+            held::add(held::Use::Pairs, 2);
+        }
+        Some(index)
     }
 
     /// Gives back a pair [`HostHeap::pair`] returned.
@@ -495,6 +501,9 @@ impl HostHeap {
         if index >= self.count + self.dynamic {
             self.pairs.lock().unwrap_or_else(|e| e.into_inner()).1.push(index);
         } else {
+            if self.count > 0 {
+                held::add(held::Use::Pairs, -2);
+            }
             self.release(index, 2);
         }
     }
@@ -1141,6 +1150,81 @@ pub(crate) mod census {
             past_tables = PAST_TABLES.load(Ordering::Relaxed),
             ?blocks,
             "view heap census (live views per 65,536 title slots)"
+        );
+    }
+}
+
+/// What the dynamic slots of title view heaps are held for (lists' tables,
+/// root-view runs and the slots used in them, UAV clears, host copies' view
+/// pairs, and the lists holding any), for the usage line
+/// [`HostHeap::dynamic`] logs with the diagnostics feature. Our own view heap
+/// (`crate::memory::heap`) is not counted.
+pub(crate) mod held {
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Use {
+        Tables,
+        RootRuns,
+        RootUsed,
+        Clears,
+        Pairs,
+        Lists,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    static HELD: [std::sync::atomic::AtomicI64; 6] = [const { std::sync::atomic::AtomicI64::new(0) }; 6];
+
+    /// `n` more (or fewer) slots, or lists, held for `what`.
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    pub(crate) fn add(what: Use, n: i64) {
+        #[cfg(feature = "diagnostics")]
+        HELD[what as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn line() -> String {
+        let [tables, runs, used, clears, pairs, lists] =
+            [0, 1, 2, 3, 4, 5].map(|k| HELD[k].load(std::sync::atomic::Ordering::Relaxed));
+        format!("tables {tables}, root runs {runs} ({used} used), clears {clears}, pairs {pairs}, by {lists} lists")
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl HostHeap {
+    /// Every 5 s, and at the first few refusals, of a title view heap: how
+    /// much of the dynamic range is taken, its largest free run, how many
+    /// 256-slot runs it still has, and what the slots are held for.
+    fn note_usage(&self, taken: &[bool], refused: Option<usize>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        static REFUSALS: AtomicU32 = AtomicU32::new(0);
+        if self.count == 0 {
+            return;
+        }
+        let first_refusals = refused.is_some() && REFUSALS.fetch_add(1, Ordering::Relaxed) < 4;
+        {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let due = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+            if !due && !first_refusals {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let used = taken.iter().filter(|&&t| t).count();
+        let (mut largest, mut runs256, mut run) = (0, 0, 0);
+        for &t in taken.iter().chain([&true]) {
+            if t {
+                largest = largest.max(run);
+                runs256 += run / 256;
+                run = 0;
+            } else {
+                run += 1;
+            }
+        }
+        tracing::info!(
+            refused = ?refused,
+            "dynamic view slots: {used} of {} taken, largest free run {largest}, {runs256} free 256-runs; held: {}",
+            self.dynamic,
+            held::line()
         );
     }
 }
