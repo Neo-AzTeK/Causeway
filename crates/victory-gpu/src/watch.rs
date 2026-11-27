@@ -623,6 +623,7 @@ pub(crate) fn frame_done() {
     let again = written.intersection(&g.written_before).count();
     crate::copystat::add(crate::copystat::C::WrittenPages, written.len() as u64);
     crate::copystat::add(crate::copystat::C::WrittenAgain, again as u64);
+    crate::memclass::frame(g.holders.keys().map(|p| p * PAGE), written.iter().map(|p| p * PAGE));
     g.written_before = written;
     let copied = std::mem::take(&mut g.copied);
     crate::copystat::add(crate::copystat::C::DistinctTakenPages, copied.len() as u64);

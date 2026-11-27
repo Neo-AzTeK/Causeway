@@ -100,6 +100,9 @@ pub extern "system" fn XMemVirtualAlloc(
             0
         },
     };
+    // The console bits dropped below (GPU access, caching), for the probe.
+    #[cfg(feature = "diagnostics")]
+    let console_protect = protect & !0xff;
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -174,6 +177,10 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    #[cfg(feature = "diagnostics")]
+    if !at.is_null() {
+        victory_gpu::memclass::note(at as usize, size, victory_gpu::memclass::Class::Virtual(console_protect));
     }
     at
 }
@@ -266,14 +273,21 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    match hooks()[0] {
+    let at = match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
             // SAFETY: the title's own routine of this type.
             let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
             alloc(size, attributes)
         }
+    };
+    // The attributes without the alignment, for the probe.
+    #[cfg(feature = "diagnostics")]
+    if !at.is_null() {
+        let class = victory_gpu::memclass::Class::Alloc(attributes & !(0x1f << ALIGNMENT_SHIFT));
+        victory_gpu::memclass::note(at as usize, size, class);
     }
+    at
 }
 
 /// See [`XMemAlloc`].
@@ -356,7 +370,8 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section, and the flags the title allocated its pages with.
+struct Section(HANDLE, #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] u64);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -500,7 +515,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, flags));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -808,6 +823,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::memclass::note(base, len, victory_gpu::memclass::Class::Physical(slice.section.1));
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     for k in 0..len / PAGE {

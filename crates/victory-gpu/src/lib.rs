@@ -44,6 +44,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod memclass;
 #[cfg(windows)]
 mod memory;
 mod mesh;
