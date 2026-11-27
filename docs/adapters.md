@@ -42,7 +42,7 @@ written down.
 
 | Change | Checked by | Not yet shown |
 |--------|------------|---------------|
-| root constants read whatever their dword number | a full 6-minute title run, 2026-11-27, RTX 2060 SUPER: no device removal | effect on the picture; other adapters |
+| root constants read whatever their dword number | a full 6-minute title run, 2026-11-27, RTX 2060 SUPER: no device removal; a second run of the same code removed the device about 3 minutes in (cause not read, `gpu-long-dispatch` not ruled out) | effect on the picture; other adapters; whether the removal comes back |
 | loop limits by shader stage | tests; part of the 2026-11-27 title run | the run's result; whether a real loop is cut short |
 | "UAVs at every stage" shader flag | tests, validator; part of that run | effect in the title |
 | compute shaders with implicit derivatives ask for validator 1.8 | tests, validator; part of that run | effect in the title; whether an older Windows D3D12 runtime accepts such a module |

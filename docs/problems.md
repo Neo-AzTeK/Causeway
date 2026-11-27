@@ -11,13 +11,16 @@ Goal: **one correct frame** (`docs/agent-workflow.md`).
 
 Each item names its problem in the ranked table below.
 
-- [ ] Owner chooses the next step for the 3D scene (`scene-blocker`). Traced
-      on the newest build: the geometry reaches the main pass and its normals
-      and depth, but most surfaces have no base colour there, the earliest
-      wrong step, as before (empty texture slots, the descriptor side). A
-      second loss after the main pass is possible, not shown: surfaces that
-      do have colour are black on screen in the traced shot (guess: exposure
-      or lighting). Settling it needs the same shot on two builds
+- [ ] Find the pass that should put lit people and ground into the scene's
+      colour before tonemap (`scene-blocker`). Traced on the newest build:
+      most surfaces have no base colour in the main pass, the earliest wrong
+      step, as before (empty texture slots, the descriptor side). Surfaces
+      that do have colour stay near black in the scene's colour before
+      tonemap, while one lighting pass draws them lit: on near geometry that
+      pass lights, the scene's colour is hundreds of times darker, almost
+      everywhere. Tonemap and upscale keep the picture they get, so this
+      second loss is in lighting or composition. Measured in one frame of
+      one shot; not pinned to one pass, no causal test yet
 - [ ] Owner decides how the original project's later updates come in: one
       commit at a time, or squashed; cleaned either way
 - [ ] Game run that includes the newest shader fix (lane mask joined with data)
