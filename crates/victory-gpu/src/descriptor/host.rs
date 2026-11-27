@@ -46,6 +46,9 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// Fresh tables lists share ([`HostHeap::find_table`]). Locked before
+    /// `next`.
+    tables: Mutex<Tables>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -147,6 +150,42 @@ const SERVED_PER_FRAME: usize = 256;
 /// long enough that a texture the host has no memory for does not take the
 /// frame's share every frame.
 const RETRY_FRAMES: u64 = 30;
+
+/// What a fresh table holds (`crate::draw`): the generation of host copies
+/// and textures it was made in, then per entry the record words (tag, view
+/// index, generation) of its title slot. Views made from the same records,
+/// copies and textures are the same.
+pub(crate) type TableKey = (u64, Box<[u32]>);
+
+/// The generation fresh tables are made in ([`TableKey`]): it changes when
+/// a host copy is made or a title buffer released (`crate::shadow`), and
+/// when a title texture's memory gets a new host texture (`crate::resource`,
+/// the last count of `texture_counts`), as what a made view shows can then.
+pub(crate) fn table_generation() -> u64 {
+    crate::shadow::generation() + crate::resource::texture_counts().5
+}
+
+/// Fresh tables lists share, by what they hold; those no list holds, oldest
+/// first (by when they were given up); the generation tables are found in.
+#[derive(Default)]
+struct Tables {
+    made: std::collections::HashMap<TableKey, Table>,
+    idle: std::collections::BTreeMap<u64, TableKey>,
+    tick: u64,
+    generation: u64,
+}
+
+/// A shared fresh table: its slots, how many lists hold it, and when the
+/// last gave it up.
+struct Table {
+    first: u32,
+    n: u32,
+    holders: u32,
+    idle_at: u64,
+}
+
+/// Slots of idle shared tables given back at a time when a run is wanted.
+const GIVE_BACK: u32 = 1024;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -323,6 +362,7 @@ impl HostHeap {
             }),
             kept: Mutex::new(vec![None; pool.1 as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            tables: Mutex::default(),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: if sampler {
                 total
@@ -421,54 +461,184 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// [`HostHeap::release`]: the first's index. Shared tables no list
+    /// holds are given back for them if none are free.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        self.take_or_give_back(n, false, None)
+    }
+
+    /// `n` consecutive free dynamic slots, searched from the range's top
+    /// end down (`top`: slots held long, apart from the lists' short-lived
+    /// ones) or from where the last search ended; while there is no such
+    /// run, shared tables no list holds are given back, oldest first.
+    /// `tables`: their lock, if the caller has it.
+    fn take_or_give_back(&self, n: u32, top: bool, tables: Option<&mut Tables>) -> Option<u32> {
+        if let Some(first) = self.take(n, top) {
+            return Some(first);
+        }
+        let mut guard;
+        let tables = match tables {
+            Some(t) => t,
+            None => {
+                guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+                &mut *guard
+            }
+        };
+        while !tables.idle.is_empty() {
+            // Enough back for the run, if they lie together; more at a time,
+            // so that each search of the range finds more.
+            let mut back = 0;
+            while back < n.max(GIVE_BACK) {
+                let Some((_, key)) = tables.idle.pop_first() else { break };
+                if let Some(t) = tables.made.remove(&key) {
+                    self.release(t.first, t.n);
+                    held::add(held::Use::IdleTables, -i64::from(t.n));
+                    back += t.n;
+                }
+            }
+            if let Some(first) = self.take(n, top) {
+                return Some(first);
+            }
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let used = self.next.lock().unwrap_or_else(|e| e.into_inner()).1.iter().filter(|&&t| t).count();
+            tracing::warn!(
+                n,
+                used,
+                of = self.dynamic,
+                title_slots = self.count,
+                "no free dynamic descriptor slots: a table is not made"
+            );
+        });
+        None
+    }
+
+    /// `n` consecutive free dynamic slots, taken; see
+    /// [`HostHeap::take_or_give_back`].
+    fn take(&self, n: u32, top: bool) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
+        if top {
+            for at in (0..end).rev() {
+                run = if taken[at] { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at);
+                    break;
+                }
             }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
+        } else {
+            // Search from `next` on, then from the start (extending past
+            // cursor by n - 1 so contiguous runs crossing the cursor are
+            // not missed).
+            let cursor = *next as usize;
+            let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+            let starts = (cursor..end).chain(0..second_end);
+            let mut last = usize::MAX;
+            for at in starts {
+                // A run cannot wrap past the end.
+                if at != last.wrapping_add(1) {
+                    run = 0;
+                }
+                last = at;
+                run = if taken[at] { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at + 1 - n);
+                    break;
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
         self.note_usage(taken, found.is_none().then_some(n));
-        let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                let used = taken.iter().filter(|&&t| t).count();
-                tracing::warn!(
-                    n,
-                    used,
-                    of = self.dynamic,
-                    title_slots = self.count,
-                    "no free dynamic descriptor slots: a table is not made"
-                );
-            });
-            return None;
-        };
+        let first = found?;
         taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
+        if !top {
+            *next = ((first + n) % end) as u32;
+        }
         Some(self.count + first as u32)
+    }
+
+    /// The first slot of a fresh table made already holding the descriptors
+    /// `key` names, held once more until [`HostHeap::drop_table`]; None if
+    /// there is none (the caller makes one in [`HostHeap::dynamic`] slots,
+    /// and may then share it, [`HostHeap::share_table`]). Lists share
+    /// tables: the title writes the same descriptors at many table
+    /// addresses, and made per list they took most of a capped heap's
+    /// dynamic slots. Tables no list holds stay for later draws until their
+    /// slots are wanted.
+    pub(crate) fn find_table(&self, key: &TableKey) -> Option<u32> {
+        let mut guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let tables = &mut *guard;
+        if tables.generation != key.0 {
+            // Tables made from other copies and textures are not found again.
+            tables.generation = key.0;
+            let old: Vec<u64> = tables.idle.iter().filter(|(_, k)| k.0 != key.0).map(|(&at, _)| at).collect();
+            for at in old {
+                if let Some(key) = tables.idle.remove(&at)
+                    && let Some(t) = tables.made.remove(&key)
+                {
+                    self.release(t.first, t.n);
+                    held::add(held::Use::IdleTables, -i64::from(t.n));
+                }
+            }
+        }
+        let t = tables.made.get_mut(key)?;
+        if t.holders == 0 {
+            tables.idle.remove(&t.idle_at);
+            held::add(held::Use::IdleTables, -i64::from(t.n));
+            held::add(held::Use::Tables, i64::from(t.n));
+        }
+        t.holders += 1;
+        held::add(held::Use::SharedHits, 1);
+        Some(t.first)
+    }
+
+    /// Lets other lists find the table the caller made in `n` dynamic slots
+    /// from `first` holding what `key` names, every view in it made: true
+    /// if the heap now holds it for the caller (given back with
+    /// [`HostHeap::drop_table`], not [`HostHeap::release`]), false if
+    /// another list made the same one first (the caller keeps its own).
+    pub(crate) fn share_table(&self, key: &TableKey, first: u32, n: u32) -> bool {
+        let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        if key.0 != tables.generation || tables.made.contains_key(key) {
+            return false;
+        }
+        let table = Table {
+            first,
+            n,
+            holders: 1,
+            idle_at: 0,
+        };
+        tables.made.insert(key.clone(), table);
+        held::add(held::Use::Tables, i64::from(n));
+        true
+    }
+
+    /// A list no longer holds the table it shared or found.
+    pub(crate) fn drop_table(&self, key: &TableKey) {
+        let mut guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let tables = &mut *guard;
+        let Some(t) = tables.made.get_mut(key) else { return };
+        t.holders -= 1;
+        if t.holders > 0 {
+            return;
+        }
+        held::add(held::Use::Tables, -i64::from(t.n));
+        if key.0 == tables.generation {
+            tables.tick += 1;
+            t.idle_at = tables.tick;
+            tables.idle.insert(tables.tick, key.clone());
+            held::add(held::Use::IdleTables, i64::from(t.n));
+        } else if let Some(t) = tables.made.remove(key) {
+            self.release(t.first, t.n);
+        }
     }
 
     /// Two consecutive slots (view heaps only) kept until
@@ -489,7 +659,7 @@ impl HostHeap {
                 return Some(pairs.0 - 2);
             }
         }
-        let index = self.dynamic(2)?;
+        let index = self.take_or_give_back(2, true, None)?;
         if self.count > 0 {
             held::add(held::Use::Pairs, 2);
         }
@@ -530,15 +700,17 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    /// host cannot (false).
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
         let (kept, mark) = make_marked(view, self.cpu(index));
-        if kept.is_none() {
+        let made = kept.is_some();
+        if !made {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
         self.set_stride(index, Some(view));
         self.set_mark(index, mark);
+        made
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -1162,7 +1334,12 @@ pub(crate) mod census {
 pub(crate) mod held {
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum Use {
+        /// Slots of fresh tables lists hold, their own or shared.
         Tables,
+        /// Slots of shared tables no list holds.
+        IdleTables,
+        /// Shared tables found (a count, not slots).
+        SharedHits,
         RootRuns,
         RootUsed,
         Clears,
@@ -1171,42 +1348,13 @@ pub(crate) mod held {
     }
 
     #[cfg(feature = "diagnostics")]
-    static HELD: [std::sync::atomic::AtomicI64; 6] = [const { std::sync::atomic::AtomicI64::new(0) }; 6];
+    static HELD: [std::sync::atomic::AtomicI64; 8] = [const { std::sync::atomic::AtomicI64::new(0) }; 8];
 
     /// `n` more (or fewer) slots, or lists, held for `what`.
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     pub(crate) fn add(what: Use, n: i64) {
         #[cfg(feature = "diagnostics")]
         HELD[what as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Fresh tables held by lists, by (table, what it holds): entries and
-    /// how many lists hold it; and lists given back: how many, and for how
-    /// long in all (ms) they held slots.
-    #[cfg(feature = "diagnostics")]
-    type Tables = std::collections::HashMap<(u64, u64), (u32, u32)>;
-    #[cfg(feature = "diagnostics")]
-    static TABLES: std::sync::Mutex<Option<Tables>> = std::sync::Mutex::new(None);
-    #[cfg(feature = "diagnostics")]
-    static GIVEN_BACK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-    /// A list now holds (`held`) or no longer holds fresh table `key` of `n`
-    /// entries.
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    pub(crate) fn table(key: (u64, u64), n: u32, held: bool) {
-        #[cfg(feature = "diagnostics")]
-        {
-            let mut g = TABLES.lock().unwrap_or_else(|e| e.into_inner());
-            let map = g.get_or_insert_with(Default::default);
-            if held {
-                map.entry(key).or_insert((n, 0)).1 += 1;
-            } else if let Some(e) = map.get_mut(&key) {
-                e.1 -= 1;
-                if e.1 == 0 {
-                    map.remove(&key);
-                }
-            }
-        }
     }
 
     /// Lists executed again without a reset between (since the start).
@@ -1224,6 +1372,9 @@ pub(crate) mod held {
         PENDING[1].fetch_max(now, Relaxed);
     }
 
+    #[cfg(feature = "diagnostics")]
+    static GIVEN_BACK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
     /// A list gave its slots back after holding them `ms`.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn given_back(ms: u64) {
@@ -1234,23 +1385,13 @@ pub(crate) mod held {
     #[cfg(feature = "diagnostics")]
     pub(super) fn line() -> String {
         use std::sync::atomic::Ordering::Relaxed;
-        let [tables, runs, used, clears, pairs, lists] = [0, 1, 2, 3, 4, 5].map(|k| HELD[k].load(Relaxed));
-        let (distinct, slots, large, contents) = {
-            let g = TABLES.lock().unwrap_or_else(|e| e.into_inner());
-            let map = g.as_ref();
-            let all = map.into_iter().flat_map(|m| m.values());
-            let (d, s, l) = all.fold((0, 0, 0), |(d, s, l), &(n, _)| (d + 1, s + n, l + if n >= 64 { n } else { 0 }));
-            // The same descriptors at other table addresses, once.
-            let mut by_contents = std::collections::HashMap::new();
-            for (&(_, hash), &(n, _)) in map.into_iter().flatten() {
-                by_contents.insert(hash, n);
-            }
-            (d, s, l, by_contents.values().sum::<u32>())
-        };
+        let [tables, idle, hits, runs, used, clears, pairs, lists] =
+            [0, 1, 2, 3, 4, 5, 6, 7].map(|k| HELD[k].load(Relaxed));
+        HELD[Use::SharedHits as usize].store(0, Relaxed);
         let [back, ms] = [0, 1].map(|k| GIVEN_BACK[k].swap(0, Relaxed));
         let age = ms.checked_div(back).unwrap_or(0);
         format!(
-            "tables {tables} ({distinct} distinct of {slots} slots, {contents} slots by contents alone, {large} in tables of 64 or more), \
+            "tables {tables} (shared {hits} times since the last line; {idle} idle), \
              root runs {runs} ({used} used), clears {clears}, pairs {pairs}, by {lists} lists; \
              {back} lists gave slots back, held {age} ms on average; {} lists executed again before a reset; \
              held by lists not yet executed {} (most {})",
@@ -2387,6 +2528,69 @@ mod tests {
         super::super::record(handle(&mut slots, 11), View::Placed(false, resource, desc));
         assert!(heap.mirror(11, handle(&mut slots, 11), false).is_some());
         assert_eq!(remap(11), slot, "taken again");
+    }
+
+    /// A heap the host caps after the title's first 4 slots: the smaller
+    /// dynamic range, no pair slots.
+    fn capped() -> Option<HostHeap> {
+        HostHeap::with_limit(false, 40_000, Some(MIN_DYNAMIC + REMAP_SLOTS + NULL_VIEWS + 4))
+    }
+
+    /// Lists making the same fresh table share its slots; a table no list
+    /// holds stays for the next, until its slots are wanted or its
+    /// generation is gone. Without sharing, every list's copy took slots of
+    /// a capped heap's dynamic range until it was reset.
+    #[test]
+    fn lists_share_fresh_tables_until_their_slots_are_wanted() {
+        let Some(heap) = capped() else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.dynamic, MIN_DYNAMIC);
+        let key = |generation: u64, word: u32| (generation, vec![word; 24].into_boxed_slice());
+        let a = key(1, 7);
+        // The first list makes it, a second finds it.
+        assert_eq!(heap.find_table(&a), None);
+        let first = heap.dynamic(8).unwrap();
+        assert!(heap.share_table(&a, first, 8));
+        assert_eq!(heap.find_table(&a), Some(first), "shared");
+        let other = heap.dynamic(8).unwrap();
+        assert!(!heap.share_table(&a, other, 8), "made already: the second keeps its own");
+        heap.release(other, 8);
+        // Given up by both, it stays for a later list.
+        heap.drop_table(&a);
+        heap.drop_table(&a);
+        assert_eq!(heap.find_table(&a), Some(first), "kept while idle");
+        heap.drop_table(&a);
+        // Every other slot taken: a run is had by giving the idle table back.
+        let rest = heap.dynamic(MIN_DYNAMIC - 8).expect("the rest");
+        assert_eq!(heap.dynamic(8), Some(first), "the idle table's slots");
+        assert_eq!(heap.find_table(&a), None, "given back");
+        heap.release(first, 8);
+        // Idle tables of an earlier generation go when a later one is looked up.
+        let b = key(1, 9);
+        assert_eq!(heap.find_table(&b), None);
+        assert!(heap.share_table(&b, heap.dynamic(8).unwrap(), 8));
+        heap.drop_table(&b);
+        let c = key(2, 9);
+        assert_eq!(heap.find_table(&c), None, "another generation's");
+        assert!(heap.dynamic(8).is_some(), "b's slots back");
+        assert!(!heap.share_table(&b, first, 8), "an old generation is not shared");
+        heap.release(rest, MIN_DYNAMIC - 8);
+    }
+
+    /// A capped heap's host-copy view pairs, held for a copy's life, come
+    /// from the dynamic range's top end, apart from the lists' slots.
+    #[test]
+    fn pairs_of_a_capped_heap_come_from_the_top() {
+        let Some(heap) = capped() else {
+            return; // no host GPU
+        };
+        let top = heap.count + heap.dynamic;
+        assert_eq!(heap.pair(), Some(top - 2));
+        assert_eq!(heap.pair(), Some(top - 4));
+        assert_eq!(heap.dynamic(4), Some(heap.count), "lists' from the bottom");
+        heap.free_pair(top - 2);
+        assert_eq!(heap.pair(), Some(top - 2), "given back, taken again");
     }
 
     #[test]
