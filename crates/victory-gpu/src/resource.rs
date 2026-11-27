@@ -1992,6 +1992,41 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Host bytes a texture placed at `address` with the resource description
+/// `desc` (as words) would add if made now: 0 when it or a host texture of
+/// its memory is live, `None` when the host cannot size it (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_cost(address: u64, desc: &[u32; 14]) -> Option<u64> {
+    let mut desc = *desc;
+    (desc[1], desc[13]) = (0, 0);
+    if let Some(&r) = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).get(&(address, desc))
+        && current(r as This)
+    {
+        return Some(0);
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    if let Some(k) = memory_key(address, &d)
+        && let Some(map) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        && map.get(&k).is_some_and(|w| w.strong_count() > 0)
+    {
+        return Some(0);
+    }
+    let h = host_desc(&d)?;
+    let host = crate::host::host()?;
+    // SAFETY: a plain query on a host description (same layout).
+    let info = unsafe {
+        host.device.GetResourceAllocationInfo(
+            0,
+            &[std::ptr::from_ref(&h).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()],
+        )
+    };
+    Some(info.SizeInBytes)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

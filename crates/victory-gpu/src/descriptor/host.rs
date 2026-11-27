@@ -1023,8 +1023,33 @@ impl HostHeap {
         // frame makes, whether memory stops it): every 64th frame.
         #[cfg(feature = "diagnostics")]
         if frame.is_multiple_of(64) {
-            let waiting = self.made.lock().unwrap_or_else(|e| e.into_inner()).queue.len();
+            let handles: Vec<u64> =
+                self.made.lock().unwrap_or_else(|e| e.into_inner()).queue.values().map(|w| w.handle).collect();
+            let waiting = handles.len();
             tracing::info!(frame, waiting, served, room = crate::vram::room(), "texture queue");
+            if crate::levels::sampled() {
+                // What making every waiting slot would add: distinct title
+                // textures without a host texture, and their host bytes.
+                let mut seen = std::collections::BTreeSet::new();
+                let (mut new, mut bytes, mut unknown) = (0u64, 0u64, 0u64);
+                for h in handles {
+                    let Some(View::Placed(false, resource, desc)) = super::view(h) else { continue };
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    if !seen.insert((address, resource)) {
+                        continue;
+                    }
+                    match crate::resource::placed_cost(address, &resource) {
+                        Some(0) => {}
+                        Some(n) => (new, bytes) = (new + 1, bytes + n),
+                        None => unknown += 1,
+                    }
+                }
+                tracing::info!(
+                    "texture queue (probe): {} distinct textures waiting, {new} without a host texture needing {} MB, {unknown} not sized",
+                    seen.len(),
+                    bytes >> 20,
+                );
+            }
         }
         served
     }

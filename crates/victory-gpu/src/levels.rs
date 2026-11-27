@@ -98,9 +98,9 @@ pub(crate) fn count(moment: &'static str, memory: *const u8, layout: &Layout, ho
     }
 }
 
-/// Whether the resident sample is on (`VICTORY_PROBE_LEVELS=1`; it asks
+/// Whether the samples are on (`VICTORY_PROBE_LEVELS=1`; the resident one asks
 /// the kernel about every level of every live host texture).
-fn sampled() -> bool {
+pub(crate) fn sampled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_PROBE_LEVELS").is_ok_and(|v| v == "1"))
 }
