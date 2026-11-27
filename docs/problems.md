@@ -36,6 +36,9 @@ Each item names its problem in the ranked table below.
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
 - [ ] Frame replay tool, if the owner chooses it
+- [ ] Speed, after the picture: look at waiting for the GPU after every batch
+      sent, and at the copies between the two views of memory; the gain is not
+      measured (`frame-preparing-cost`)
 
 ## Done lately
 
