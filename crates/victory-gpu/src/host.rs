@@ -1121,6 +1121,14 @@ impl Host {
             .zip(firsts.iter().skip(1).chain([&lists.len()]))
             .map(|(&a, &b)| &lists[a..b])
             .collect();
+        // First, with the probe on: what the refreshes wrote, to the copies
+        // in video memory (`crate::vramcopy`).
+        #[cfg(feature = "diagnostics")]
+        let to_video = [crate::vramcopy::list(&self.device)];
+        #[cfg(feature = "diagnostics")]
+        if to_video[0].is_some() {
+            groups.insert(0, &to_video);
+        }
         // Last: the written-pages bitmaps the lists marked, read back.
         #[cfg(feature = "diagnostics")]
         let marking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarksUs);
@@ -2791,6 +2799,7 @@ impl Meter {
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
                 crate::shadow::log_views(copy_frames);
+                crate::vramcopy::log(copy_frames);
                 let [refused, compiling, other] =
                     crate::pipeline::drops_by_cause(&drops).map(|n| n as f64 / frames);
                 tracing::info!(

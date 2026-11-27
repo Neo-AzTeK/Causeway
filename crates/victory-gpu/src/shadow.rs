@@ -53,6 +53,10 @@ pub(crate) struct Shadow {
     /// `data` is title memory itself, and there is nothing to refresh,
     /// snapshot or copy back.
     in_place: Option<ID3D12Heap>,
+    /// The system-memory buffer `data` maps, when shaders use `buffer` in
+    /// video memory instead (diagnostics probe, `crate::vramcopy`).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    home: Option<ID3D12Resource>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -236,7 +240,20 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
-    fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, block: Option<Block>) -> Arc<Shadow> {
+    /// A copy of `[start, start + len)` in `buffer`, system memory that
+    /// `data` maps. Where `twin` allows, the diagnostics probe moves what
+    /// shaders use to video memory (`crate::vramcopy`).
+    fn new(buffer: ID3D12Resource, data: *mut u8, start: u64, len: u64, block: Option<Block>, twin: bool) -> Arc<Shadow> {
+        #[cfg(feature = "diagnostics")]
+        // SAFETY: a live buffer.
+        let (buffer, home) = match twin.then(|| crate::vramcopy::twin(unsafe { buffer.GetDesc() }.Width)).flatten() {
+            Some(video) => (video, Some(buffer)),
+            None => (buffer, None),
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let (home, _) = (None, twin);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -251,6 +268,7 @@ impl Shadow {
             marks,
             block,
             in_place: None,
+            home,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -274,6 +292,7 @@ impl Shadow {
             marks: None,
             block: None,
             in_place: Some(o.heap),
+            home: None,
         })
     }
 
@@ -727,6 +746,10 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        #[cfg(feature = "diagnostics")]
+        if let Some(home) = &self.home {
+            crate::vramcopy::copied(&self.buffer, home, (from - start) as u64, (to - from) as u64);
+        }
         to - from
     }
 }
@@ -1039,8 +1062,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         if len >= 16 << 20 {
             tracing::info!(
                 start = format_args!("{:#x}", key.0),
@@ -1054,7 +1075,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len, None));
+        entry.shadow = Some(Shadow::new(buffer, data, key.0, len, None, true));
         changed();
     }
     entry.shadow.clone()
@@ -1082,14 +1103,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
         "loose memory copied to the host"
     );
-    let shadow = Shadow::new(buffer, data, gpu, start, len, None);
+    let shadow = Shadow::new(buffer, data, start, len, None, true);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1247,11 +1266,9 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
     };
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     // A new copy takes every page (or the whole of untracked memory) at
     // its first refresh.
-    let shadow = Shadow::new(buffer, data, gpu, address, len, block);
+    let shadow = Shadow::new(buffer, data, address, len, block, false);
     map.insert((address, len), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {

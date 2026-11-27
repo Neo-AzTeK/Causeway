@@ -73,6 +73,8 @@ mod texture;
 mod twin;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod vram;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod vramcopy;
 #[cfg(windows)]
 mod watch;
 
