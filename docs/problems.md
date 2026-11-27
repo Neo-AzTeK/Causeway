@@ -62,8 +62,14 @@ Each item names its problem in the ranked table below.
       today's cost and refresh, snapshot and copy-back go. Probes
       (`inplace.rs`, RTX 2060 SUPER) open committed pools and physical-page
       section views in placeholders, GPU writes land in place; the sized form
-      opens part of an allocation. Open: pages committed on use, views the
-      title unmaps while a heap pins them, the other adapters (caps query)
+      opens part of an allocation. Tried (`VICTORY_IN_PLACE=1`, off by
+      default): the runtime maps title memory as 64 KiB views, so the big GPU
+      heap never opened whole; and an open heap pins its view, so the
+      title's unmaps were refused while lists or slots held the copy (167 in
+      one world run), then the title crashed. Next lead: open the section
+      itself (`OpenExistingHeapFromFileMapping`), which pins no addresses;
+      title addresses then need their section offset, contiguous only where
+      the title maps pages in order
 
 ## Done lately
 

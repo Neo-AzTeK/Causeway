@@ -86,8 +86,9 @@ pub(crate) struct Opened {
     pub(crate) len: u64,
 }
 
-/// Whether title memory is opened in place: `VICTORY_IN_PLACE=1`, until runs
-/// show it safe to make the default.
+/// Whether title memory is opened in place: `VICTORY_IN_PLACE=1`. Off by
+/// default: in a world run the title unmapped views whose copies lists or
+/// slots still held, Windows refused, and the title crashed.
 fn wanted() -> bool {
     static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WANTED.get_or_init(|| std::env::var("VICTORY_IN_PLACE").is_ok_and(|v| v == "1"))
