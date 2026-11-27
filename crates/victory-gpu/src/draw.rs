@@ -1503,7 +1503,9 @@ impl State {
             // range (a shader may index past the entries its used-resource
             // list names: descriptor arrays). Either way this list reads
             // what the entries view.
-            let (first, new) = match host.find_table(&key.1) {
+            let views: Vec<Option<View>> =
+                (0..n).map(|k| crate::descriptor::view(table + u64::from(k) * 32)).collect();
+            let (first, new) = match host.find_table(&key.1, &views) {
                 Some(first) => {
                     self.shared_tables.push(key.clone());
                     (first, false)
@@ -1523,16 +1525,16 @@ impl State {
                 },
             };
             let mut complete = true;
-            for k in 0..n {
+            for (k, view) in (0..n).zip(&views) {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                match view {
                     Some(view) => {
                         if new {
-                            complete &= host.make_at(index, &view);
+                            complete &= host.make_at(index, view);
                         }
                         if let Some(u) = used {
-                            readable(list, u, &view, true);
+                            readable(list, u, view, true);
                         }
                     }
                     None => {
@@ -1548,7 +1550,7 @@ impl State {
             if new {
                 // A table with a view the host could not make yet (a
                 // texture not made) stays this list's: later draws try again.
-                if complete && host.share_table(&key.1, first, n) {
+                if complete && host.share_table(&key.1, first, n, &views) {
                     self.shared_tables.push(key.clone());
                 } else {
                     self.hold(heap_key, first, n, Use::Tables);

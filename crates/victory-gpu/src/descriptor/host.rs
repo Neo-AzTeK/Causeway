@@ -158,15 +158,33 @@ const RETRY_FRAMES: u64 = 30;
 pub(crate) type TableKey = (u64, Box<[u32]>);
 
 /// The generation fresh tables are made and shared in ([`TableKey`]): it
-/// changes with the frame, and when a title texture's memory gets a new
-/// host texture (`crate::resource`, the last count of `texture_counts`).
-/// A table made from a host copy that another has since replaced views the
-/// old one, as a list's own table did for as long as the list lived; sharing
-/// within a frame keeps that to about a list's life. Host copies change many
-/// times a frame (`crate::shadow::generation`), too often to share across.
-/// Both counts only grow, so their sum changes when either does.
+/// changes when a title texture's memory gets a new host texture
+/// (`crate::resource`, the last count of `texture_counts`). Host copies
+/// change many times a frame (`crate::shadow::generation`), too often to
+/// key tables by: a shared table is checked instead against the host
+/// resources its views read now ([`viewed_now`]).
 pub(crate) fn table_generation() -> u64 {
-    crate::frame::current() + crate::resource::texture_counts().5
+    crate::resource::texture_counts().5
+}
+
+/// The host resource (its interface pointer) a view made now reads, as
+/// [`make`] picks it: a constant or buffer view's host copy, a texture
+/// view's host texture; None where that cannot be told without making the
+/// view (a table holding one is not shared).
+fn viewed_now(view: &View) -> Option<usize> {
+    use windows::core::Interface;
+    match view {
+        &View::Constant(address, size) => {
+            Some(crate::shadow::find(address, u64::from(size))?.buffer.as_raw() as usize)
+        }
+        View::Placed(false, resource, _) if resource[0] != 1 => viewed_now(&placed_texture(view)?),
+        View::Shader(r, _) | View::Unordered(r, ..)
+            if let Some(copy) = crate::resource::host_copy(*r as crate::object::This) =>
+        {
+            Some(copy.texture.as_raw() as usize)
+        }
+        _ => Some(view_copy(view)?.0.buffer.as_raw() as usize),
+    }
 }
 
 /// Fresh tables lists share, by what they hold; those no list holds, oldest
@@ -179,13 +197,16 @@ struct Tables {
     generation: u64,
 }
 
-/// A shared fresh table: its slots, how many lists hold it, and when the
-/// last gave it up.
+/// A shared fresh table: its slots, how many lists hold it, when the last
+/// gave it up, per slot the host resource it views (0: none), and whether
+/// one of those is no longer what its view reads (not found again).
 struct Table {
     first: u32,
     n: u32,
     holders: u32,
     idle_at: u64,
+    viewed: Box<[usize]>,
+    stale: bool,
 }
 
 /// Slots of idle shared tables given back at a time when a run is wanted.
@@ -577,23 +598,48 @@ impl HostHeap {
     /// addresses, and made per list they took most of a capped heap's
     /// dynamic slots. Tables no list holds stay for later draws until their
     /// slots are wanted.
-    pub(crate) fn find_table(&self, key: &TableKey) -> Option<u32> {
-        let mut guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
-        let tables = &mut *guard;
-        if tables.generation != key.0 {
-            // Tables made from other copies and textures are not found again.
-            tables.generation = key.0;
-            let old: Vec<u64> = tables.idle.iter().filter(|(_, k)| k.0 != key.0).map(|(&at, _)| at).collect();
-            for at in old {
-                if let Some(key) = tables.idle.remove(&at)
-                    && let Some(t) = tables.made.remove(&key)
-                {
-                    self.release(t.first, t.n);
-                    held::add(held::Use::IdleTables, -i64::from(t.n));
+    /// `views`: what the table's title slots hold now, which the found
+    /// table's slots must still view.
+    pub(crate) fn find_table(&self, key: &TableKey, views: &[Option<View>]) -> Option<u32> {
+        let (first, viewed) = {
+            let mut guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+            let tables = &mut *guard;
+            if tables.generation != key.0 {
+                // Tables of earlier host textures are not found again.
+                tables.generation = key.0;
+                let old: Vec<u64> = tables.idle.iter().filter(|(_, k)| k.0 != key.0).map(|(&at, _)| at).collect();
+                for at in old {
+                    if let Some(key) = tables.idle.remove(&at)
+                        && let Some(t) = tables.made.remove(&key)
+                    {
+                        self.release(t.first, t.n);
+                        held::add(held::Use::IdleTables, -i64::from(t.n));
+                    }
                 }
             }
+            let t = tables.made.get(key).filter(|t| !t.stale)?;
+            (t.first, t.viewed.clone())
+        };
+        // Checked outside the lock: what a view reads takes other locks
+        // (copies, textures).
+        let current = viewed.len() == views.len()
+            && views.iter().zip(&viewed).all(|(v, &was)| v.as_ref().map_or(Some(0), viewed_now) == Some(was));
+        let mut guard = self.tables.lock().unwrap_or_else(|e| e.into_inner());
+        let tables = &mut *guard;
+        let t = tables.made.get_mut(key).filter(|t| t.first == first && !t.stale)?;
+        if !current {
+            // A copy or texture it views was replaced: made again by the
+            // caller, given back when no list holds it.
+            t.stale = true;
+            if t.holders == 0 {
+                let at = t.idle_at;
+                tables.idle.remove(&at);
+                let t = tables.made.remove(key)?;
+                held::add(held::Use::IdleTables, -i64::from(t.n));
+                self.release(t.first, t.n);
+            }
+            return None;
         }
-        let t = tables.made.get_mut(key)?;
         if t.holders == 0 {
             tables.idle.remove(&t.idle_at);
             held::add(held::Use::IdleTables, -i64::from(t.n));
@@ -605,11 +651,30 @@ impl HostHeap {
     }
 
     /// Lets other lists find the table the caller made in `n` dynamic slots
-    /// from `first` holding what `key` names, every view in it made: true
-    /// if the heap now holds it for the caller (given back with
-    /// [`HostHeap::drop_table`], not [`HostHeap::release`]), false if
-    /// another list made the same one first (the caller keeps its own).
-    pub(crate) fn share_table(&self, key: &TableKey, first: u32, n: u32) -> bool {
+    /// from `first` holding what `key` names from `views`, every view in it
+    /// made: true if the heap now holds it for the caller (given back with
+    /// [`HostHeap::drop_table`], not [`HostHeap::release`]); false if
+    /// another list made the same one first, or a slot views what cannot be
+    /// checked later ([`viewed_now`]): the caller keeps its own.
+    pub(crate) fn share_table(&self, key: &TableKey, first: u32, n: u32, views: &[Option<View>]) -> bool {
+        use windows::core::Interface;
+        if views.len() != n as usize {
+            return false;
+        }
+        let mut viewed = Vec::with_capacity(views.len());
+        for (k, view) in views.iter().enumerate() {
+            let Some(view) = view else {
+                viewed.push(0);
+                continue;
+            };
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner())[(first as usize) + k]
+                .as_ref()
+                .map(|(r, _)| r.as_raw() as usize);
+            match (viewed_now(view), kept) {
+                (Some(now), Some(kept)) if now == kept => viewed.push(now),
+                _ => return false,
+            }
+        }
         let mut tables = self.tables.lock().unwrap_or_else(|e| e.into_inner());
         if key.0 != tables.generation || tables.made.contains_key(key) {
             return false;
@@ -619,6 +684,8 @@ impl HostHeap {
             n,
             holders: 1,
             idle_at: 0,
+            viewed: viewed.into_boxed_slice(),
+            stale: false,
         };
         tables.made.insert(key.clone(), table);
         held::add(held::Use::Tables, i64::from(n));
@@ -635,7 +702,7 @@ impl HostHeap {
             return;
         }
         held::add(held::Use::Tables, -i64::from(t.n));
-        if key.0 == tables.generation {
+        if key.0 == tables.generation && !t.stale {
             tables.tick += 1;
             t.idle_at = tables.tick;
             tables.idle.insert(tables.tick, key.clone());
@@ -2551,35 +2618,42 @@ mod tests {
         };
         assert_eq!(heap.dynamic, MIN_DYNAMIC);
         let key = |generation: u64, word: u32| (generation, vec![word; 24].into_boxed_slice());
+        let none: Vec<Option<View>> = vec![None; 8];
         let a = key(1, 7);
         // The first list makes it, a second finds it.
-        assert_eq!(heap.find_table(&a), None);
+        assert_eq!(heap.find_table(&a, &none), None);
         let first = heap.dynamic(8).unwrap();
-        assert!(heap.share_table(&a, first, 8));
-        assert_eq!(heap.find_table(&a), Some(first), "shared");
+        assert!(heap.share_table(&a, first, 8, &none));
+        assert_eq!(heap.find_table(&a, &none), Some(first), "shared");
         let other = heap.dynamic(8).unwrap();
-        assert!(!heap.share_table(&a, other, 8), "made already: the second keeps its own");
+        assert!(!heap.share_table(&a, other, 8, &none), "made already: the second keeps its own");
         heap.release(other, 8);
         // Given up by both, it stays for a later list.
         heap.drop_table(&a);
         heap.drop_table(&a);
-        assert_eq!(heap.find_table(&a), Some(first), "kept while idle");
+        assert_eq!(heap.find_table(&a, &none), Some(first), "kept while idle");
         heap.drop_table(&a);
         // Every other slot taken: a run is had by giving the idle table back.
         let rest = heap.dynamic(MIN_DYNAMIC - 8).expect("the rest");
         assert_eq!(heap.dynamic(8), Some(first), "the idle table's slots");
-        assert_eq!(heap.find_table(&a), None, "given back");
+        assert_eq!(heap.find_table(&a, &none), None, "given back");
         heap.release(first, 8);
         // Idle tables of an earlier generation go when a later one is looked up.
         let b = key(1, 9);
-        assert_eq!(heap.find_table(&b), None);
-        assert!(heap.share_table(&b, heap.dynamic(8).unwrap(), 8));
+        assert_eq!(heap.find_table(&b, &none), None);
+        assert!(heap.share_table(&b, heap.dynamic(8).unwrap(), 8, &none));
         heap.drop_table(&b);
         let c = key(2, 9);
-        assert_eq!(heap.find_table(&c), None, "another generation's");
+        assert_eq!(heap.find_table(&c, &none), None, "another generation's");
         assert!(heap.dynamic(8).is_some(), "b's slots back");
-        assert!(!heap.share_table(&b, first, 8), "an old generation is not shared");
+        assert!(!heap.share_table(&b, first, 8, &none), "an old generation is not shared");
         heap.release(rest, MIN_DYNAMIC - 8);
+        // A view whose host resource cannot be told now (a constant buffer
+        // without a host copy) keeps its table the list's own.
+        let d = key(2, 11);
+        let one = heap.dynamic(1).unwrap();
+        assert!(!heap.share_table(&(d.0, vec![11; 3].into_boxed_slice()), one, 1, &[Some(View::Constant(0x10, 16))]));
+        assert!(!heap.share_table(&d, one, 1, &none), "views one per slot");
     }
 
     /// A capped heap's host-copy view pairs, held for a copy's life, come
