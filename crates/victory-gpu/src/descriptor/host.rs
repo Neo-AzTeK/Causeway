@@ -44,8 +44,9 @@ pub(crate) struct HostHeap {
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
     /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// (by lists not yet reset), one bit per slot: the search skips 64 taken
+    /// slots at a time (each draw searches, under this lock).
+    next: Mutex<(u32, Vec<u64>)>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -322,7 +323,7 @@ impl HostHeap {
                 served: 0,
             }),
             kept: Mutex::new(vec![None; pool.1 as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, vec![0; (extra as usize).div_ceil(64)])),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: if sampler {
                 total
@@ -403,6 +404,42 @@ impl HostHeap {
     }
 }
 
+/// The first `n` clear bits in a row within `from..to` of `bits`: their
+/// first index.
+fn first_run(bits: &[u64], from: usize, to: usize, n: usize) -> Option<usize> {
+    let mut run = 0;
+    let mut at = from;
+    while at < to {
+        let word = bits[at / 64];
+        if at.is_multiple_of(64) && at + 64 <= to && (word == u64::MAX || word == 0) {
+            run = if word == 0 { run + 64 } else { 0 };
+            at += 64;
+            if run >= n {
+                return Some(at - run);
+            }
+            continue;
+        }
+        run = if word >> (at % 64) & 1 == 1 { 0 } else { run + 1 };
+        at += 1;
+        if run == n {
+            return Some(at - n);
+        }
+    }
+    None
+}
+
+/// Sets or clears bits `from..to`.
+fn set_bits(bits: &mut [u64], from: usize, to: usize, on: bool) {
+    for at in from..to {
+        let mask = 1u64 << (at % 64);
+        if on {
+            bits[at / 64] |= mask;
+        } else {
+            bits[at / 64] &= !mask;
+        }
+    }
+}
+
 /// A plain point sampler at `at`.
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
@@ -434,26 +471,12 @@ impl HostHeap {
         let cursor = *next as usize;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        // A run cannot wrap past the end.
+        let found = first_run(taken, cursor, end, n).or_else(|| first_run(taken, 0, second_end, n));
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                let used = taken.iter().filter(|&&t| t).count();
+                let used: u32 = taken.iter().map(|w| w.count_ones()).sum();
                 tracing::warn!(
                     n,
                     used,
@@ -464,7 +487,7 @@ impl HostHeap {
             });
             return None;
         };
-        taken[first..first + n].fill(true);
+        set_bits(taken, first, first + n, true);
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -515,8 +538,8 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+        if (at as usize) < end {
+            set_bits(&mut guard.1, at as usize, end, false);
         }
     }
 
@@ -2302,6 +2325,47 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// The word-skipping search finds what a slot-by-slot one finds, on
+    /// full, empty and mixed words, runs across word edges and bounds
+    /// inside words.
+    #[test]
+    fn run_search_matches_slot_by_slot() {
+        let plain = |taken: &[bool], from: usize, to: usize, n: usize| {
+            let mut run = 0;
+            (from..to).find_map(|at| {
+                run = if taken[at] { 0 } else { run + 1 };
+                (run == n).then(|| at + 1 - n)
+            })
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..400 {
+            let len = 1 + (round * 37) % 700;
+            let mut taken = vec![false; len];
+            // Long taken and free stretches, so whole words occur.
+            let mut at = 0;
+            while at < len {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let stretch = 1 + (seed % 150) as usize;
+                let on = seed >> 40 & 3 != 0;
+                for t in &mut taken[at..(at + stretch).min(len)] {
+                    *t = on;
+                }
+                at += stretch;
+            }
+            let mut bits = vec![0u64; len.div_ceil(64)];
+            for (i, &t) in taken.iter().enumerate() {
+                set_bits(&mut bits, i, i + 1, t);
+            }
+            let cases = [(0, len, 1), (0, len, 3), (len / 3, len, 64), (len / 5, len - len / 7, 70), (1, len, 130)];
+            for (from, to, n) in cases {
+                let want = plain(&taken, from, to, n);
+                assert_eq!(first_run(&bits, from, to, n), want, "round {round} {from}..{to} n {n}");
+            }
+        }
     }
 
     #[test]
