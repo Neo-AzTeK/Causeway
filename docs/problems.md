@@ -58,15 +58,15 @@ Each item names its problem in the ranked table below.
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
 - [ ] Frame replay tool, if the owner chooses it
-- [ ] Speed and memory (`frame-preparing-cost`): the design the tests point
-      to is `docs/memory-design.md` (4 steps, being built). Step 1, the
-      changed-page count, is in and tested; two world runs show no clear
-      change in refresh batches (the spread between runs is larger), and
-      the time spent in checks is not measured yet. Step 2 was tested
-      first as a probe (`VICTORY_PROBE_VRAM_COPIES`, H6.1): copies in video
-      memory leave GPU time unchanged, so steps 2-3 are held; GPU time is
-      in the shaders themselves (H6.3-H6.6) or in correctness (H6.6).
-      Remaining hypotheses in
+- [ ] Speed and memory (`frame-preparing-cost`): the design agreed with the
+      owner is `docs/memory-design.md` (rewritten 2026-11-27): each byte
+      lives where its users are; assets stream from disk to video memory,
+      GPU-only memory lives only there, the title's pages for both stay
+      unbacked and guarded, and textures are made when read and evicted
+      when not. Next: step 0, one run measuring memory by class and owner,
+      CPU reads of loaded data, and GPU bytes per frame. Built: sections
+      used in place (median frame 500 ms against ~880-980, but 6.1 GB
+      committed up front, to decide after step 0). Remaining hypotheses in
       `docs/frame-cost.md`, one at a time, writing each result there. Order
       (cheap tests first, then by bytes touched):
       - [x] H6.2 the slow GPU copy programs read a wrong or stale count:
