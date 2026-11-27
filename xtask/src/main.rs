@@ -12,6 +12,7 @@ mod queue;
 mod report;
 mod setup;
 mod smoke;
+mod stacks;
 
 use std::path::{Path, PathBuf};
 
@@ -63,6 +64,9 @@ enum Cmd {
     /// Smoke runs requested by many sessions, run one at a time by one runner:
     /// `queue add`, `queue run`, `queue status`.
     Queue(Box<queue::Queue>),
+    /// Where the title's threads were in our code at each stack dump of a run
+    /// (`VICTORY_STACKS`), and a tally of the functions they ran or waited in.
+    Stacks(stacks::Stacks),
 }
 
 fn main() -> Result<()> {
@@ -75,6 +79,7 @@ fn main() -> Result<()> {
         Cmd::Compare(args) => compare::run(&args),
         Cmd::Dumps(args) => dumps::run(&args),
         Cmd::Queue(args) => queue::run(&root, &args),
+        Cmd::Stacks(args) => stacks::run(&args),
         Cmd::Setup { game_dir } => setup::run(&root, game_dir.as_deref()),
     }
 }
