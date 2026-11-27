@@ -1397,6 +1397,95 @@ pub(crate) mod census {
     }
 }
 
+/// Diagnostics: draw tables reaching past the host's title slots, per usage
+/// line (5 s): how many draws ask for one, at how many distinct title bases,
+/// the title slots those cover, their sizes and how many entries shaders
+/// use, bases whose contents changed within the line, and bases also seen
+/// in the line before. Sizes a mapping of those title slots shared by every
+/// list instead of tables made per list.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod past {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Line {
+        asked: u64,
+        used: u64,
+        /// Per base: entries, contents hash, contents changed.
+        bases: HashMap<u32, (u32, u64, bool)>,
+        before: HashSet<u32>,
+        lowest: u32,
+        highest: u32,
+    }
+
+    static LINE: Mutex<Option<Line>> = Mutex::new(None);
+
+    /// A draw asks for the table at title slot `base`, `n` slots of which
+    /// shaders use `used`, holding `words`.
+    pub(crate) fn note(base: u32, n: u32, used: usize, words: &[u32]) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        words.hash(&mut h);
+        let hash = h.finish();
+        let mut g = LINE.lock().unwrap_or_else(|e| e.into_inner());
+        let line = g.get_or_insert_with(|| Line { lowest: u32::MAX, ..Default::default() });
+        line.asked += 1;
+        line.used += used as u64;
+        line.lowest = line.lowest.min(base);
+        line.highest = line.highest.max(base + n);
+        let e = line.bases.entry(base).or_insert((n, hash, false));
+        e.0 = e.0.max(n);
+        if e.1 != hash {
+            e.1 = hash;
+            e.2 = true;
+        }
+    }
+
+    pub(super) fn line() -> String {
+        let mut g = LINE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(line) = g.as_mut() else {
+            return String::new();
+        };
+        let mut covered: Vec<(u32, u32)> = line.bases.iter().map(|(&b, &(n, ..))| (b, b + n)).collect();
+        covered.sort_unstable();
+        let (mut slots, mut end) = (0u64, 0u32);
+        for (b, e) in covered {
+            let from = b.max(end);
+            if e > from {
+                slots += u64::from(e - from);
+            }
+            end = end.max(e);
+        }
+        let ns: Vec<u32> = line.bases.values().map(|v| v.0).collect();
+        let sum: u64 = ns.iter().map(|&n| u64::from(n)).sum();
+        let hist = [4, 16, 64, 256, u32::MAX].map(|top| ns.iter().filter(|&&n| n <= top).count());
+        let changed = line.bases.values().filter(|v| v.2).count();
+        let again = line.bases.keys().filter(|b| line.before.contains(b)).count();
+        let mut residues: HashMap<u32, usize> = HashMap::new();
+        for &b in line.bases.keys() {
+            *residues.entry(b % 128).or_default() += 1;
+        }
+        let mut top: Vec<(usize, u32)> = residues.into_iter().map(|(r, c)| (c, r)).collect();
+        top.sort_unstable_by(|a, b| b.cmp(a));
+        top.truncate(4);
+        let text = format!(
+            "; past tables: {} asked, {} bases ({changed} changed, {again} also in the line before), \
+             {slots} title slots covered ({sum} summed), n <= 4/16/64/256/any {hist:?}, max {}, \
+             used entries per ask {:.1}, title {}..{}, base mod 128 top (count, residue) {top:?}",
+            line.asked,
+            line.bases.len(),
+            ns.iter().max().unwrap_or(&0),
+            line.used as f64 / line.asked.max(1) as f64,
+            line.lowest,
+            line.highest,
+        );
+        let before = line.bases.keys().copied().collect();
+        *line = Line { lowest: u32::MAX, before, ..Default::default() };
+        text
+    }
+}
+
 /// What the dynamic slots of title view heaps are held for (lists' tables,
 /// root-view runs and the slots used in them, UAV clears, host copies' view
 /// pairs, and the lists holding any), for the usage line
@@ -1507,9 +1596,15 @@ impl HostHeap {
         }
         tracing::info!(
             refused = ?refused,
-            "dynamic view slots: {used} of {} taken, largest free run {largest}, {runs256} free 256-runs; held: {}",
+            "dynamic view slots: {used} of {} taken, largest free run {largest}, {runs256} free 256-runs; held: {}; \
+             pool slots taken {}{}",
             self.dynamic,
-            held::line()
+            held::line(),
+            {
+                let r = self.remapped.lock().unwrap_or_else(|e| e.into_inner());
+                (r.1 - self.pool.0) as usize - r.2.len()
+            },
+            past::line()
         );
     }
 }

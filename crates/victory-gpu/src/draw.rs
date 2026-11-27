@@ -1488,6 +1488,10 @@ impl State {
                     unsafe { (at as *const [u32; 3]).read_unaligned() }
                 })
                 .collect();
+            #[cfg(feature = "diagnostics")]
+            if let Some(base) = heap.index(table) {
+                crate::descriptor::host::past::note(base, n, entries.len(), &words);
+            }
             let key = (heap_key, (crate::descriptor::host::table_generation(), words));
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
