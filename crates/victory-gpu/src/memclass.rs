@@ -197,6 +197,13 @@ struct Loads {
     destinations: std::collections::HashSet<(usize, usize)>,
     data: std::collections::HashSet<u64>,
     pages: std::collections::HashSet<usize>,
+    /// The same data to the same destination again (a retry, or a reload
+    /// into the same place), split by the time since the last: under a
+    /// second, and longer; and calls that produced less than asked.
+    pairs: HashMap<(u64, usize, usize), std::time::Instant>,
+    again_soon: u64,
+    again_later: u64,
+    short: u64,
 }
 
 static LOADS: Mutex<BTreeMap<&'static str, Loads>> = Mutex::new(BTreeMap::new());
@@ -222,6 +229,18 @@ pub fn loaded(source: &'static str, at: usize, asked: usize, got: usize, data: O
         l.same_data += 1;
         l.same_data_bytes += got as u64;
     }
+    if got < asked {
+        l.short += 1;
+    }
+    if let Some(d) = data
+        && let Some(last) = l.pairs.insert((d, at, asked), std::time::Instant::now())
+    {
+        if last.elapsed() < std::time::Duration::from_secs(1) {
+            l.again_soon += 1;
+        } else {
+            l.again_later += 1;
+        }
+    }
     let page = crate::watch::PAGE;
     l.pages.extend(at / page..at.saturating_add(asked).div_ceil(page));
 }
@@ -233,14 +252,17 @@ fn loads_window() {
         .iter()
         .map(|(s, l)| {
             format!(
-                "{s}: {} calls, asked {} MB, got {} MB, {} MB of pages, same destination {}, same data {} ({} MB)",
+                "{s}: {} calls, asked {} MB, got {} MB, {} MB of pages, same destination {}, same data {} ({} MB), same data and destination within 1 s {} and later {}, short {}",
                 l.calls,
                 mb(l.asked),
                 mb(l.got),
                 mb(l.pages.len() as u64 * crate::watch::PAGE as u64),
                 l.same_destination,
                 l.same_data,
-                mb(l.same_data_bytes)
+                mb(l.same_data_bytes),
+                l.again_soon,
+                l.again_later,
+                l.short
             )
         })
         .collect();
