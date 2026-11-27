@@ -184,7 +184,9 @@ behind one heap lock.
 totals by waiting after each list) rank first two small compute programs that
 copy buffer to buffer. Each lane copies 16 bytes per loop turn, and the byte
 count is read from a buffer. At the same group count, one dispatch takes 1 ms
-and another 1.3-1.5 s. Next come a mesh culling program written for waves of
+and another 1.3-1.5 s (that run later lost its device, see H6.6; a run without
+the loss ranks a wave-64 compute program with group memory first, then these
+copies, all under 30 ms each). Next come a mesh culling program written for waves of
 64 (up to 1.7 s per indirect draw) and a wave-64 compute program using group
 memory (up to 250 ms).
 
@@ -202,6 +204,26 @@ memory (up to 250 ms).
   lane), and its output is also cut short. This fits times that vary
   1,000-fold at the same group count. Test: log the count, read from the
   copy the GPU used, after the submission.
+  **Refuted, 2026-11-27** (`VICTORY_PROBE_COUNT`, one 200 s world run):
+  ~950 dispatches of both programs. Every count is sane: the largest copy is
+  under 8 MB, under 1 MB for most, and the loop stride constant is 64 KiB.
+  A dozen counts are all ones, which wrap to zero bytes (no work, not a long
+  loop). The slowest of these dispatches took under 30 ms, against 1.0-1.5 s
+  in the earlier run. Side finding: the counts are in the host copy only,
+  and title memory reads zero there. The GPU writes them for itself and the
+  CPU never sees them, which fits H0.1.
+- **H6.6 (impl or driver): second-long commands are device trouble, not the
+  program.** In the earlier run, commands of 0.2-1.7 s came from five
+  unrelated programs during the last minute before the device was removed.
+  In the new run, with no removal, one dispatch of yet another program took
+  2.7 s once (10 groups; 3-6 ms elsewhere). So a one-off stall lands on
+  whatever runs at that moment. Candidates: residency or paging of
+  system-memory heaps, a page fault on the GPU, or the device drifting toward
+  removal. Consequence: the per-program ranking above came from a failing
+  device. It must be redone from runs without removal, and with outliers
+  counted apart. Test: the times of the stalls against Windows' GPU paging
+  events (a GPUView or PIX capture), and against the device-removed reason
+  when there is one.
 - **H6.3 (missing): waves of 64 run as two waves of 32.** The host has no wave
   size of 64, and exchanges between lanes cost extra in translation. The
   share is unknown. Test: the same programs on an adapter with waves of 64

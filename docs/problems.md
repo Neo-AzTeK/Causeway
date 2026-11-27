@@ -49,7 +49,8 @@ Each item names its problem in the ranked table below.
 - [ ] Speed (`frame-preparing-cost`): test the hypotheses in
       `docs/frame-cost.md`, one at a time, writing each result there. Order
       (cheap tests first, then by bytes touched):
-      - [ ] H6.2 the slow GPU copy programs read a wrong or stale count
+      - [x] H6.2 the slow GPU copy programs read a wrong or stale count:
+            refuted (counts sane); second-long commands are H6.6
             (also correctness)
       - [ ] H0.2 the title's heap kind says which buffers are GPU-only: CPU
             writes into buffers on default heaps
@@ -63,6 +64,8 @@ Each item names its problem in the ranked table below.
       - [ ] H1.4 kernel read against plain copy (offline benchmark)
       - [ ] H1.5 / H5.4 the same scene with the release build
       - [ ] H6.1 one heavy pass with its buffers in video memory
+      - [ ] H6.6 second-long one-off stalls (paging, GPU faults, device
+            drift); redo the GPU ranking from runs without removal
       - [ ] H6.3 / H6.4 / H6.5 wave 64, translated code, idle gaps
       - [ ] H2.1 refresh cost per byte with and without shader writes
       - [ ] H7.1 overlap preparing with the GPU, if H0.x hold
