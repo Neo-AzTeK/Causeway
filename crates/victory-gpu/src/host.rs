@@ -2410,8 +2410,14 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
 /// page is not readable or a destination page not writable (the bytes
-/// before that page may have been copied).
+/// before that page may have been copied). Pages disk loads left without
+/// bytes are read from their loads (`crate::lazy`).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_kernel(src, dst, len) || crate::watch::read_lazy(src as usize, dst, len)
+}
+
+/// [`read`] of memory alone.
+pub(crate) fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -2782,6 +2788,7 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            tracing::info!("{}", crate::ledger::line());
             let (refused, flat_pipelines, flat_draws) = crate::pipeline::fallback_counts();
             if refused > 0 {
                 tracing::info!(

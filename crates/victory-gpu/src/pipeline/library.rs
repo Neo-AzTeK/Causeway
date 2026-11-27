@@ -309,6 +309,7 @@ pub(crate) fn save(now: bool) {
         }
         // SAFETY: plain query.
         let size = unsafe { l.library.GetSerializedSize() };
+        crate::ledger::set(crate::ledger::Owner::PipelineLibrary, size as i64);
         // A save copies the whole library (gigabytes after long runs): a big
         // one waits longer between saves during play, one second per MiB.
         let wait = std::time::Duration::from_secs((size >> 20) as u64).max(SAVE_EVERY);

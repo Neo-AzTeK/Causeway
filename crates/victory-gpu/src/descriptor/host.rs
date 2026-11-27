@@ -1046,6 +1046,8 @@ impl HostHeap {
         };
         let mut served = 0;
         for (index, handle, read) in picked {
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = read;
             // Read slots come first but share the line of the rest: past it,
             // eviction runs against textures kept resident by the heap, and
             // memory thrashes (one world run then timed out on the GPU).

@@ -346,6 +346,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::title_memory_freed(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -372,12 +373,13 @@ const PAGE: usize = 64 << 10;
 
 /// A section, the flags the title allocated its pages with, its size, and
 /// a number naming it for the process's life (the GPU side opens it whole,
-/// `victory_gpu::title_memory_section`).
+/// `victory_gpu::title_memory_section`), and whether it is committed.
 struct Section(
     HANDLE,
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] u64,
     usize,
     usize,
+    bool,
 );
 
 /// The next [`Section`] number.
@@ -390,6 +392,9 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        if self.4 {
+            victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleSections, -(self.2 as i64));
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -461,12 +466,29 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Reports writes into physical pages through our own views at every title
-/// view showing them (DirectStorage's page destinations).
-fn report_written(shown: &[usize]) {
-    for &page in shown {
-        drop(victory_gpu::kernel_will_write(page, PAGE));
-    }
+/// The addresses of title views showing each of `pages`: none for a page
+/// unknown or not mapped.
+pub(crate) fn shown_each(pages: &[usize]) -> Vec<Vec<usize>> {
+    let physical = physical();
+    pages
+        .iter()
+        .map(|p| {
+            physical
+                .pages
+                .get(p)
+                .and_then(|slice| physical.shown.get(&slice.key(0)))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Before writes into physical pages through our own views: tells every
+/// title view showing them (DirectStorage's page destinations), which
+/// also fills pages a disk load left without bytes there, so the write
+/// lands on them. Done when dropped.
+fn will_write(shown: &[usize]) -> Vec<victory_gpu::KernelWrite> {
+    shown.iter().map(|&page| victory_gpu::kernel_will_write(page, PAGE)).collect()
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -565,7 +587,10 @@ fn section(size: usize, flags: u64) -> Option<Arc<Section>> {
             )
         };
         if !handle.is_null() {
-            return Some(Arc::new(Section(handle, flags, size, SECTIONS.fetch_add(1, Ordering::Relaxed))));
+            if kind == SEC_COMMIT {
+                victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleSections, size as i64);
+            }
+            return Some(Arc::new(Section(handle, flags, size, SECTIONS.fetch_add(1, Ordering::Relaxed), kind == SEC_COMMIT)));
         }
         error = Some(std::io::Error::last_os_error());
     }
@@ -671,6 +696,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         return false;
     };
     let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
+    let _writing = will_write(&shown);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -680,7 +706,6 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    report_written(&shown);
     true
 }
 
@@ -691,14 +716,9 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
-    /// Title views showing the pages, told when the window is done.
-    shown: Vec<usize>,
-}
-
-impl Drop for PageWindow {
-    fn drop(&mut self) {
-        report_written(&self.shown);
-    }
+    /// The title views showing the pages, told before the window is
+    /// written and done with it when it goes.
+    _writing: Vec<victory_gpu::KernelWrite>,
 }
 
 impl PageWindow {
@@ -722,7 +742,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
+        _writing: will_write(&shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]))),
     })
 }
 

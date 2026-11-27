@@ -43,6 +43,10 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+pub mod lazy;
+#[cfg(windows)]
+pub mod ledger;
 pub mod list;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod memclass;
@@ -86,6 +90,6 @@ pub use host::on_failure;
 pub use inplace::title_memory_section;
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    Writing as KernelWrite, title_memory_aliased, title_memory_freed, title_memory_lazy, title_memory_remapped,
     kernel_will_write,
 };

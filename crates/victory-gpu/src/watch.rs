@@ -34,6 +34,10 @@
 //! DirectStorage writing pages through views of the runtime's own reports
 //! the addresses showing them as written.
 //!
+//! Pages disk loads left without bytes (`crate::lazy`) are guarded without
+//! any access and counted as guarded: an access fills them first
+//! ([`fill`]), our reads take their bytes from the load ([`read_lazy`]).
+//!
 //! shortcut: a system call writing into a guarded block fails; the known
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
 //! and allocated again while a tracker holds it is not seen.
@@ -111,6 +115,10 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// Pages left without bytes by disk loads (`crate::lazy`), with no
+    /// access, and where in their load each starts. Each is in
+    /// `protected` too.
+    lazy: BTreeMap<usize, (Arc<crate::lazy::Load>, usize)>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -126,6 +134,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    lazy: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -291,6 +300,10 @@ impl Drop for Tracked {
 /// Gives write access back to page `page` if we guarded it.
 fn open(g: &mut Guards, page: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    // A write is coming: the page takes its load's bytes first.
+    if let Some(entry) = g.lazy.remove(&page) {
+        fill(g, page, entry);
+    }
     if !g.protected.remove(&page) {
         return false;
     }
@@ -300,6 +313,171 @@ fn open(g: &mut Guards, page: usize) -> bool {
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::OpenPages, 1);
     true
+}
+
+/// Sets the protection of page `page`.
+fn set_protection(page: usize, protection: u32) -> bool {
+    use windows_sys::Win32::System::Memory::VirtualProtect;
+    let mut old = 0;
+    // SAFETY: title memory; only its protection changes (failing
+    // harmlessly if it is gone).
+    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, protection, &mut old) != 0 }
+}
+
+/// Fills page `page`, which a disk load left without bytes and whose entry
+/// was just taken out of `lazy`, from that load, leaving it read-write.
+/// Addresses showing the same physical page (`alias_of`) left without
+/// bytes by the same load now show the bytes too: their entries go, and
+/// they are guarded as other pages ([`settle`]).
+fn fill(g: &mut Guards, page: usize, (load, at): (Arc<crate::lazy::Load>, usize)) {
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    use crate::ledger::{Owner, add};
+    add(Owner::LazyPages, -(PAGE as i64));
+    add(Owner::LazyFilled, PAGE as i64);
+    if !set_protection(page, PAGE_READWRITE) {
+        return;
+    }
+    // SAFETY: a committed page we just made read-write; the title's
+    // threads that touch it wait in our handler for the guard lock.
+    let out = unsafe { std::slice::from_raw_parts_mut((page * PAGE) as *mut u8, PAGE) };
+    if !load.bytes(at, out) {
+        tracing::warn!(page = format_args!("{:#x}", page * PAGE), "a disk load's bytes could not be read again: zeros");
+        out.fill(0);
+    }
+    let others = g.alias_of.get(&page).cloned().unwrap_or_default();
+    for other in others {
+        if g.lazy.get(&other).is_some_and(|(l, a)| Arc::ptr_eq(l, &load) && *a == at) {
+            g.lazy.remove(&other);
+            add(Owner::LazyPages, -(PAGE as i64));
+            settle(g, other);
+        }
+    }
+}
+
+/// After [`fill`] outside a write: a page trackers hold stays guarded
+/// (read-only), others become plain read-write memory.
+fn settle(g: &mut Guards, page: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    if g.holders.contains_key(&page) {
+        set_protection(page, PAGE_READONLY);
+    } else {
+        g.protected.remove(&page);
+        set_protection(page, PAGE_READWRITE);
+    }
+}
+
+/// A disk load (`load`) leaves the title page at `at` without bytes; its
+/// bytes are `[offset, offset + PAGE)` of the load. What trackers hold of
+/// the page is stale, as before a write. False if the page cannot be left
+/// so (a write under way, not committed, or the protection failed): the
+/// caller writes it then. The runtime calls it for every address showing
+/// the page.
+pub fn title_memory_lazy(load: &Arc<crate::lazy::Load>, at: usize, offset: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{DiscardVirtualMemory, PAGE_NOACCESS};
+    // Only the runtime's GPU memory: its views, and its write-watched
+    // pools (the C heap's own accesses must never fault here). Asked
+    // without `VirtualQuery`, which walks a whole view ([`allocation`]).
+    let ours = match allocation(at) {
+        Some((_, false)) => true,
+        Some((_, true)) => runtime_memory(at, false),
+        None => false,
+    };
+    if !at.is_multiple_of(PAGE) || !ours {
+        return false;
+    }
+    // The handler fills it on access.
+    install();
+    let page = at / PAGE;
+    let mut g = guards();
+    if g.busy.iter().any(|&(a, b)| (a..b).contains(&page)) {
+        return false;
+    }
+    // Loaded over again: the older load's bytes are not wanted.
+    if g.lazy.remove(&page).is_some() {
+        crate::ledger::add(crate::ledger::Owner::LazyPages, -(PAGE as i64));
+    }
+    changed_here(&mut g, page, page + 1, true);
+    // What the page held goes back to the system; the protection below
+    // keeps it from being read before it is filled.
+    // SAFETY: a committed title page whose bytes are replaced.
+    unsafe { DiscardVirtualMemory(at as *mut _, PAGE) };
+    // Fails where nothing is committed: the caller writes it then.
+    if !set_protection(page, PAGE_NOACCESS) {
+        return false;
+    }
+    g.protected.insert(page);
+    g.lazy.insert(page, (load.clone(), offset));
+    crate::ledger::add(crate::ledger::Owner::LazyPages, PAGE as i64);
+    true
+}
+
+/// The runtime releases the title reservation holding `at`: pages disk
+/// loads left without bytes there go without being filled, and are no
+/// longer guarded (the addresses may hold other memory later).
+pub fn title_memory_freed(at: usize) {
+    let Some((end, _)) = allocation(at) else {
+        return;
+    };
+    let mut g = guards();
+    let pages: Vec<usize> = g.lazy.range(at / PAGE..end.div_ceil(PAGE)).map(|(&p, _)| p).collect();
+    for page in pages {
+        g.lazy.remove(&page);
+        g.protected.remove(&page);
+        crate::ledger::add(crate::ledger::Owner::LazyPages, -(PAGE as i64));
+    }
+}
+
+/// Reads title memory `[src, src + len)` into `dst` where disk loads left
+/// pages without bytes, taking those from their loads and the rest from
+/// memory: what a kernel read that stopped at such a page reads. False if
+/// no page of the range was left so, or a piece cannot be read.
+pub(crate) fn read_lazy(src: usize, dst: *mut u8, len: usize) -> bool {
+    let entries: Vec<(usize, Arc<crate::lazy::Load>, usize)> = {
+        let g = guards();
+        if g.lazy.is_empty() {
+            return false;
+        }
+        g.lazy
+            .range(src / PAGE..src.saturating_add(len).div_ceil(PAGE))
+            .map(|(&p, (l, a))| (p, l.clone(), *a))
+            .collect()
+    };
+    if entries.is_empty() {
+        return false;
+    }
+    let (mut at, end) = (src, src + len);
+    while at < end {
+        let page = at / PAGE;
+        let to = ((page + 1) * PAGE).min(end);
+        // SAFETY: the caller's destination holds `len` bytes.
+        let out = unsafe { std::slice::from_raw_parts_mut(dst.add(at - src), to - at) };
+        let read = match entries.iter().find(|e| e.0 == page) {
+            Some((_, load, offset)) => load.bytes(offset + at % PAGE, out),
+            None => crate::host::read_kernel(at as *const u8, out.as_mut_ptr(), out.len()),
+        };
+        if !read {
+            return false;
+        }
+        at = to;
+    }
+    true
+}
+
+/// Fills the pages of `[at, at + len)` disk loads left without bytes: the
+/// GPU is about to read that memory where it lies (copies used in place,
+/// `crate::inplace`).
+pub(crate) fn fill_lazy(at: usize, len: usize) {
+    let mut g = guards();
+    if g.lazy.is_empty() {
+        return;
+    }
+    let pages: Vec<usize> = g.lazy.range(at / PAGE..at.saturating_add(len).div_ceil(PAGE)).map(|(&p, _)| p).collect();
+    for page in pages {
+        if let Some(entry) = g.lazy.remove(&page) {
+            fill(&mut g, page, entry);
+            settle(&mut g, page);
+        }
+    }
 }
 
 impl Tracked {
@@ -704,6 +882,25 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::forget(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    // A page a disk load left without bytes that another address still
+    // shows, left so by the same load, keeps its bytes there; the others
+    // are filled before they go (`open`, below): the physical page may be
+    // mapped again later.
+    let lazy: Vec<usize> = g.lazy.range(first..last).map(|(&p, _)| p).collect();
+    for page in lazy {
+        let (load, offset) = g.lazy[&page].clone();
+        let shown = g.alias_of.get(&page).is_some_and(|others| {
+            others.iter().any(|o| {
+                !(first..last).contains(o)
+                    && g.lazy.get(o).is_some_and(|(l, a)| Arc::ptr_eq(l, &load) && *a == offset)
+            })
+        });
+        if shown {
+            g.lazy.remove(&page);
+            g.protected.remove(&page);
+            crate::ledger::add(crate::ledger::Owner::LazyPages, -(PAGE as i64));
+        }
+    }
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
@@ -735,6 +932,18 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             }
         }
     }
+    // Shows a page a disk load left without bytes: left so here too.
+    let lazy = others.iter().find_map(|&o| g.lazy.get(&(o / PAGE)).cloned());
+    if let Some(entry) = lazy {
+        use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+        if set_protection(page, PAGE_NOACCESS) {
+            g.protected.insert(page);
+            if g.lazy.insert(page, entry).is_none() {
+                crate::ledger::add(crate::ledger::Owner::LazyPages, PAGE as i64);
+            }
+            return;
+        }
+    }
     if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
         protect(&mut g, &[page]);
     }
@@ -752,19 +961,33 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // Reads and other faults are ours only while loads left pages
+        // without bytes: the lock is not taken for others (a fault in code
+        // holding it would wait forever).
+        if r.ExceptionInformation[0] != WRITE && crate::ledger::bytes(crate::ledger::Owner::LazyPages) <= 0 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
-        // Held across both checks: another thread may have opened the block
+        // Held across all checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
+        // Any access to a page a disk load left without bytes fills it; a
+        // write then faults again on the guard as any other.
+        if let Some(entry) = g.lazy.remove(&(at / PAGE)) {
+            fill(&mut g, at / PAGE, entry);
+            settle(&mut g, at / PAGE);
+            crate::ledger::add(crate::ledger::Owner::LazyFaults, PAGE as i64);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if r.ExceptionInformation[0] != WRITE {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -934,6 +1157,64 @@ pub(crate) mod tests {
         title_memory_remapped(p, PAGE);
         assert!(a.changed(p / PAGE) && !a.changed(p / PAGE + 1));
         drop((a, b));
+        free(p);
+    }
+
+    /// Pages a disk load leaves without bytes: changed for trackers, read
+    /// from the load by our reads without being filled, filled by a title
+    /// access (then guarded as before), and filled before our writes.
+    #[test]
+    fn pages_left_without_bytes_fill_on_access() {
+        struct Pattern;
+        impl crate::lazy::Source for Pattern {
+            fn size(&self) -> usize {
+                2 * PAGE
+            }
+            fn whole(&self) -> bool {
+                false
+            }
+            fn read(&self, at: usize, out: &mut [u8]) -> bool {
+                for (i, b) in out.iter_mut().enumerate() {
+                    *b = ((at + i) % 251) as u8;
+                }
+                true
+            }
+        }
+        let byte = |at: usize| (at % 251) as u8;
+        let p = pool(3);
+        let t = track(p, 3 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p, p + 3 * PAGE)]);
+        let load = crate::lazy::Load::new(Box::new(Pattern));
+        assert!(title_memory_lazy(&load, p + PAGE, 0));
+        assert!(title_memory_lazy(&load, p + 2 * PAGE, PAGE));
+        assert!(!title_memory_lazy(&load, p + 5, 0), "not a page start");
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p + PAGE, p + 3 * PAGE)], "loaded pages changed");
+        // Our read: page 0 from memory, the others from the load.
+        let mut out = vec![9u8; 3 * PAGE - 10];
+        assert!(crate::host::read_into((p + 10) as *const u8, &mut out));
+        assert_eq!(out[0], 0);
+        assert_eq!(out[PAGE - 10 + 3], byte(3));
+        assert_eq!(out[2 * PAGE - 10 + 7], byte(PAGE + 7));
+        assert!(guards().lazy.contains_key(&(p / PAGE + 1)), "a read does not fill");
+        // SAFETY: a committed page of ours without access: the handler
+        // fills it.
+        let v = unsafe { ((p + 2 * PAGE + 7) as *const u8).read_volatile() };
+        assert_eq!(v, byte(PAGE + 7));
+        assert!(!guards().lazy.contains_key(&(p / PAGE + 2)));
+        // Tracked, so guarded again: a write is seen.
+        // SAFETY: as above, now read-only.
+        unsafe { ((p + 2 * PAGE + 7) as *mut u8).write_volatile(1) };
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p + 2 * PAGE, p + 3 * PAGE)]);
+        // Our write fills the page first.
+        drop(writing(p + PAGE + 1, 1));
+        // SAFETY: filled and open now.
+        assert_eq!(unsafe { ((p + PAGE + 2) as *const u8).read_volatile() }, byte(2));
+        assert!(guards().lazy.is_empty() || !guards().lazy.range(p / PAGE..p / PAGE + 3).any(|_| true));
+        // A reservation released with pages left so drops them unfilled.
+        assert!(title_memory_lazy(&load, p + PAGE, 0));
+        title_memory_freed(p);
+        assert!(!guards().lazy.range(p / PAGE..p / PAGE + 3).any(|_| true));
+        drop(t);
         free(p);
     }
 

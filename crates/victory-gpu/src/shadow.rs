@@ -96,6 +96,7 @@ fn give_back(v: Vec<u8>) {
         total += v.capacity();
         total <= POOL_BYTES
     });
+    crate::ledger::set(crate::ledger::Owner::SnapshotPool, pool.iter().map(Vec::capacity).sum::<usize>() as i64);
 }
 
 /// Snapshot memory kept for reuse.
@@ -239,6 +240,9 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.in_place.is_some() {
+            // The GPU reads it where it lies: pages disk loads left
+            // without bytes take them first.
+            crate::watch::fill_lazy(self.start as usize, self.len as usize);
             list.keep_in_place(self);
             return;
         }
@@ -260,6 +264,7 @@ impl Shadow {
         let (home, _) = (None, twin);
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        crate::ledger::add(crate::ledger::Owner::BufferCopies, len as i64);
         let tracked = crate::watch::track(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -349,6 +354,7 @@ impl Shadow {
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         // Written in place: nothing to snapshot or copy back.
         if self.in_place.is_some() {
+            crate::watch::fill_lazy(self.start as usize, self.len as usize);
             list.keep_in_place(self);
             return;
         }
@@ -769,6 +775,9 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.in_place.is_none() {
+            crate::ledger::add(crate::ledger::Owner::BufferCopies, -(self.len as i64));
+        }
         if let Some(base) = self.marks {
             let mut m = marks();
             m.owners.remove(&base);
