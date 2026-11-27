@@ -49,6 +49,13 @@ pub const PROFILES: &[Profile] = &[
     documented(nvidia_ampere),
     documented(nvidia_ada),
     documented(nvidia_blackwell),
+    Profile {
+        caps: amd_rdna2_vkd3d,
+        source: Source::Logged {
+            adapter: "AMD Radeon RX 6800S (RADV NAVI23)",
+            date: "2026-11-27",
+        },
+    },
 ];
 
 fn base(name: &str, vendor_id: u32, wave: (u32, u32), tiers: (u8, u8, u8)) -> Caps {
@@ -178,6 +185,31 @@ pub fn nvidia_generations() -> Vec<Caps> {
 /// AMD RDNA2/3 class: wave32 or wave64 at the driver's choice.
 pub fn amd_rdna() -> Caps {
     Caps { typed_atomics64: Some(true), heap_atomics64: Some(true), ..base("amd-rdna", 0x1002, (32, 64), (3, 3, 1)) }
+}
+
+/// AMD RDNA2 under Wine: D3D12 through vkd3d-proton on Mesa RADV (Linux), a
+/// laptop RX 6800S (Navi 23, 8 GiB). Read from `Caps::probe` (`{:#?}`); the
+/// tiers and shader model are what vkd3d-proton reports, not AMD's Windows
+/// driver, so they may differ from the same card on Windows (`amd_rdna`).
+pub fn amd_rdna2_vkd3d() -> Caps {
+    Caps {
+        adapter: AdapterInfo {
+            name: "amd-rdna2-vkd3d".into(),
+            vendor_id: 0x1002,
+            device_id: 0x73ef,
+            ..AdapterInfo::default()
+        },
+        shader_model: Some(ShaderModel(0x68)),
+        typed_atomics64: Some(true),
+        heap_atomics64: Some(true),
+        aniso_point_mip: Some(true),
+        memory: MemoryCaps {
+            budget: Some(8_556_404_736),
+            dedicated: 8_573_157_376,
+            shared: 7_969_656_832,
+        },
+        ..base("amd-rdna2-vkd3d", 0x1002, (32, 64), (3, 4, 1))
+    }
 }
 
 /// AMD GCN class: wave64 only.

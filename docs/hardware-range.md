@@ -75,7 +75,8 @@ budget.
 `reference::all()`: the NVIDIA generations (`nvidia_maxwell`, `nvidia_pascal`
 = the owner's GTX 1070, `nvidia_turing`, `nvidia_ampere`, `nvidia_ada`,
 `nvidia_blackwell`; the side case `nvidia_maxwell1`, first-generation Maxwell
-at binding tier 2; `nvidia_modern` is the class name older tests use), `amd_rdna` (waves 32 to 64), `amd_gcn` (wave64 only),
+at binding tier 2; `nvidia_modern` is the class name older tests use), `amd_rdna` (waves 32 to 64), `amd_rdna2_vkd3d` (an RX 6800S read
+under Wine/vkd3d-proton), `amd_gcn` (wave64 only),
 `intel_arc` (8 to 32), `intel_igpu` (UMA, 128 MiB "dedicated"), `warp`.
 Each entry of `reference::PROFILES` carries the `Source` of its figures
 (documentation and inference, or a real device's log with its date); check it
