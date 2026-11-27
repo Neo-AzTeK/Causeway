@@ -21,16 +21,14 @@ Each item names its problem in the ranked table below.
       is not caught. Not proven: first log any guard on a view the runtime
       did not report; low memory could also fail the lock
 
-- [ ] A new session confirms `descriptor-slots` on `main` (merged;
-      `/problem-session confirm descriptor-slots`).
-      A capped view heap's pool now shares the lists' dynamic slots, and
-      the title's table slots past the cap take no pool slot: no draw lost
-      for lack of slots in quiet world runs on the GTX 1070. Also answer
-      whether the merge raised refusals: one pixel shader refused for "a
-      descriptor read only as data" lost more draws per frame on the branch
-      than on main, and one branch run counted more refused work than main's
-      spread. Guess, not proven: on main those draws were already dropped
-      earlier, counted as slot drops
+- [x] `descriptor-slots` confirmed on `main`: two quiet world runs lose no
+      draw for lack of slots. The merge did not raise refusals. The pixel
+      programs refused for "a descriptor read only as data" are counted
+      under their own reason on every path, before and after the merge, and
+      lose the same per frame whenever they are on screen. Runs differ only
+      in how long that content stays on screen (same commit: short in one
+      run, long in the next). Refused work without them is the same on
+      both sides (problem notes, "Confirm: refusal shift")
 - [ ] The title's code wrote to memory reserved but never committed and the
       run stopped (0xc0000005 in the title's image, one quiet run of `main`
       before the `descriptor-slots` merge; `image-uncommitted-write`). Find
@@ -114,7 +112,7 @@ measure what the picture loses.
 | 1 | `scene-blocker` | which loss keeps the 3D scene from showing is unknown; the answer ranks the rest | unknown |
 | 2 | `placed-texture-slots` | heap-indexing shaders read an empty slot where the title placed a texture: most 3D surfaces have no base colour | causal by white substitution (main-pass black 65% to 39%, 49% to 10%); real textures not tried |
 | 3 | `wave64-refusals` | compute needing waves of 64 is refused: most refused pipelines in world runs | counts measured; picture effect a guess |
-| 4 | `descriptor-slots` | draws and dispatches dropped for lack of descriptor slots; a large share of drops | fixed in `main`, proven on the GTX 1070 (capped heap), not confirmed yet; picture effect a guess |
+| 4 | `descriptor-slots` | draws and dispatches dropped for lack of descriptor slots; a large share of drops | fixed in `main`, confirmed on the GTX 1070 (capped heap); an uncapped host (AMD) not run; picture effect a guess |
 | 5 | `mesh-pipeline-invalid` | a mesh pipeline the host rejects loses many indirect draws in some runs, almost none in others | cause unknown |
 | 6 | `gpu-long-dispatch` | evicting idle host textures that bindless shaders still write hung the GPU seconds into most world runs (fixed on main by fdc72fc: idle textures are lowered in priority, not evicted) | shown by 600 s runs: no such hang in 11 fix runs; main 0 of 2 past 11 s |
 | 7 | `gpu-long-lists` | emulated mesh draws and the ray-tracing BVH builder's compute run for seconds in one list and trip the GPU timeout, in about half the world runs once the eviction hang is gone | GPU times and pixel counts measured; lead: loops cut at the 64-iteration limit make layered full-screen draws (one run without the cap had none) |
