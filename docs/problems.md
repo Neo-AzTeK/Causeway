@@ -38,8 +38,8 @@ Each item names its problem in the ranked table below.
 - [ ] Waves of 64: the unmerged branch with several console waves per group
       (`wave64-refusals`; needs the owner's OK to take it over)
 - [ ] Refusals with no fix found yet (`untranslated-shaders`): structured
-      buffer of unknown stride; a descriptor read as data (first settle whether
-      it is descriptor work, which another owner has)
+      buffer of unknown stride; a descriptor read as data (may need the
+      descriptor heap's contents; that work is ours too)
 - [ ] Look for fixes in forks not yet checked: `avatarmanz/VIctory-7900XTX`,
       `DexNom/VIctory`
 - [ ] Reach one fixed test scene that every run can repeat (`scene-blocker`)

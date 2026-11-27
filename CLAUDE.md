@@ -41,6 +41,12 @@ and ask the owner for the title's folder if none is set.
   test, or when the owner asks. No agents by default.
 - Before working on a listed problem that has notes, also after compaction or
   a pause: `cargo xtask problem resume <id>` and read them.
+- One place per kind of note, so old notes cannot contradict new ones: live
+  state and todo only in `docs/problems.md`, a problem's running notes only in
+  `cargo xtask problem`; agent memory holds only owner rules, machine-local
+  paths and never-push lists, not branch tips or session logs. When a rule
+  changes, edit or delete the old note in the same step; do not add a
+  "superseded" note beside it.
 - Merge only on the owner's explicit yes; push only with their OK.
 - Grep, then read at most 150 lines; never a source file over 800 lines whole
   (`lower.rs`); at most 60 lines of output per command; do not re-read a file
