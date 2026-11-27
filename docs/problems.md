@@ -37,10 +37,10 @@ Each item names its problem in the ranked table below.
       the stack's top. Find where the bad index came from; the crash report
       now names the reservation, the thread's stack and what the registers
       point at, for the next time it happens
-- [ ] `victory-shader` test `direct_barycentrics_weigh_the_second_and_third_vertex`
-      fails on a host without barycentrics (GTX 1070: making its pipeline is
-      refused) instead of skipping; seen on `main` and branches alike (no
-      ranked problem: test hygiene, `docs/hardware-range.md`)
+- [x] `victory-shader` test `direct_barycentrics_weigh_the_second_and_third_vertex`
+      failed on a host without barycentrics (GTX 1070) instead of skipping;
+      fixed on branch `claude/bary-test-skip-8f4ace` (`Host::has_barycentrics`,
+      the test skips with a message); not yet on `main`
 
 - [ ] Find the pass that should put lit people and ground into the scene's
       colour before tonemap (`scene-blocker`). Traced on the newest build:
