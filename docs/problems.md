@@ -25,7 +25,16 @@ Each item names its problem in the ranked table below.
       `/problem-session confirm descriptor-slots`).
       A capped view heap's pool now shares the lists' dynamic slots, and
       the title's table slots past the cap take no pool slot: no draw lost
-      for lack of slots in quiet world runs on the GTX 1070
+      for lack of slots in quiet world runs on the GTX 1070. Also answer
+      whether the merge raised refusals: one pixel shader refused for "a
+      descriptor read only as data" lost more draws per frame on the branch
+      than on main, and one branch run counted more refused work than main's
+      spread. Guess, not proven: on main those draws were already dropped
+      earlier, counted as slot drops
+- [ ] The title's code wrote to memory reserved but never committed and the
+      run stopped (0xc0000005 in the title's image, one quiet run of `main`
+      before the `descriptor-slots` merge; `image-uncommitted-write`). Find
+      which reservation and who should have committed it
 - [ ] `victory-shader` test `direct_barycentrics_weigh_the_second_and_third_vertex`
       fails on a host without barycentrics (GTX 1070: making its pipeline is
       refused) instead of skipping; seen on `main` and branches alike (no
@@ -118,6 +127,7 @@ measure what the picture loses.
 | 14 | `device-methods-missing` | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
 | 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charges the rest of the list to its last timed command, so slow-command lines mislead on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list |
 | 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay (rank not confirmed by the owner) | seen twice on 2026-11-27 on the GTX 1070; both dumps: `dxgmms2!VIDMM_GLOBAL::EnsureLockedPages` after a failed lock of our process's pages, during an eviction from a system-memory segment; which pages, not known |
+| 17 | `image-uncommitted-write` | the title's code wrote to an address reserved but never committed and the run stopped with an access violation (rank not confirmed by the owner) | seen once on 2026-11-27, in a quiet run of `main`; cause unknown |
 
 ## Finding what keeps the 3D scene from showing
 
