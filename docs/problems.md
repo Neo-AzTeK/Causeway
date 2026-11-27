@@ -14,9 +14,11 @@ Each item names its problem in the ranked table below.
 - [ ] Title crash (a write to address zero in the title's code) at a captured
       frame when render targets are dumped: comes with detiling on the host
       GPU (`a69a361`); its parent runs clean, and the same build without the
-      dumps runs clean. Why is not found. Until fixed, scene work needs the
-      commit before it or runs without dumps (`scene-blocker`; a problem of
-      its own if the owner agrees)
+      dumps runs clean. Likely why, from the code and the runs, fix not tried:
+      a submission keeps the conversion lists' lock to its end, and a dump
+      made at that end submits again and waits on the same lock. Until fixed,
+      scene work needs the commit before it or runs without dumps
+      (`scene-blocker`; a problem of its own if the owner agrees)
 - [ ] Owner decides how the original project's later updates come in: one
       commit at a time, or squashed; cleaned either way
 - [ ] Game run that includes the newest shader fix (lane mask joined with data)
