@@ -2798,6 +2798,7 @@ impl Meter {
                 let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
                 crate::copystat::log(copy_frames);
                 crate::bindless::log(copy_frames);
+                crate::levels::sample();
                 crate::shadow::log_views(copy_frames);
                 crate::vramcopy::log(copy_frames);
                 let [refused, compiling, other] =

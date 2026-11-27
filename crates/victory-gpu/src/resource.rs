@@ -791,6 +791,10 @@ pub(crate) struct HostTexture {
     /// When a list or a view last reached it ([`now_ms`]); shared with its
     /// [`LIVE`] entry.
     last_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The title memory and console layout it was made for
+    /// (`crate::levels`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) title: std::sync::OnceLock<(u64, victory_formats::texture::Layout)>,
 }
 
 /// Host textures in video memory only once the GPU may reach them. The
@@ -1017,6 +1021,8 @@ impl HostTexture {
             used: false.into(),
             residency,
             last_used,
+            #[cfg(feature = "diagnostics")]
+            title: std::sync::OnceLock::new(),
         }
     }
 
@@ -1024,6 +1030,12 @@ impl HostTexture {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Whether it is resident now ([`residency`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn resident(&self) -> bool {
+        self.residency.load(std::sync::atomic::Ordering::Acquire) != NOT_RESIDENT
     }
 
     /// A submission holds it: stamped as used now and resident again if
@@ -1463,6 +1475,7 @@ fn shared_texture(
     if let Some(tex) = texture_layout(desc) {
         let plane = &tex.planes[0];
         crate::levels::count("made", (address + plane.offset) as *const u8, &plane.layout, t.bytes);
+        let _ = t.title.set((address + plane.offset, plane.layout.clone()));
     }
     if let Some(k) = key {
         if live.is_some() {
@@ -1475,6 +1488,13 @@ fn shared_texture(
         map.insert(k, std::sync::Arc::downgrade(&t));
     }
     Some(t)
+}
+
+/// Live host textures made for title memory (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn titled() -> Vec<std::sync::Arc<HostTexture>> {
+    let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref().map_or_else(Vec::new, |m| m.values().filter_map(std::sync::Weak::upgrade).collect())
 }
 
 /// Whether host texture `t` takes a title texture of host description

@@ -98,6 +98,56 @@ pub(crate) fn count(moment: &'static str, memory: *const u8, layout: &Layout, ho
     }
 }
 
+/// Whether the resident sample is on (`VICTORY_PROBE_LEVELS=1`; it asks
+/// the kernel about every level of every live host texture).
+fn sampled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PROBE_LEVELS").is_ok_and(|v| v == "1"))
+}
+
+/// With the host textures line: of the resident host textures made for
+/// title memory, the host bytes in levels the title has not mapped now,
+/// and how many of those textures hold no level at all.
+pub(crate) fn sample() {
+    if !sampled() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (mut textures, mut host, mut unheld, mut empty) = (0u64, 0u64, 0u64, 0u64);
+    for t in crate::resource::titled() {
+        let Some((address, layout)) = t.title.get() else { continue };
+        if !t.resident() || layout.mips.is_empty() {
+            continue;
+        }
+        let spans = spans(layout);
+        let held = held(*address as *const u8, layout);
+        let mut seen = std::collections::BTreeSet::new();
+        let (mut all, mut not) = (0u64, 0u64);
+        for (&(start, end), &h) in spans.iter().zip(&held) {
+            if seen.insert(start) {
+                all += end - start;
+                if !h {
+                    not += end - start;
+                }
+            }
+        }
+        textures += 1;
+        host += t.bytes();
+        if all > 0 {
+            unheld += (u128::from(t.bytes()) * u128::from(not) / u128::from(all)) as u64;
+        }
+        if held.iter().all(|&h| !h) {
+            empty += 1;
+        }
+    }
+    tracing::info!(
+        "levels not mapped (probe), resident now: {textures} textures, {} MB of {} MB host bytes; {empty} hold no level; sampled in {:.1} ms",
+        unheld >> 20,
+        host >> 20,
+        started.elapsed().as_secs_f64() * 1e3,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
