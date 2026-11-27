@@ -20,7 +20,8 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else [`MIN_DYNAMIC`]; in a capped view
+    /// heap [`REMAP_SLOTS`] more, which its pool slots come from.
     dynamic: u32,
     sampler: bool,
     /// The title heap's slots: more than `count` in a view heap the host
@@ -28,13 +29,18 @@ pub(crate) struct HostHeap {
     title_count: u32,
     /// The heap's slots.
     total: u32,
-    /// The pool slots (start, end): [`REMAP_SLOTS`] after the dynamic ones
-    /// in a capped view heap, else none (both the dynamic slots' end).
-    pool: (u32, u32),
     /// Capped view heaps: per title slot from `count` on, the pool slot it
-    /// is made in (0: none); the pool slot next never taken, those given
-    /// back.
-    remapped: Mutex<(Vec<u32>, u32, Vec<u32>)>,
+    /// is made in (0: none), and how many it has. Pool slots are dynamic
+    /// ones, single and taken from the range's top, [`REMAP_SLOTS`] at
+    /// most, so lists keep [`MIN_DYNAMIC`] at least; the pool has what
+    /// lists leave (tens of slots in the world, thousands at the menus).
+    /// Locked before `next`.
+    remapped: Mutex<(Vec<u32>, u32)>,
+    /// Pool slots given up, with the [`crate::host::quiet_points`] count
+    /// then: taken again only after the GPU work running then has run (a
+    /// shader of a running submission may still read one through its remap
+    /// entry). Locked after `remapped` and `next`.
+    retired: Mutex<Vec<(u64, u32)>>,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Made>,
     /// The host resource each slot views, held while the slot does: shaders
@@ -43,9 +49,10 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Where the search for free dynamic slots starts, which are taken (by
+    /// lists not yet reset, pairs, pool slots), and where the search from
+    /// the range's top end down starts.
+    next: Mutex<(u32, Vec<bool>, u32)>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -104,8 +111,9 @@ pub(crate) fn near_heaps(va: u64) -> String {
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Per title slot: the record (view index and generation) it was last made
-/// from, 0 for none; and whether that view was left for draws to make
-/// (`HostHeap::mirror`'s postponed placed textures).
+/// from or, a table's slot past a capped heap's own, noted for
+/// ([`HostHeap::tabled`]), 0 for none; and whether that view was left for
+/// draws to make (`HostHeap::mirror`'s postponed placed textures).
 struct Made {
     keys: Vec<u64>,
     postponed: Vec<bool>,
@@ -140,6 +148,12 @@ struct Waiting {
 /// VIctory-Belobug-AMD (descriptor/host.rs, GPL-3.0-or-later).
 const TABLED_FRAMES: u64 = 240;
 const TABLED_GRACE: u64 = 8;
+/// Whether a slot last read through a table at `stamp` ([`Made::tabled`])
+/// counts as a table's in `frame` ([`TABLED_FRAMES`]).
+fn lately(stamp: u32, frame: u64) -> bool {
+    stamp != 0 && u64::from((frame as u32).wrapping_sub(stamp - 1)) <= TABLED_FRAMES
+}
+
 /// Slots the queue makes in one frame at most, per heap: making a host
 /// texture and uploading it costs time in the frame that does it.
 const SERVED_PER_FRAME: usize = 256;
@@ -165,7 +179,9 @@ const MIN_DYNAMIC: u32 = 1 << 16;
 const PAIR_SLOTS: u32 = 1 << 15;
 
 /// Pool slots of a view heap the host caps, for the title slots past its
-/// own that hold a view; sized above the most one world run was seen to use.
+/// own that hold a view shaders may pick by index; sized above the most one
+/// world run was seen to use. They are dynamic slots, which lists' tables
+/// have while the pool does not.
 const REMAP_SLOTS: u32 = 1 << 15;
 
 /// Slots at the end of a view heap that are neither the title's nor a
@@ -209,11 +225,11 @@ impl HostHeap {
         let samplers = victory_shader::emit::HEAP_SAMPLERS;
         let title_count = count;
         // A capped heap: the title's slots that fit, the smaller dynamic
-        // range, the pool, the null views.
+        // range with the pool's room, the null views.
         let capped = |limit: u32| {
-            make(limit)
-                .ok()
-                .map(|heap| (heap, limit - MIN_DYNAMIC - REMAP_SLOTS - NULL_VIEWS, MIN_DYNAMIC))
+            make(limit).ok().map(|heap| {
+                (heap, limit - MIN_DYNAMIC - REMAP_SLOTS - NULL_VIEWS, MIN_DYNAMIC + REMAP_SLOTS)
+            })
         };
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
@@ -260,11 +276,6 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
-        let pool = if count < title_count {
-            (count + extra, count + extra + REMAP_SLOTS)
-        } else {
-            (count + extra, count + extra)
-        };
         // The view-stride table: shaders read it as a root view, which has no
         // bounds, at indices clamped to the last slot its header names, and
         // remap entries clamped to the last.
@@ -311,8 +322,8 @@ impl HostHeap {
             sampler,
             title_count,
             total,
-            pool,
-            remapped: Mutex::new((vec![0; (title_count - count) as usize], pool.0, Vec::new())),
+            remapped: Mutex::new((vec![0; (title_count - count) as usize], 0)),
+            retired: Mutex::new(Vec::new()),
             made: Mutex::new(Made {
                 keys: vec![0; title_count as usize],
                 postponed: vec![false; title_count as usize],
@@ -321,16 +332,10 @@ impl HostHeap {
                 writes: 0,
                 served: 0,
             }),
-            kept: Mutex::new(vec![None; pool.1 as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            kept: Mutex::new(vec![None; total as usize]),
+            next: Mutex::new((0, vec![false; extra as usize], extra.saturating_sub(1))),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: if sampler {
-                total
-            } else if pool.1 > pool.0 {
-                pool.0
-            } else {
-                total - NULL_VIEWS
-            },
+            pairs_end: if sampler { total } else { total - NULL_VIEWS },
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
@@ -423,49 +428,102 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        self.take_or_warn(n, false)
+    }
+
+    /// [`HostHeap::take`], warning the first time there is no such run.
+    fn take_or_warn(&self, n: u32, top: bool) -> Option<u32> {
+        if let Some(first) = self.take(n, top) {
+            return Some(first);
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let used = self.next.lock().unwrap_or_else(|e| e.into_inner()).1.iter().filter(|&&t| t).count();
+            tracing::warn!(
+                n,
+                used,
+                of = self.dynamic,
+                title_slots = self.count,
+                "no free dynamic descriptor slots: a table is not made"
+            );
+        });
+        None
+    }
+
+    /// `n` consecutive free dynamic slots, taken: searched from the range's
+    /// top end down (`top`: slots held long, pairs and pool slots, apart
+    /// from the lists' short-lived ones) or up, each from where its last
+    /// search ended.
+    fn take(&self, n: u32, top: bool) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let (next, taken, down) = &mut *guard;
+        {
+            let quiet = crate::host::quiet_points();
+            let mut retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+            retired.retain(|&(at, slot)| {
+                let back = at < quiet;
+                if back {
+                    taken[(slot - self.count) as usize] = false;
+                }
+                !back
+            });
+        }
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
+        if top {
+            // Down from where the last such search ended, then from the top
+            // down to there (by n - 1 more, for runs crossing it): one pass
+            // over the range per lap, not per slot (pool slots are taken
+            // thousands of times a frame).
+            let cursor = (*down as usize).min(end - 1);
+            let starts = (0..=cursor).rev().chain((cursor.saturating_sub(n - 1)..end).rev());
+            let mut last = usize::MAX;
+            for at in starts {
+                if at.wrapping_add(1) != last {
+                    run = 0;
+                }
+                last = at;
+                run = if taken[at] { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at);
+                    break;
+                }
             }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
+        } else {
+            // Search from `next` on, then from the start (extending past
+            // cursor by n - 1 so contiguous runs crossing the cursor are
+            // not missed).
+            let cursor = *next as usize;
+            let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+            let starts = (cursor..end).chain(0..second_end);
+            let mut last = usize::MAX;
+            for at in starts {
+                // A run cannot wrap past the end.
+                if at != last.wrapping_add(1) {
+                    run = 0;
+                }
+                last = at;
+                run = if taken[at] { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at + 1 - n);
+                    break;
+                }
             }
         }
-        let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                let used = taken.iter().filter(|&&t| t).count();
-                tracing::warn!(
-                    n,
-                    used,
-                    of = self.dynamic,
-                    title_slots = self.count,
-                    "no free dynamic descriptor slots: a table is not made"
-                );
-            });
-            return None;
-        };
+        #[cfg(feature = "diagnostics")]
+        self.note_usage(taken, found.is_none().then_some(n));
+        let first = found?;
         taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
+        if top {
+            *down = first.checked_sub(1).unwrap_or(end - 1) as u32;
+        } else {
+            *next = ((first + n) % end) as u32;
+        }
         Some(self.count + first as u32)
     }
 
@@ -487,7 +545,11 @@ impl HostHeap {
                 return Some(pairs.0 - 2);
             }
         }
-        self.dynamic(2)
+        let index = self.take_or_warn(2, true)?;
+        if self.count > 0 {
+            held::add(held::Use::Pairs, 2);
+        }
+        Some(index)
     }
 
     /// Gives back a pair [`HostHeap::pair`] returned.
@@ -495,6 +557,9 @@ impl HostHeap {
         if index >= self.count + self.dynamic {
             self.pairs.lock().unwrap_or_else(|e| e.into_inner()).1.push(index);
         } else {
+            if self.count > 0 {
+                held::add(held::Use::Pairs, -2);
+            }
             self.release(index, 2);
         }
     }
@@ -521,15 +586,17 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    /// host cannot (false).
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
         let (kept, mark) = make_marked(view, self.cpu(index));
-        if kept.is_none() {
+        let made = kept.is_some();
+        if !made {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
         self.set_stride(index, Some(view));
         self.set_mark(index, mark);
+        made
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
@@ -771,7 +838,9 @@ impl HostHeap {
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
-    /// if it changed since, and returns the view recorded there. Buffer
+    /// if it changed since (past a capped heap's own slots: in a pool slot,
+    /// none for a table's slot, [`HostHeap::tabled`]), and returns the view
+    /// recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
@@ -818,6 +887,17 @@ impl HostHeap {
         // Made from this record already; one left for draws (postponed)
         // is made now if a draw needs it.
         let done = made.keys[index as usize] == key && !(for_draw && made.postponed[index as usize]);
+        if !done && index >= self.count && lately(made.tabled[index as usize], frame) {
+            // A table's slot past the host's ([`HostHeap::tabled`]): no pool
+            // slot; its record is noted (not made), so a sync finding it
+            // unchanged leaves it.
+            made.keys[index as usize] = key;
+            if std::mem::take(&mut made.postponed[index as usize]) {
+                made.queue.remove(&index);
+            }
+            self.unmap(index);
+            return Some(view);
+        }
         if !done {
             let Some(slot) = self.slot_of(index, true) else {
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -848,8 +928,7 @@ impl HostHeap {
             let later = !for_draw && is_placed_texture(&view);
             made.keys[index as usize] = key;
             if later {
-                let stamp = made.tabled[index as usize];
-                let lately = stamp != 0 && u64::from((frame as u32).wrapping_sub(stamp - 1)) <= TABLED_FRAMES;
+                let lately = lately(made.tabled[index as usize], frame);
                 made.writes += 1;
                 let waiting = Waiting {
                     due: if lately { frame + TABLED_GRACE } else { frame },
@@ -1019,21 +1098,18 @@ impl HostHeap {
             return Some(index);
         };
         let mut guard = self.remapped.lock().unwrap_or_else(|e| e.into_inner());
-        let (slots, next, free) = &mut *guard;
+        let (slots, mapped) = &mut *guard;
         match *slots.get(past as usize)? {
             0 => {}
             slot => return Some(slot),
         }
-        if !take {
+        if !take || *mapped >= REMAP_SLOTS {
             return None;
         }
-        let slot = free.pop().or_else(|| {
-            (*next < self.pool.1).then(|| {
-                *next += 1;
-                *next - 1
-            })
-        })?;
+        let slot = self.take(1, true)?;
         slots[past as usize] = slot;
+        *mapped += 1;
+        held::add(held::Use::Pool, 1);
         self.write_remap(past, slot);
         Some(slot)
     }
@@ -1043,13 +1119,39 @@ impl HostHeap {
     fn unmap(&self, index: u32) {
         let Some(past) = index.checked_sub(self.count) else { return };
         let mut guard = self.remapped.lock().unwrap_or_else(|e| e.into_inner());
-        let (slots, _, free) = &mut *guard;
+        let (slots, mapped) = &mut *guard;
         let Some(slot) = slots.get_mut(past as usize).filter(|s| **s != 0) else {
             return;
         };
-        free.push(std::mem::take(slot));
+        let slot = std::mem::take(slot);
+        *mapped -= 1;
+        held::add(held::Use::Pool, -1);
         self.write_remap(past, self.total - 1);
+        let quiet = crate::host::quiet_points();
+        self.retired.lock().unwrap_or_else(|e| e.into_inner()).push((quiet, slot));
         self.viewed.set(index, None, false);
+    }
+
+    /// Draws read title slots `[first, first + n)` through a table: those
+    /// past `count` (a capped heap) are made afresh in the lists' slots for
+    /// that (`crate::draw`), so they give their pool slots back and take
+    /// none when the title writes them again within [`TABLED_FRAMES`]. The
+    /// title rewrites its tables' slots every few frames (thousands a
+    /// frame), and made in the pool when written they took all of it.
+    /// shortcut: a shader picking such a slot by index reads null, until
+    /// the title writes another record there after the window (the title
+    /// rewrites its tables' slots every ten or so frames).
+    pub(crate) fn tabled(&self, first: u32, n: u32) {
+        let (from, to) = (first.max(self.count), first.saturating_add(n).min(self.title_count));
+        if from >= to {
+            return;
+        }
+        let stamp = (crate::frame::current() as u32).wrapping_add(1).max(1);
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for index in from..to {
+            made.tabled[index as usize] = stamp;
+            self.unmap(index);
+        }
     }
 
     /// Remap entry `past` (title slot `count + past`) names host slot `slot`.
@@ -1141,6 +1243,209 @@ pub(crate) mod census {
             past_tables = PAST_TABLES.load(Ordering::Relaxed),
             ?blocks,
             "view heap census (live views per 65,536 title slots)"
+        );
+    }
+}
+
+/// Diagnostics: draw tables reaching past the host's title slots, per usage
+/// line (5 s): how many draws ask for one, at how many distinct title bases,
+/// the title slots those cover, their sizes and how many entries shaders
+/// use, bases whose contents changed within the line, and bases also seen
+/// in the line before. Sizes a mapping of those title slots shared by every
+/// list instead of tables made per list.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod past {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Line {
+        asked: u64,
+        used: u64,
+        /// Per base: entries, contents hash, contents changed.
+        bases: HashMap<u32, (u32, u64, bool)>,
+        before: HashSet<u32>,
+        lowest: u32,
+        highest: u32,
+    }
+
+    static LINE: Mutex<Option<Line>> = Mutex::new(None);
+
+    /// A draw asks for the table at title slot `base`, `n` slots of which
+    /// shaders use `used`, holding `words`.
+    pub(crate) fn note(base: u32, n: u32, used: usize, words: &[u32]) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        words.hash(&mut h);
+        let hash = h.finish();
+        let mut g = LINE.lock().unwrap_or_else(|e| e.into_inner());
+        let line = g.get_or_insert_with(|| Line { lowest: u32::MAX, ..Default::default() });
+        line.asked += 1;
+        line.used += used as u64;
+        line.lowest = line.lowest.min(base);
+        line.highest = line.highest.max(base + n);
+        let e = line.bases.entry(base).or_insert((n, hash, false));
+        e.0 = e.0.max(n);
+        if e.1 != hash {
+            e.1 = hash;
+            e.2 = true;
+        }
+    }
+
+    pub(super) fn line() -> String {
+        let mut g = LINE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(line) = g.as_mut() else {
+            return String::new();
+        };
+        let mut covered: Vec<(u32, u32)> = line.bases.iter().map(|(&b, &(n, ..))| (b, b + n)).collect();
+        covered.sort_unstable();
+        let (mut slots, mut end) = (0u64, 0u32);
+        for (b, e) in covered {
+            let from = b.max(end);
+            if e > from {
+                slots += u64::from(e - from);
+            }
+            end = end.max(e);
+        }
+        let ns: Vec<u32> = line.bases.values().map(|v| v.0).collect();
+        let sum: u64 = ns.iter().map(|&n| u64::from(n)).sum();
+        let hist = [4, 16, 64, 256, u32::MAX].map(|top| ns.iter().filter(|&&n| n <= top).count());
+        let changed = line.bases.values().filter(|v| v.2).count();
+        let again = line.bases.keys().filter(|b| line.before.contains(b)).count();
+        let mut residues: HashMap<u32, usize> = HashMap::new();
+        for &b in line.bases.keys() {
+            *residues.entry(b % 128).or_default() += 1;
+        }
+        let mut top: Vec<(usize, u32)> = residues.into_iter().map(|(r, c)| (c, r)).collect();
+        top.sort_unstable_by(|a, b| b.cmp(a));
+        top.truncate(4);
+        let text = format!(
+            "; past tables: {} asked, {} bases ({changed} changed, {again} also in the line before), \
+             {slots} title slots covered ({sum} summed), n <= 4/16/64/256/any {hist:?}, max {}, \
+             used entries per ask {:.1}, title {}..{}, base mod 128 top (count, residue) {top:?}",
+            line.asked,
+            line.bases.len(),
+            ns.iter().max().unwrap_or(&0),
+            line.used as f64 / line.asked.max(1) as f64,
+            line.lowest,
+            line.highest,
+        );
+        let before = line.bases.keys().copied().collect();
+        *line = Line { lowest: u32::MAX, before, ..Default::default() };
+        text
+    }
+}
+
+/// What the dynamic slots of title view heaps are held for (lists' tables,
+/// root-view runs and the slots used in them, UAV clears, host copies' view
+/// pairs, and the lists holding any), for the usage line
+/// [`HostHeap::dynamic`] logs with the diagnostics feature. Our own view heap
+/// (`crate::memory::heap`) is not counted.
+pub(crate) mod held {
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Use {
+        /// Slots of fresh tables lists hold.
+        Tables,
+        RootRuns,
+        RootUsed,
+        Clears,
+        Pairs,
+        Lists,
+        /// Pool slots of title slots past a capped heap's own.
+        Pool,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    static HELD: [std::sync::atomic::AtomicI64; 7] = [const { std::sync::atomic::AtomicI64::new(0) }; 7];
+
+    /// `n` more (or fewer) slots, or lists, held for `what`.
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    pub(crate) fn add(what: Use, n: i64) {
+        #[cfg(feature = "diagnostics")]
+        HELD[what as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Lists executed again without a reset between (since the start).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) static AGAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// Slots held by lists not yet executed since made or reset; and the
+    /// most since the last line.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) static PENDING: [std::sync::atomic::AtomicI64; 2] = [const { std::sync::atomic::AtomicI64::new(0) }; 2];
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pending(n: i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = PENDING[0].fetch_add(n, Relaxed) + n;
+        PENDING[1].fetch_max(now, Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    static GIVEN_BACK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+    /// A list gave its slots back after holding them `ms`.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn given_back(ms: u64) {
+        GIVEN_BACK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GIVEN_BACK[1].fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn line() -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        let [tables, runs, used, clears, pairs, lists, pool] = [0, 1, 2, 3, 4, 5, 6].map(|k| HELD[k].load(Relaxed));
+        let [back, ms] = [0, 1].map(|k| GIVEN_BACK[k].swap(0, Relaxed));
+        let age = ms.checked_div(back).unwrap_or(0);
+        format!(
+            "tables {tables}, root runs {runs} ({used} used), clears {clears}, pairs {pairs}, pool {pool}, \
+             by {lists} lists; \
+             {back} lists gave slots back, held {age} ms on average; {} lists executed again before a reset; \
+             held by lists not yet executed {} (most {})",
+            AGAIN.load(Relaxed),
+            PENDING[0].load(Relaxed),
+            PENDING[1].swap(PENDING[0].load(Relaxed), Relaxed)
+        )
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl HostHeap {
+    /// Every 5 s, and at the first few refusals, of a title view heap: how
+    /// much of the dynamic range is taken, its largest free run, how many
+    /// 256-slot runs it still has, and what the slots are held for.
+    fn note_usage(&self, taken: &[bool], refused: Option<usize>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        static REFUSALS: AtomicU32 = AtomicU32::new(0);
+        if self.count == 0 {
+            return;
+        }
+        let first_refusals = refused.is_some() && REFUSALS.fetch_add(1, Ordering::Relaxed) < 4;
+        {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let due = last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+            if !due && !first_refusals {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let used = taken.iter().filter(|&&t| t).count();
+        let (mut largest, mut runs256, mut run) = (0, 0, 0);
+        for &t in taken.iter().chain([&true]) {
+            if t {
+                largest = largest.max(run);
+                runs256 += run / 256;
+                run = 0;
+            } else {
+                run += 1;
+            }
+        }
+        tracing::info!(
+            refused = ?refused,
+            "dynamic view slots: {used} of {} taken, largest free run {largest}, {runs256} free 256-runs; held: {}{}",
+            self.dynamic,
+            held::line(),
+            past::line()
         );
     }
 }
@@ -2220,16 +2525,133 @@ mod tests {
         super::super::record(handle(&mut slots, 9), View::Placed(false, resource, desc));
         assert!(heap.mirror(9, handle(&mut slots, 9), false).is_some());
         let slot = remap(9);
-        assert!((heap.pool.0..heap.pool.1).contains(&slot), "a pool slot: {slot}");
+        assert_eq!(slot, heap.count + heap.dynamic - 1, "a dynamic slot, from the top");
         assert!(heap.kept.lock().unwrap()[slot as usize].is_some(), "made there");
         assert_eq!(word(VIEW_TABLE_HEADER + slot), 32, "its stride (32-byte elements)");
         // The title rewrites slot 9 with no view: the pool slot goes back.
         slots[9] = [0; 8];
         assert!(heap.mirror(9, handle(&mut slots, 9), false).is_none());
         assert_eq!(remap(9), limit - 1, "null again");
+        assert!(heap.retired.lock().unwrap().iter().any(|&(_, s)| s == slot), "given back");
         super::super::record(handle(&mut slots, 11), View::Placed(false, resource, desc));
         assert!(heap.mirror(11, handle(&mut slots, 11), false).is_some());
-        assert_eq!(remap(11), slot, "taken again");
+        assert_ne!(remap(11), limit - 1, "taken");
+        assert_ne!(remap(11), slot, "not the one given back while GPU work may still read it");
+    }
+
+    /// A pool slot given back is taken again only after GPU work running
+    /// then has run (a running shader may still read it by index).
+    #[test]
+    fn pool_slots_given_back_wait_for_the_work_in_flight() {
+        let Some(heap) = capped() else {
+            return; // no host GPU
+        };
+        let slot = heap.take(1, true).unwrap();
+        let quiet = crate::host::quiet_points();
+        heap.retired.lock().unwrap().push((quiet, slot));
+        assert!(heap.take(1, false).is_some());
+        // Other tests' submissions make quiet points of their own.
+        let taken = heap.next.lock().unwrap().1[(slot - heap.count) as usize];
+        assert!(taken || crate::host::quiet_points() != quiet, "still taken");
+        crate::host::quiet_point();
+        assert!(heap.take(1, false).is_some());
+        assert!(!heap.next.lock().unwrap().1[(slot - heap.count) as usize], "given back after");
+    }
+
+    /// The search from the top goes on down from where it ended, wraps to
+    /// the top, finds runs crossing where it starts, and no run across the
+    /// range's ends.
+    #[test]
+    fn the_search_from_the_top_wraps_and_finds_runs_across_its_start() {
+        let Some(heap) = capped() else {
+            return; // no host GPU
+        };
+        let (c, end) = (heap.count, heap.dynamic);
+        assert_eq!(heap.take(end, false), Some(c), "all taken");
+        heap.release(c, 1);
+        heap.release(c + end - 1, 1);
+        assert_eq!(heap.take(2, true), None, "no run across the ends");
+        assert_eq!(heap.take(1, true), Some(c + end - 1), "from the top");
+        assert_eq!(heap.take(1, true), Some(c), "on down");
+        heap.release(c + 10, 2);
+        heap.next.lock().unwrap().2 = 10;
+        assert_eq!(heap.take(2, true), Some(c + 10), "a run across where it starts");
+        heap.release(c + 20, 1);
+        assert_eq!(heap.take(1, true), Some(c + 20), "wrapped to the top and down again");
+    }
+
+    /// Title slots past a capped heap's own that draws read through tables
+    /// (made afresh in the lists' slots) give their pool slots back and take
+    /// none when written again; the lists have the pool's room. The title
+    /// rewrites thousands of such slots a frame: made in the pool when
+    /// written, they took all of it, and lists had 65,536 slots in all.
+    #[test]
+    fn title_slots_read_through_tables_take_no_pool_slots() {
+        use victory_shader::emit::VIEW_TABLE_HEADER;
+        let Some(heap) = capped() else {
+            return; // no host GPU
+        };
+        let (_, table) = heap.strides.as_ref().unwrap();
+        // SAFETY: remap entries of the mapped table, one per title slot from 4 on.
+        let remap = |title: u32| unsafe {
+            (*table as *const u32).add((VIEW_TABLE_HEADER + heap.total + title - 4) as usize).read_volatile()
+        };
+        let null = heap.total - 1;
+        let mut slots = vec![[0u32; 8]; 12];
+        let handle = |slots: &mut [[u32; 8]], i: usize| slots[i].as_mut_ptr() as u64;
+        let memory = crate::watch::tests::owned_window(1024);
+        let at = (memory as u64).next_multiple_of(32);
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, 16 * 32);
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2]) = (1, 0x1688);
+        (desc[4], desc[6], desc[7]) = (1, 4, 32);
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        super::super::record(handle(&mut slots, 9), View::Placed(false, resource, desc));
+        assert!(heap.mirror(9, handle(&mut slots, 9), false).is_some());
+        let slot = remap(9);
+        assert_ne!(slot, null, "written before any table read it: a pool slot");
+        // A draw reads title slots 8 to 11 through a table.
+        heap.tabled(8, 4);
+        assert_eq!(remap(9), null, "given back");
+        assert!(heap.retired.lock().unwrap().iter().any(|&(_, s)| s == slot));
+        // Written again (another view): still none.
+        desc[6] = 2;
+        super::super::record(handle(&mut slots, 9), View::Placed(false, resource, desc));
+        assert!(heap.mirror(9, handle(&mut slots, 9), false).is_some());
+        assert_eq!(remap(9), null, "a table's slot takes no pool slot");
+        // A slot no table reads still takes one.
+        super::super::record(handle(&mut slots, 11), View::Placed(false, resource, desc));
+        heap.mirror(11, handle(&mut slots, 11), false);
+        assert_eq!(remap(11), null, "11 was in the table too");
+        super::super::record(handle(&mut slots, 7), View::Placed(false, resource, desc));
+        heap.mirror(7, handle(&mut slots, 7), false);
+        assert_ne!(remap(7), null);
+        // Lists have the pool's free room too.
+        assert_eq!(heap.dynamic, MIN_DYNAMIC + REMAP_SLOTS);
+        assert!(heap.dynamic(MIN_DYNAMIC + REMAP_SLOTS / 2).is_some());
+    }
+
+    /// A heap the host caps after the title's first 4 slots: the smaller
+    /// dynamic range with the pool's room, no pair slots.
+    fn capped() -> Option<HostHeap> {
+        HostHeap::with_limit(false, 40_000, Some(MIN_DYNAMIC + REMAP_SLOTS + NULL_VIEWS + 4))
+    }
+
+    /// A capped heap's host-copy view pairs, held for a copy's life, come
+    /// from the dynamic range's top end, apart from the lists' slots.
+    #[test]
+    fn pairs_of_a_capped_heap_come_from_the_top() {
+        let Some(heap) = capped() else {
+            return; // no host GPU
+        };
+        let top = heap.count + heap.dynamic;
+        assert_eq!(heap.pair(), Some(top - 2));
+        assert_eq!(heap.pair(), Some(top - 4));
+        assert_eq!(heap.dynamic(4), Some(heap.count), "lists' from the bottom");
+        heap.free_pair(top - 2);
+        assert!(!heap.next.lock().unwrap().1[(top - 2 - heap.count) as usize], "given back");
+        assert_eq!(heap.pair(), Some(top - 6), "the search goes on down from where it ended");
     }
 
     #[test]

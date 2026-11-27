@@ -3253,8 +3253,26 @@ pub(crate) fn retire(resource: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
 }
 
+/// Times [`release_retired`] ran: a point after which no GPU work that was
+/// running before it still runs.
+static QUIET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times a submission had run with none running ([`QUIET`]): view
+/// heap slots given up before such a point may be taken again after it.
+pub(crate) fn quiet_points() -> u64 {
+    QUIET.load(Ordering::Acquire)
+}
+
+/// A quiet point ([`QUIET`]) without releasing retired resources (tests:
+/// another test's may be waiting for its own check).
+#[cfg(test)]
+pub(crate) fn quiet_point() {
+    QUIET.fetch_add(1, Ordering::Release);
+}
+
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
+    QUIET.fetch_add(1, Ordering::Release);
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
     crate::shadow::blocks_cooled();

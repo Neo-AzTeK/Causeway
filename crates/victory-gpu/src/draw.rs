@@ -104,12 +104,20 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// Tables made afresh that this list reads: (title heap, the record
+    /// words (tag, view index, generation) of its title slots) → first
+    /// dynamic slot. Views made from the same records are the same.
+    fresh_tables: std::collections::HashMap<(usize, Box<[u32]>), u32>,
+    /// The dynamic slots the list holds: title heap, first, count, what
+    /// for; given back when the list is reset or released.
+    dynamic: Vec<(usize, u32, u32, Use)>,
+    /// When the list first took dynamic slots of a title heap (the usage
+    /// line, `descriptor::host::held`).
+    #[cfg(feature = "diagnostics")]
+    holding_since: Option<std::time::Instant>,
+    /// Times the list was executed since it was made or reset.
+    #[cfg(feature = "diagnostics")]
+    executions: u32,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -129,20 +137,83 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        let mut title_heaps = false;
+        for &(heap, first, n, what) in &self.dynamic {
             match (heap, crate::memory::heap()) {
                 (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
+                _ => {
+                    title_heaps = true;
+                    held::add(what, -i64::from(n));
+                    crate::descriptor::release_dynamic(heap, first, n);
+                }
             }
+        }
+        let used = self.root_slots.keys().filter(|&&(heap, _, _)| heap != MEMORY_HEAP).count();
+        held::add(Use::RootUsed, -(used as i64));
+        if title_heaps {
+            held::add(Use::Lists, -1);
+        }
+        #[cfg(feature = "diagnostics")]
+        if self.executions == 0 {
+            held::pending(-self.title_slots());
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(since) = self.holding_since {
+            held::given_back(since.elapsed().as_millis() as u64);
         }
     }
 }
 
+impl State {
+    /// The list's submission has run.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn executed(&mut self) {
+        self.executions += 1;
+        if self.executions == 1 {
+            held::pending(-self.title_slots());
+        }
+        if self.executions == 2 {
+            held::AGAIN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes note that the list holds `n` dynamic slots from `first` of view
+    /// heap `heap` (a title heap's key, or [`MEMORY_HEAP`]) for `what`.
+    fn hold(&mut self, heap: usize, first: u32, n: u32, what: Use) {
+        if heap != MEMORY_HEAP {
+            if !self.dynamic.iter().any(|&(h, ..)| h != MEMORY_HEAP) {
+                held::add(Use::Lists, 1);
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.holding_since = Some(std::time::Instant::now());
+                }
+            }
+            held::add(what, i64::from(n));
+            #[cfg(feature = "diagnostics")]
+            if self.executions == 0 {
+                held::pending(i64::from(n));
+            }
+        }
+        self.dynamic.push((heap, first, n, what));
+    }
+
+    /// The dynamic slots of title heaps the list holds.
+    #[cfg(feature = "diagnostics")]
+    fn title_slots(&self) -> i64 {
+        self.dynamic.iter().filter(|&&(h, ..)| h != MEMORY_HEAP).map(|&(_, _, n, _)| i64::from(n)).sum()
+    }
+}
+
+use crate::descriptor::host::held::{self, Use};
+
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
 const MEMORY_HEAP: usize = crate::memory::OURS;
 
-/// Dynamic slots taken at a time for root views.
-const ROOT_VIEW_RUN: u32 = 256;
+/// Dynamic slots taken at a time for root views: a run each list holds
+/// until it is reset, so no longer than a list's root views fill in most
+/// lists, and about as long as the tables taken between them (a capped heap
+/// runs short of slots, not of long runs, when runs are this size).
+const ROOT_VIEW_RUN: u32 = 32;
 
 /// Dynamic slots taken for root views ([`State::root_view`]) since the last
 /// call.
@@ -927,12 +998,15 @@ impl State {
                 once!("no dynamic slots for root views: dropped");
                 return Err("no dynamic slots for root views");
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            self.hold(key, first, ROOT_VIEW_RUN, Use::RootRuns);
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
+        if key != MEMORY_HEAP {
+            held::add(Use::RootUsed, 1);
+        }
         host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
@@ -992,8 +1066,7 @@ impl State {
         let Some(slot) = visible.dynamic(1) else {
             return;
         };
-        self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+        self.hold(std::ptr::from_ref(heap) as usize, slot, 1, Use::Clears);
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -1398,17 +1471,21 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
+            // What the table's entries hold (record words), in the heap.
+            let heap_key = std::ptr::from_ref(heap) as usize;
+            let words: Box<[u32]> = (0..n)
+                .flat_map(|k| {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
-            };
+                    unsafe { (at as *const [u32; 3]).read_unaligned() }
+                })
+                .collect();
+            if let Some(base) = heap.index(table) {
+                #[cfg(feature = "diagnostics")]
+                crate::descriptor::host::past::note(base, n, entries.len(), &words);
+                host.tabled(base, n);
+            }
+            let key = (heap_key, words);
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -1423,14 +1500,12 @@ impl State {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
-                // a wild address on AMD and the device is removed (#59).
-                // The draw or dispatch is dropped instead.
+                // a wild address on AMD and the device is removed (#59). The
+                // draw or dispatch is dropped instead.
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.hold(heap_key, first, n, Use::Tables);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1451,6 +1526,7 @@ impl State {
                     }
                 }
             }
+            self.fresh_tables.insert(key, first);
             made.push((slot, first * 32));
         }
         made

@@ -124,6 +124,10 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&host_lists);
+        #[cfg(feature = "diagnostics")]
+        for &l in lists {
+            crate::list::with_state(l, |_, state| state.executed());
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
