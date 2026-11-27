@@ -78,6 +78,27 @@ watch, change checks on every declared read, before-images and copy-back.
   writes land at page grain and are counted wide. Test: DirectStorage
   requests per window by destination, and how often the same destination
   is requested again.
+  **Tested, 2026-11-27** (`loads` lines, one 400 s run, a 100-frame world
+  window of ~110 s). The volume is real, not counted wide:
+  - DirectStorage did ~48,000 requests, ~4.4 GB, all of it produced. That
+    is ~40 MB/s while standing still, with page spans matching the bytes.
+  - ~8,000 of these (~0.8 GB, ~18%) read data already loaded in the same
+    window. The previous window shows the same pattern.
+  - File reads are small (~40 MB).
+
+  So the title keeps loading, and reloads what it dropped: evict-and-reload
+  churn. A console title standing in one room should settle. Next
+  hypotheses, for correctness as much as speed:
+  - **H0.5:** our memory answers (budget, working set, residency) make the
+    title think it is short of memory, so it evicts and reloads.
+  - **H0.6:** its streaming is driven by what the GPU reports (mip use,
+    visibility, feedback buffers). That report is wrong here: draws are
+    dropped, the picture is black, and GPU-written data stays in host
+    copies, so the title asks for data again and again.
+
+  Tests: the `XMemGetWorkingSetStatistics` and budget answers over the run
+  against the title's limits (H0.5); the GPU buffers its streaming reads,
+  and whether their values change frame to frame in a still scene (H0.6).
 - **H0.2 (missing): the title already says which memory is GPU-only, and we
   drop it.** Heaps and committed resources come with a heap kind (default,
   upload, readback). `resource.rs` uses it only for the title-side

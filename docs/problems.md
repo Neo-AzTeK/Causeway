@@ -57,8 +57,10 @@ Each item names its problem in the ranked table below.
             writes into buffers on default heaps
       - [x] H0.1 bytes by writer: confirmed (title code writes ~3% of
             tracked memory; ~44% written by nobody in two minutes)
-      - [ ] H0.4 ~5.7 GB of distinct heap pages streamed in two minutes of
-            a still scene: re-requested loads?
+      - [x] H0.4 streaming volume is real: ~4.4 GB of DirectStorage loads per
+            ~2 minutes standing still, ~18% reloads of the same data
+      - [ ] H0.5 our memory answers make the title evict and reload
+      - [ ] H0.6 GPU feedback the streaming reads is wrong (picture too)
       - [ ] H0.3 CPU reads of pages the GPU writes
       - [ ] H1.2 our own write-backs refreshed back in as CPU writes
       - [ ] H1.3 one title page in several host copies
