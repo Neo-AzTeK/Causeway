@@ -3272,9 +3272,9 @@ pub(crate) fn quiet_point() {
 
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
+    QUIET.fetch_add(1, Ordering::Release);
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
-    QUIET.fetch_add(1, Ordering::Release);
     crate::shadow::blocks_cooled();
 }
 
