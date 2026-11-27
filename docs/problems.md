@@ -46,9 +46,12 @@ Each item names its problem in the ranked table below.
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
 - [ ] Frame replay tool, if the owner chooses it
-- [ ] Speed, after the picture: look at waiting for the GPU after every batch
-      sent, and at the copies between the two views of memory; the gain is not
-      measured (`frame-preparing-cost`)
+- [ ] Speed, after the picture (`frame-preparing-cost`): where each part of a
+      world frame goes and whether it is our implementation or missing
+      functionality is in `docs/frame-cost.md`. Largest levers there: buffer
+      memory on the GPU side (GPU copy programs over PCIe), overlapping CPU
+      preparation with the GPU; first check the size the slowest GPU copy is
+      asked to move (real, or a wrong count running to the loop limit)
 - [ ] Ideas from xcl-dev/xcl (GPL-2.0-only: ideas only, our own code), by
       measured cost (world frame ~1.3 s: 709 ms preparing on the submitting
       thread, 550 ms GPU): (1) changed-bytes upload: copy only 64-byte chunks
