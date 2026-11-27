@@ -14,8 +14,10 @@ Each item names its problem in the ranked table below.
 - [ ] Read the Windows minidumps of the host stops (`host-bugcheck`): they
       need an administrator to copy them out of `C:\Windows\Minidump` and a
       kernel debugger (`!analyze -v`) to name the stack; until then the cause
-      is not known. Fewer GPU timeouts (`gpu-long-lists`) is the likeliest
-      way to make them rarer, not proven
+      is not known. Both came during GPU work on a day of many GPU resets
+      (one replay ran right after a removal), so fewer resets is the
+      likeliest way to make them rarer, not proven: `gpu-long-lists`, and
+      the owner may raise `TdrDelay` (`crates/victory-gpu/src/tdr.rs`)
 
 - [ ] Find the pass that should put lit people and ground into the scene's
       colour before tonemap (`scene-blocker`). Traced on the newest build:
