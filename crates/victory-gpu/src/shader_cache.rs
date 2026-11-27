@@ -106,8 +106,11 @@ pub fn host_shader_for(
     lacks: Lacks,
 ) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true, min_lod_clamp, mesh_as_compute, wave64_native };
+    // (`crate::shadow::copy_back_marks`). Heap slots shaders pick by index
+    // are marked read: the texture queue makes those first
+    // (`descriptor::host::note_reads`).
+    let options =
+        victory_shader::emit::Options { view_marks: true, view_reads: true, min_lod_clamp, mesh_as_compute, wave64_native };
     let translate = |c: &[u8]| {
         let shader = victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string())?;
         runs_here(shader, lacks)

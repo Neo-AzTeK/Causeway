@@ -161,11 +161,17 @@ fn entry(kind: ResourceType, dwords: u8, user_data: u8) -> UsedResource {
     }
 }
 
-fn build(
+fn build(words: &[u32], layout: Vec<RootParam>, used: Vec<UsedResource>, threads: u32) -> HostShader {
+    build_marking(words, layout, used, threads, false)
+}
+
+/// [`build`], with read marks (`reads`) or without.
+fn build_marking(
     words: &[u32],
     layout: Vec<RootParam>,
     used: Vec<UsedResource>,
     threads: u32,
+    reads: bool,
 ) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -197,6 +203,7 @@ fn build(
         mesh_stride: 0,
         min_lod_clamp: false,
         view_marks: false,
+        view_reads: reads,
     })
     .expect("lower");
     let shader = HostShader {
@@ -481,6 +488,73 @@ fn a_heap_index_past_the_host_title_slots_reads_its_remapped_slot() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(words[0], vec![9; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Read marks: a descriptor the program takes from the resource heap at a
+/// computed index sets the bit of the host slot it reads (after the
+/// remap), past the written-pages bits; a table's view sets none, and the
+/// read itself is unchanged.
+#[test]
+fn a_heap_index_marks_the_host_slot_it_reads() {
+    let layout = || vec![param(RootType::Constants, 0), param(RootType::ResourceHeap, 1), param(RootType::Table, 2)];
+    let shader = build_marking(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32, true);
+    assert!(shader.view_marks, "the bitmap is bound");
+    let plain = build(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32);
+    assert!(!plain.view_marks, "no bitmap without read marks");
+    let (data, last) = (vec![7u32, 8, 9, 10], vec![70u32, 80, 90, 100]);
+    let views = [
+        View::RawUav(32),
+        View::Buffer { data: &data, stride: Stride::Raw },
+        View::Buffer { data: &last, stride: Stride::Raw },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dwords = (super::VIEW_WRITE_BITS + super::VIEW_READ_BITS) / 32;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => 5,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        // As in the remap test: title slot 5 reads host slot 1.
+        let table = vec![2, 2, 3, 3, 4, 4, 4, 2, 2, 1];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE, 0, super::VIEW_MARK_NONE, 0, super::VIEW_MARK_NONE, 0] }),
+                        (2, Root::Uav(dwords)),
+                        (3, Root::View { srv: true, data: table }),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], vec![9; 32], "{label}: the read");
+        let bitmap = words.last().expect("the bitmap");
+        let marked: Vec<u32> =
+            (0..bitmap.len() as u32 * 32).filter(|&b| bitmap[(b / 32) as usize] >> (b % 32) & 1 != 0).collect();
+        assert_eq!(marked, [super::VIEW_WRITE_BITS + 1], "{label}: marks");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

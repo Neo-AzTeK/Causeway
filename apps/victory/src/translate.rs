@@ -660,7 +660,7 @@ fn translate(
                     // (`VICTORY_PAIRS`).
                     let label = || format!("{} {:?} {hash}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options { view_marks: true, min_lod_clamp: MIN_LOD_CLAMP, mesh_as_compute: false, wave64_native: false };
+                    let marks = emit::Options { view_marks: true, view_reads: true, min_lod_clamp: MIN_LOD_CLAMP, mesh_as_compute: false, wave64_native: false };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;

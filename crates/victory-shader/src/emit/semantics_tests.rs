@@ -296,6 +296,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         mesh_stride: 0,
         min_lod_clamp: false,
         view_marks: false,
+        view_reads: false,
     })
     .map_err(e)?;
     Ok(HostShader {

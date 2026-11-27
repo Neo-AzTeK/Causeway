@@ -86,6 +86,9 @@ pub(crate) struct Parts<'a> {
     pub min_lod_clamp: bool,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// Heap descriptors at computed indices mark their slot read (`emit`,
+    /// "Read marks").
+    pub view_reads: bool,
     /// A mesh program is made as compute (`emit`, "Mesh shaders as compute").
     pub mesh_compute: bool,
     /// The host runs waves of 64 (`Options::wave64_native`): a console wave
@@ -5580,6 +5583,7 @@ impl<'a> Lower<'a> {
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 let index = self.buffer_guard(src, index, sampler, props);
+                self.mark_view_read(src, index, sampler);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -5701,6 +5705,7 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
                 let index = self.buffer_guard(src, phi, sampler, props);
+                self.mark_view_read(src, index, sampler);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Select { scc, args } => {
@@ -5720,6 +5725,7 @@ impl<'a> Lower<'a> {
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 let index = self.buffer_guard(src, index, sampler, props);
+                self.mark_view_read(src, index, sampler);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -5728,6 +5734,7 @@ impl<'a> Lower<'a> {
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
                 let index = self.buffer_guard(src, index, sampler, props);
+                self.mark_view_read(src, index, sampler);
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
@@ -5935,6 +5942,42 @@ impl<'a> Lower<'a> {
         } else {
             index
         })
+    }
+
+    /// For a descriptor `src` taken from the resource heap itself (not a
+    /// table, not a sampler), marks host heap slot `index` as read (module
+    /// notes, "Read marks"):
+    /// bit [`super::VIEW_WRITE_BITS`] + `index` of the bitmap, set only
+    /// where still clear; slots past [`super::VIEW_READ_BITS`] mark its
+    /// last bit. Every lane marks, active or not: a slot marked that no
+    /// lane read only keeps its texture longer. Nothing without
+    /// [`Parts::view_reads`].
+    fn mark_view_read(&mut self, src: &Source, index: V, sampler: bool) {
+        if !self.x.view_reads || sampler || !self.is_heap_direct(src) {
+            return;
+        }
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let c = self.cur;
+        let cap = k(self, super::VIEW_READ_BITS - 1);
+        let over = self.s.m.cmp(c, pred::IUGT, index, cap);
+        let n = self.s.m.select(c, over, cap, index);
+        let base = k(self, super::VIEW_WRITE_BITS);
+        let n = self.s.m.bin(c, Bin::Add, n, base);
+        let bitmap = self.s.view_writes_handle();
+        let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+        let word = self.s.m.bin(c, Bin::LShr, n, k5);
+        let word = self.s.m.bin(c, Bin::Shl, word, k2);
+        let bit = self.s.m.bin(c, Bin::And, n, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        // Most reads find their slot marked: a load, not an atomic.
+        let old = self.raw_dword(bitmap, word);
+        let set = self.s.m.bin(c, Bin::And, old, bit);
+        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+        let inner = self.begin_guarded(Some(clear));
+        let iu = self.s.m.undef(self.s.t.i32);
+        // Operation 2 is OR.
+        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
+        self.end_guarded(inner, &[]);
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -10967,6 +11010,7 @@ mod tests {
             mesh_stride: 0,
             min_lod_clamp: false,
             view_marks: false,
+            view_reads: false,
         })
         .map(|_| ())
     }
@@ -11021,6 +11065,7 @@ mod tests {
             mesh_stride: 0,
             min_lod_clamp: false,
             view_marks: false,
+            view_reads: false,
         })
     }
 
@@ -11239,6 +11284,7 @@ mod tests {
             mesh_stride: 0,
             min_lod_clamp: false,
             view_marks: false,
+            view_reads: false,
         })
         .unwrap();
 

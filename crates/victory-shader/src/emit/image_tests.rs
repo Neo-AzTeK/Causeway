@@ -146,6 +146,7 @@ fn translate_form(
             mesh_stride: 0,
             min_lod_clamp,
             view_marks: false,
+            view_reads: false,
             mesh_compute: false,
             wave64_native,
         })

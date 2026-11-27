@@ -176,6 +176,14 @@
 //!   a view the bit of its first byte's page as base with that byte's
 //!   offset in its page as phase. Writes at computed addresses mark the
 //!   page-table bitmap instead ("Title memory").
+//! * **Read marks** ([`HostShader::view_marks`], with
+//!   [`Options::view_reads`]): a descriptor taken from the resource heap at
+//!   a computed index (not a table, not a sampler) sets bit
+//!   [`VIEW_WRITE_BITS`] + its host slot of the same bitmap, at most
+//!   [`VIEW_READ_BITS`] − 1 past it, so the host knows which slots
+//!   shaders picked: it keeps and makes only those textures. A load first,
+//!   the atomic only where the bit is clear. The bitmap then holds
+//!   [`VIEW_WRITE_BITS`] + [`VIEW_READ_BITS`] bits.
 //! * **Signatures** as the console container has them (same semantics,
 //!   registers and masks), so the input layout and stage linking are the
 //!   title's; pixel outputs are plain 32-bit values.
@@ -276,7 +284,7 @@ pub use sampler::StaticSampler;
 pub use container::required_waves;
 pub use shader::{
     HEAP_SAMPLERS, MEMORY_SPACE, MESH_ELEMENT_BYTES, MESH_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_MARK_NONE,
-    VIEW_MARKS, VIEW_STRIDES, VIEW_TABLE_HEADER, VIEW_WRITE_BITS, VIEW_WRITES,
+    VIEW_MARKS, VIEW_READ_BITS, VIEW_STRIDES, VIEW_TABLE_HEADER, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// [`loop_limit`] while none is named: each stage then has a lower limit of
@@ -418,6 +426,10 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Descriptors taken from the resource heap at computed indices mark
+    /// their host slot as read (module notes, "Read marks"); like write
+    /// marks, the host binds the bitmap ([`HostShader::view_marks`]).
+    pub view_reads: bool,
     /// Sampling with a least-level clamp (D3D12 TiledResources tier 2 or
     /// better). Without it `image_sample_d_cl` is refused.
     pub min_lod_clamp: bool,
@@ -652,6 +664,7 @@ fn emit_once(
                 prims: prims.clone(),
                 mesh_stride,
                 view_marks: options.view_marks,
+                view_reads: options.view_reads,
                 min_lod_clamp: options.min_lod_clamp,
                 mesh_compute,
                 wave64_native: options.wave64_native,

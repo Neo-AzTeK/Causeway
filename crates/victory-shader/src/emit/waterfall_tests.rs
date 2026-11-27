@@ -73,6 +73,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
         min_lod_clamp: false,
         view_marks: false,
+        view_reads: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.

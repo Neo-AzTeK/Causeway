@@ -848,7 +848,9 @@ fn bitmap() -> Option<&'static Bitmap> {
     static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
     BITMAP
         .get_or_init(|| {
-            let bits = host()?.mark_bits(u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8))?;
+            // Written-pages bits, then the read marks of heap slots.
+            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8 + victory_shader::emit::VIEW_READ_BITS / 8);
+            let bits = host()?.mark_bits(bytes)?;
             crate::host::name(&bits.gpu, || "views' written pages".into());
             // SAFETY: a live buffer.
             let gpu = unsafe { bits.gpu.GetGPUVirtualAddress() };
@@ -868,6 +870,30 @@ pub(crate) fn view_writes(list: &crate::host::HostList) -> Option<u64> {
     let b = bitmap()?;
     list.read_marks(&b.bits);
     Some(b.gpu)
+}
+
+/// After a submission: the host view heap slots its shaders took from the
+/// heap at computed indices (`victory_shader::emit`, "Read marks"), in
+/// order; the marks are cleared. The last slot also stands for every slot
+/// past the bits.
+pub(crate) fn take_reads() -> Vec<u32> {
+    let Some(b) = bitmap() else {
+        return Vec::new();
+    };
+    let first = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+    let words = (victory_shader::emit::VIEW_READ_BITS / 32) as usize;
+    // SAFETY: the mapped bitmap, past its written-pages bits; the GPU is
+    // done with it (one submission runs at a time).
+    let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+    let mut read = Vec::new();
+    for (w, word) in bits.iter_mut().enumerate() {
+        let mut x = std::mem::take(word);
+        while x != 0 {
+            read.push((w * 32) as u32 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+    read
 }
 
 /// After a submission: every page its shaders marked as written through

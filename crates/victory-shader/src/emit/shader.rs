@@ -44,6 +44,10 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 /// Bits in the written-pages bitmap of buffer views; marks past it go to
 /// the last bit.
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+/// Host view heap slots read marks have bits for, after the written-pages
+/// bits of the same bitmap (`emit`, "Read marks"); slots past it mark the
+/// last. The host view heap holds at most a million (D3D12 tier 2 and 3).
+pub const VIEW_READ_BITS: u32 = 1 << 20;
 /// Where a mesh program run as compute (`emit`, "Mesh shaders as compute")
 /// writes its vertices (`u0`, raw root UAV) and triangles (`u1`) and reads
 /// its first group's number (`t1`, raw root SRV), and where the vertex

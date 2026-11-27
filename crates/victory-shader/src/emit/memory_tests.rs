@@ -183,6 +183,7 @@ fn program() -> HostShader {
         mesh_compute: false,
         wave64_native: false,
         view_marks: false,
+        view_reads: false,
     })
     .expect("lower");
     assert!(l.memory && l.memory_writes && l.view_addresses);
@@ -413,6 +414,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         mesh_compute: false,
         wave64_native: false,
         view_marks: false,
+        view_reads: false,
     })
     .expect("lower");
     // (Only the host's own view-stride table, which every heap access reads.)
@@ -563,6 +565,7 @@ fn writes_through_views_mark_their_pages() {
         mesh_compute: false,
         wave64_native: false,
         view_marks: true,
+        view_reads: false,
     })
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");
