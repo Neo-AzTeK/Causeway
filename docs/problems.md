@@ -46,12 +46,26 @@ Each item names its problem in the ranked table below.
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
 - [ ] Frame replay tool, if the owner chooses it
-- [ ] Speed, after the picture (`frame-preparing-cost`): where each part of a
-      world frame goes and whether it is our implementation or missing
-      functionality is in `docs/frame-cost.md`. Largest levers there: buffer
-      memory on the GPU side (GPU copy programs over PCIe), overlapping CPU
-      preparation with the GPU; first check the size the slowest GPU copy is
-      asked to move (real, or a wrong count running to the loop limit)
+- [ ] Speed (`frame-preparing-cost`): test the hypotheses in
+      `docs/frame-cost.md`, one at a time, writing each result there. Order
+      (cheap tests first, then by bytes touched):
+      - [ ] H6.2 the slow GPU copy programs read a wrong or stale count
+            (also correctness)
+      - [ ] H0.2 the title's heap kind says which buffers are GPU-only: CPU
+            writes into buffers on default heaps
+      - [ ] H0.1 / H0.3 bytes by class (CPU→GPU, GPU-only, both, neither);
+            CPU reads of written-back pages
+      - [ ] H1.2 our own write-backs refreshed back in as CPU writes
+      - [ ] H1.3 one title page in several host copies
+      - [ ] H1.1 changed 64-byte pieces per copied page
+      - [ ] H3.1 / H3.2 changed and equal-rewritten heap slots per page
+      - [ ] H5.1 views per frame seen the frame before
+      - [ ] H1.4 kernel read against plain copy (offline benchmark)
+      - [ ] H1.5 / H5.4 the same scene with the release build
+      - [ ] H6.1 one heavy pass with its buffers in video memory
+      - [ ] H6.3 / H6.4 / H6.5 wave 64, translated code, idle gaps
+      - [ ] H2.1 refresh cost per byte with and without shader writes
+      - [ ] H7.1 overlap preparing with the GPU, if H0.x hold
 - [ ] Ideas from xcl-dev/xcl (GPL-2.0-only: ideas only, our own code), by
       measured cost (world frame ~1.3 s: 709 ms preparing on the submitting
       thread, 550 ms GPU): (1) changed-bytes upload: copy only 64-byte chunks
