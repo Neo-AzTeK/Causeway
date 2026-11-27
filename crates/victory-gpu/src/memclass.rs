@@ -179,6 +179,73 @@ fn writers_frame(tracked: Vec<usize>) {
         text.join("; ")
     );
     *w = Writers::default();
+    loads_window();
+}
+
+/// Loads into title memory over a writers window, per source.
+#[derive(Default)]
+struct Loads {
+    calls: u64,
+    /// Bytes the title asked for, and those it got (as far as known).
+    asked: u64,
+    got: u64,
+    /// Calls whose destination range was loaded before in the window.
+    same_destination: u64,
+    /// Calls whose data (source key) was loaded before in the window.
+    same_data: u64,
+    same_data_bytes: u64,
+    destinations: std::collections::HashSet<(usize, usize)>,
+    data: std::collections::HashSet<u64>,
+    pages: std::collections::HashSet<usize>,
+}
+
+static LOADS: Mutex<BTreeMap<&'static str, Loads>> = Mutex::new(BTreeMap::new());
+
+/// A load of `asked` bytes into title memory at `at` (`got` of them
+/// produced) from `source`; `data` names what was read (a file and an
+/// offset, say), when known (diagnostics; H0.4 in `docs/frame-cost.md`).
+pub fn loaded(source: &'static str, at: usize, asked: usize, got: usize, data: Option<u64>) {
+    if !wanted() {
+        return;
+    }
+    let mut loads = LOADS.lock().unwrap_or_else(|e| e.into_inner());
+    let l = loads.entry(source).or_default();
+    l.calls += 1;
+    l.asked += asked as u64;
+    l.got += got as u64;
+    if !l.destinations.insert((at, asked)) {
+        l.same_destination += 1;
+    }
+    if let Some(d) = data
+        && !l.data.insert(d)
+    {
+        l.same_data += 1;
+        l.same_data_bytes += got as u64;
+    }
+    let page = crate::watch::PAGE;
+    l.pages.extend(at / page..at.saturating_add(asked).div_ceil(page));
+}
+
+fn loads_window() {
+    let mut loads = LOADS.lock().unwrap_or_else(|e| e.into_inner());
+    let mb = |b: u64| b >> 20;
+    let text: Vec<String> = loads
+        .iter()
+        .map(|(s, l)| {
+            format!(
+                "{s}: {} calls, asked {} MB, got {} MB, {} MB of pages, same destination {}, same data {} ({} MB)",
+                l.calls,
+                mb(l.asked),
+                mb(l.got),
+                mb(l.pages.len() as u64 * crate::watch::PAGE as u64),
+                l.same_destination,
+                l.same_data,
+                mb(l.same_data_bytes)
+            )
+        })
+        .collect();
+    tracing::info!(target: "victory_gpu::trace", "loads over the window: {}", text.join("; "));
+    loads.clear();
 }
 
 #[cfg(test)]

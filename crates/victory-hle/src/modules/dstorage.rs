@@ -955,6 +955,22 @@ fn into_destination(
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    // The probe of loads (H0.4): what was read (source, offset, options) and
+    // where to. A page destination is named by its first page number.
+    #[cfg(feature = "diagnostics")]
+    let fill = |out: &mut [u8]| {
+        let got = fill(out);
+        let (name, at) = if request.options & PAGE_DESTINATION == 0 {
+            ("DirectStorage to an address", request.destination as usize)
+        } else {
+            // SAFETY: the title passes at least one page number.
+            let first = unsafe { *request.destination.cast::<usize>() };
+            ("DirectStorage to pages", first << 12 | (request.page_offset & 0xffff) as usize)
+        };
+        let data = (request.source as u64).rotate_left(32) ^ request.offset ^ request.options.rotate_left(48);
+        victory_gpu::memclass::loaded(name, at, len, *got.as_ref().unwrap_or(&0), Some(data));
+        got
+    };
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.

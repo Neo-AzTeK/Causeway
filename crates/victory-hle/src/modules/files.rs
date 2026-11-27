@@ -536,17 +536,27 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     let _writing = victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let ok = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    #[cfg(feature = "diagnostics")]
+    {
+        // SAFETY: the title's out count, or null (overlapped reads).
+        let got = unsafe { read.as_ref() }.copied().unwrap_or(0);
+        victory_gpu::memclass::loaded("ReadFile", buffer as usize, len as usize, got as usize, None);
+    }
+    ok
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     let _writing = victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+    let n = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
-    )
+    );
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::memclass::loaded("fread", buffer as usize, size.saturating_mul(count), n.saturating_mul(size), None);
+    n
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
