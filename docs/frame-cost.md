@@ -5,6 +5,8 @@ profile), 2026-11-27. Figures are rounded per-frame medians over world frames.
 Run folders and shader hashes stay on the developer's machine (rule #1). Live
 work stays in `docs/problems.md`.
 
+The design these tests lead to: `docs/memory-design.md`.
+
 **How to read this.** Each slow part has three layers, kept apart on purpose:
 
 - **Measured:** what the counters say.

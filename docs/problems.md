@@ -46,7 +46,9 @@ Each item names its problem in the ranked table below.
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
 - [ ] Frame replay tool, if the owner chooses it
-- [ ] Speed (`frame-preparing-cost`): test the hypotheses in
+- [ ] Speed and memory (`frame-preparing-cost`): the design the tests point
+      to is `docs/memory-design.md` (4 steps; steps 1-3 need the owner's OK to
+      take over the claimed problem). Remaining hypotheses in
       `docs/frame-cost.md`, one at a time, writing each result there. Order
       (cheap tests first, then by bytes touched):
       - [x] H6.2 the slow GPU copy programs read a wrong or stale count:

@@ -21,7 +21,7 @@ and ask the owner for the title's folder if none is set.
 | cross-crate flow, import resolution | `docs/architecture.md` |
 | debug variables, smoke runs | `docs/debugging.md` |
 | todo and problem list (update after each task); separate problem sessions (optional) | `docs/problems.md`; `docs/problem-sessions.md`, skill `problem-session` |
-| where frame time goes, implementation vs missing functionality | `docs/frame-cost.md` |
+| where frame time goes, implementation vs missing functionality; the memory design it leads to | `docs/frame-cost.md`, `docs/memory-design.md` |
 | capabilities, planners, fakes | `docs/hardware-range.md`, `docs/gpu-review-checklist.md` |
 | adapters verified / not verified | `docs/adapters.md` |
 | asset policy | `docs/asset-policy.md` |
