@@ -3303,6 +3303,8 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .position(barrier)
         .map_or(history.len(), |b| (done + b).max(done + 1));
     let mut text = format!(", commands {from}..{to} between its barriers:");
+    // A long block shows the commands around the one it stopped at.
+    let from = from.max(done.saturating_sub(6)).min(done);
     let mut shown = 0;
     for i in from..to {
         let op = history[i];
