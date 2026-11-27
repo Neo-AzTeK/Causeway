@@ -2477,10 +2477,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// reads past the copy's end read 0 (through a host root descriptor
     /// they would read whatever lay there). Two root addresses in one copy
     /// share its view. The output is read from its host copy, which another
-    /// test's submission may bring up to date in between (the one run here
-    /// does): its memory is write-watched, as the title's pools, and taken by
-    /// each submission before the dispatch, so that the title's memory, never
-    /// written, is not copied over what the shader wrote.
+    /// test's submission may bring up to date in between: its memory is
+    /// write-watched, as the title's pools, and taken by each submission
+    /// before the dispatch, so that no refresh copies the title's memory,
+    /// never written, over what the shader wrote.
     #[test]
     fn root_views_reach_their_copy_and_read_zeros_past_it() {
         let Some(host) = crate::host::host() else {
@@ -2545,7 +2545,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 }
             }
             host.execute(&[&list]);
-            crate::memory::tests::ask_for_every_copy();
+            assert!(!out.stale(dst_bytes as usize, 256), "round {round}: a refresh would copy over the output");
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
         }
     }

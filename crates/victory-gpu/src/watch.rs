@@ -826,7 +826,7 @@ pub(crate) mod tests {
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).
     pub(crate) fn pool(pages: usize) -> usize {
-        // SAFETY: a fresh allocation, freed by the test.
+        // SAFETY: a fresh allocation, freed by the test or leaked.
         let p = unsafe {
             VirtualAlloc(
                 std::ptr::null(),
