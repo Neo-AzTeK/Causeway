@@ -322,6 +322,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // reservation below 2^40 if one does.
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
+    if !block.is_null() {
+        victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleHeap, layout.size() as i64);
+    }
     if block.is_null() {
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
@@ -352,6 +355,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleHeap, -(size as i64));
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

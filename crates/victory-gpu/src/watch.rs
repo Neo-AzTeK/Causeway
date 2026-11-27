@@ -411,6 +411,17 @@ pub fn title_memory_lazy(load: &Arc<crate::lazy::Load>, at: usize, offset: usize
     true
 }
 
+/// What memory `at` is, as [`title_memory_lazy`] tells it apart: a view,
+/// a write-watched pool, other private memory, or not answered.
+pub fn memory_kind(at: usize) -> &'static str {
+    match allocation(at) {
+        Some((_, false)) => "view",
+        Some((_, true)) if runtime_memory(at, false) => "pool",
+        Some((_, true)) => "plain",
+        None => "unknown",
+    }
+}
+
 /// The runtime releases the title reservation holding `at`: pages disk
 /// loads left without bytes there go without being filled, and are no
 /// longer guarded (the addresses may hold other memory later).

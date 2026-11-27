@@ -90,6 +90,6 @@ pub use host::on_failure;
 pub use inplace::title_memory_section;
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_freed, title_memory_lazy, title_memory_remapped,
+    Writing as KernelWrite, memory_kind, title_memory_aliased, title_memory_freed, title_memory_lazy, title_memory_remapped,
     kernel_will_write,
 };

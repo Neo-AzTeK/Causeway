@@ -934,6 +934,16 @@ impl victory_gpu::lazy::Source for Disk {
     }
 }
 
+/// The first loads that could leave pages without bytes but left none:
+/// what memory they went to (`kind`), where, how long, and for page
+/// destinations how many of their pages are shown at an address.
+fn refused(kind: &str, at: usize, len: usize, shown: usize) {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
+        tracing::info!(kind, at = format_args!("{at:#x}"), len, shown, "dstorage: a load wrote every page");
+    }
+}
+
 /// Leaves whole 64 KiB pages of a file request's destination without bytes
 /// (`docs/memory-design.md`, "Assets come from disk"): the GPU side takes
 /// them from the file when something reads them (`victory_gpu::lazy`). The
@@ -941,6 +951,12 @@ impl victory_gpu::lazy::Source for Disk {
 /// so (the caller writes the destination as before), or the request is not
 /// one to leave (memory sources, which the title may change).
 fn lazily(request: &Request, len: usize) -> Option<Result<(), HRESULT>> {
+    use victory_gpu::ledger::{Owner, add};
+    if request.options & MEMORY_SOURCE != 0 {
+        add(Owner::LoadsFromMemory, len as i64);
+    } else if len < PAGE {
+        add(Owner::LoadsSmall, len as i64);
+    }
     if !victory_gpu::lazy::wanted() || request.options & MEMORY_SOURCE != 0 || len < PAGE {
         return None;
     }
@@ -979,6 +995,7 @@ fn lazily(request: &Request, len: usize) -> Option<Result<(), HRESULT>> {
             p += PAGE;
         }
         if !left {
+            refused(victory_gpu::memory_kind(d), d, len, 0);
             return None;
         }
         if written_to < len {
@@ -1019,6 +1036,7 @@ fn lazily(request: &Request, len: usize) -> Option<Result<(), HRESULT>> {
         }
     }
     if !left {
+        refused("pages", pages.first().copied().unwrap_or(0), len, shown.iter().filter(|s| !s.is_empty()).count());
         return None;
     }
     if written_to < len {
