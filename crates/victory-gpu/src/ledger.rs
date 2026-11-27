@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
 pub enum Owner {
     /// Host copies of title buffers (system memory the GPU reads).
     BufferCopies,
+    /// Texture staging the CPU way keeps (`crate::texture`): upload buffers
+    /// and the bytes read for detiling.
+    TextureStaging,
     /// Snapshot memory kept for reuse.
     SnapshotPool,
     /// Title pages left without bytes by disk loads, now.
@@ -39,7 +42,7 @@ pub enum Owner {
     TitleSections,
 }
 
-const N: usize = 14;
+const N: usize = 15;
 static BYTES: [AtomicI64; N] = [const { AtomicI64::new(0) }; N];
 
 pub fn add(owner: Owner, n: i64) {
@@ -77,7 +80,7 @@ pub(crate) fn line() -> String {
     unsafe { windows_sys::Win32::System::ProcessStatus::K32GetPerformanceInfo(&mut p, p.cb) };
     let page = p.PageSize as f64;
     format!(
-        "memory: host commit {:.0} of {:.0} MB; private {:.0} MB, working set {:.0} MB; title heap {:.0} MB, title virtual commits {:.0} MB since start, title sections {:.0} MB, buffer copies {:.0} MB, \
+        "memory: host commit {:.0} of {:.0} MB; private {:.0} MB, working set {:.0} MB; title heap {:.0} MB, title virtual commits {:.0} MB since start, title sections {:.0} MB, buffer copies {:.0} MB, texture staging {:.0} MB, \
          snapshot pool {:.0} MB, pipeline library {:.0} MB, decode cache {:.0} MB; loads left without \
          bytes {:.0} MB now, filled {:.0} MB ({:.0} MB by title accesses), read from sources {:.0} MB; loads written {:.0} MB ({:.0} MB from title memory, {:.0} MB shorter than a page)",
         mb(p.CommitTotal as f64 * page),
@@ -88,6 +91,7 @@ pub(crate) fn line() -> String {
         mb(get(Owner::TitleVirtual)),
         mb(get(Owner::TitleSections)),
         mb(get(Owner::BufferCopies)),
+        mb(get(Owner::TextureStaging)),
         mb(get(Owner::SnapshotPool)),
         mb(get(Owner::PipelineLibrary)),
         mb(get(Owner::DecodeCache)),
