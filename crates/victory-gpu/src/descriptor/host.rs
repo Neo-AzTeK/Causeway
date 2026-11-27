@@ -1184,8 +1184,9 @@ pub(crate) mod held {
     /// how many lists hold it; and lists given back: how many, and for how
     /// long in all (ms) they held slots.
     #[cfg(feature = "diagnostics")]
-    static TABLES: std::sync::Mutex<Option<std::collections::HashMap<(u64, u64), (u32, u32)>>> =
-        std::sync::Mutex::new(None);
+    type Tables = std::collections::HashMap<(u64, u64), (u32, u32)>;
+    #[cfg(feature = "diagnostics")]
+    static TABLES: std::sync::Mutex<Option<Tables>> = std::sync::Mutex::new(None);
     #[cfg(feature = "diagnostics")]
     static GIVEN_BACK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -1209,13 +1210,10 @@ pub(crate) mod held {
     }
 
     /// A list gave its slots back after holding them `ms`.
-    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn given_back(ms: u64) {
-        #[cfg(feature = "diagnostics")]
-        {
-            GIVEN_BACK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            GIVEN_BACK[1].fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
-        }
+        GIVEN_BACK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GIVEN_BACK[1].fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(feature = "diagnostics")]
