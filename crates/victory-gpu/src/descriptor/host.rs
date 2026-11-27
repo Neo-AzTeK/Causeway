@@ -165,7 +165,7 @@ const MIN_DYNAMIC: u32 = 1 << 16;
 const PAIR_SLOTS: u32 = 1 << 15;
 
 /// Pool slots of a view heap the host caps, for the title slots past its
-/// own that hold a view (9,593 at most in a 300 s run, NVIDIA, 2026-11-25).
+/// own that hold a view; sized above the most one world run was seen to use.
 const REMAP_SLOTS: u32 = 1 << 15;
 
 /// Slots at the end of a view heap that are neither the title's nor a
@@ -1596,22 +1596,10 @@ fn typed_store(format: u32) -> bool {
     if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
         return ok;
     }
-    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-        Format: DXGI_FORMAT(format as i32),
-        ..Default::default()
-    };
-    let ok = host().is_some_and(|h| {
-        // SAFETY: a plain query into a struct of its size.
-        unsafe {
-            h.device.CheckFeatureSupport(
-                D3D12_FEATURE_FORMAT_SUPPORT,
-                (&raw mut support).cast(),
-                size_of_val(&support) as u32,
-            )
-        }
-        .is_ok()
-            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
-    });
+    // A failed query counts as no support.
+    let ok = host()
+        .and_then(|h| crate::caps::per_resource::format_support(&h.device, DXGI_FORMAT(format as i32)))
+        .is_some_and(|s| s.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0);
     known.push((format, ok));
     ok
 }
@@ -1828,8 +1816,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
 /// 3D), 2D if it names none: a 2D null view where the shader writes a 3D
-/// texture is a mismatch GPU-based validation reports (the world's wind
-/// field, CS_CopyWindFieldBeforeUpdateWithSmooth, 2026-11-24).
+/// texture is a mismatch GPU-based validation reports (a 3D compute write
+/// in the world).
 fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
@@ -1919,7 +1907,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// A view that reads zeros, for slots whose view the host cannot make.
 /// shortcut: slots with no view at all (kind unknown) get this null 2D
 /// view; null buffer views there did not stop the world's low-address
-/// page faults (2026-11-24, run w10), so they are not the cause.
+/// page faults in a world run, so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {

@@ -134,10 +134,9 @@ checker's own, under `xtask/`, aside):
 Part of the test host also runs in the title (`fuses_fmad`, which asks
 OPTIONS19 and uses no sampler).
 
-Still open, all in descriptor and heap code (other owner): one `FORMAT_SUPPORT`
-query in `descriptor/host.rs` (`typed_store`, which also caches its answers
-across devices), counted in `OTHER_OWNER` so that no other is added; heap sizing
-by `binding_plan`. `format_choice` and `Caps::formats` have no caller. The
+Still open, in descriptor and heap code: `typed_store` in `descriptor/host.rs`
+asks through `caps::per_resource` but caches its answers across devices; heap
+sizing by `binding_plan`. `format_choice` and `Caps::formats` have no caller. The
 `Host` keeps one `Caps` and nothing replaces it after a device loss.
 
 ## Prior art (ideas only; no code taken)

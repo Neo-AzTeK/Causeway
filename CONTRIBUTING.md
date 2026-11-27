@@ -48,6 +48,11 @@ updated in the same diff. Match a comment to how binding it is:
 | explains why (hardware quirk, rejected approach) | keep it, short |
 | marks a deliberate limit | `// shortcut:` with the limit |
 | restates the code, or is stale | delete it in code you already change, never in a sweep |
+| reports a measurement (a figure, a date, a run, a shader of the title) | say the rule it led to; the figure goes in `docs/adapters.md` or run notes outside the repository |
+
+`cargo xtask policy` counts dated and "for now" comments so their number only
+goes down, and refuses title shader names and work split by owner in comments
+(`xtask/src/comments.rs`).
 
 `cargo xtask policy` (pre-commit, and the workspace tests) fails when an
 invariant names no existing test, and when the number of `decision NNNN`
