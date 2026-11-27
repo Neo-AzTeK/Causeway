@@ -59,7 +59,8 @@ Each item names its problem in the ranked table below.
             tracked memory; ~44% written by nobody in two minutes)
       - [x] H0.4 streaming volume is real: ~4.4 GB of DirectStorage loads per
             ~2 minutes standing still, ~18% reloads of the same data
-      - [ ] H0.5 our memory answers make the title evict and reload
+      - [x] H0.5 our memory answers make the title evict and reload: mostly
+            refuted (it never asks for working-set statistics)
       - [ ] H0.6 GPU feedback the streaming reads is wrong (picture too)
       - [ ] H0.3 CPU reads of pages the GPU writes
       - [ ] H1.2 our own write-backs refreshed back in as CPU writes

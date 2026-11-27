@@ -99,6 +99,15 @@ watch, change checks on every declared read, before-images and copy-back.
   Tests: the `XMemGetWorkingSetStatistics` and budget answers over the run
   against the title's limits (H0.5); the GPU buffers its streaming reads,
   and whether their values change frame to frame in a still scene (H0.6).
+
+  **H0.5 mostly refuted, 2026-11-27** (`memory asked`, one 400 s run with the
+  probe on): the title never called `XMemGetWorkingSetStatistics`. Its other
+  memory facts from us are fixed (the adapter's memory size is the
+  console's). It streams into the physical pages it allocated once, at the
+  console's size. So nothing we answer changes during a run, and the
+  churn is more likely its own reaction to what it sees (H0.6). Not
+  checked: the two device methods we do not implement, in case either
+  asks about memory.
 - **H0.2 (missing): the title already says which memory is GPU-only, and we
   drop it.** Heaps and committed resources come with a heap kind (default,
   upload, readback). `resource.rs` uses it only for the title-side
