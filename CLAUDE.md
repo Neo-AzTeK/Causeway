@@ -17,10 +17,10 @@ and ask the owner for the title's folder if none is set.
 | Need | File |
 |------|------|
 | rules, flow, checks, hardware range | `CONTRIBUTING.md` |
-| cost, delegation, reading, output | `docs/agent-workflow.md` |
+| how to work efficiently: loop, proof, borrowing, cost, reading | `docs/agent-workflow.md` |
 | cross-crate flow, import resolution | `docs/architecture.md` |
 | debug variables, smoke runs | `docs/debugging.md` |
-| problem list; separate problem sessions (optional) | `docs/problems.md`; `docs/problem-sessions.md`, skill `problem-session` |
+| todo and problem list (update after each task); separate problem sessions (optional) | `docs/problems.md`; `docs/problem-sessions.md`, skill `problem-session` |
 | capabilities, planners, fakes | `docs/hardware-range.md`, `docs/gpu-review-checklist.md` |
 | adapters verified / not verified | `docs/adapters.md` |
 | asset policy | `docs/asset-policy.md` |
