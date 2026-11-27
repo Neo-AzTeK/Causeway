@@ -159,6 +159,17 @@ pub struct Tail {
     pub y: u32,
 }
 
+/// Where one subresource's elements are in tiled memory: element
+/// (`x`, `y`, `z`) is at `rows[z * height + y] + columns[x]` bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tables {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub rows: Vec<u32>,
+    pub columns: Vec<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub desc: Desc,
@@ -597,6 +608,47 @@ impl Layout {
     /// 3D textures, else 1 (one array slice).
     pub fn subresource_depth(&self, mip: u32) -> u32 {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
+    }
+
+    /// The address tables of one subresource (`mip` and `slice` as in
+    /// [`Layout::detile`]), for a conversion done elsewhere (a GPU shader).
+    pub fn tables(&self, mip: u32, slice: u32) -> Result<Tables, Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let volume = self.desc.dimension == Dimension::Tex3d;
+        if (volume && slice != 0) || (!volume && slice >= self.slices) {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let first = if volume { 0 } else { slice };
+        let n = u64::from(self.desc.element_bytes);
+        let linear = self.desc.swizzle == Swizzle::LINEAR;
+        let narrow = |at: u64| u32::try_from(at).map_err(|_| Error::Unsupported);
+        let columns = (0..m.width)
+            .map(|x| narrow(if linear { u64::from(x) * n } else { self.column(m, x) }))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut rows = Vec::with_capacity(m.depth as usize * m.height as usize);
+        for z in 0..m.depth {
+            let (s, inner) = self.split(first + z);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            for y in 0..m.height {
+                let row = if linear {
+                    u64::from(y) * u64::from(m.pitch) * n
+                } else {
+                    self.row(m, y, inner)
+                };
+                rows.push(narrow(base + row)?);
+            }
+        }
+        // Every element lies inside the texture.
+        let end = u64::from(rows.iter().copied().max().unwrap_or(0))
+            + u64::from(columns.iter().copied().max().unwrap_or(0))
+            + n;
+        if end > self.size {
+            return Err(Error::TooSmall);
+        }
+        Ok(Tables { width: m.width, height: m.height, depth: m.depth, rows, columns })
     }
 
     /// Copies one subresource out of tiled memory (the whole texture,

@@ -435,6 +435,27 @@ impl State {
         };
     }
 
+    /// The user-data dword `u` where no table was made afresh for it, else
+    /// why the draw or dispatch reading it must be dropped.
+    fn user_dword(
+        &mut self,
+        list: &HostList,
+        compute: bool,
+        u: &victory_shader::emit::UserData,
+    ) -> Result<u32, &'static str> {
+        // `dword` marks a view's entry only on a root descriptor: of root
+        // constants it is the dword's number, 4 as good as any.
+        if u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET {
+            // Where the root address lies in the copy its view shows.
+            return root_view_offset(self.roots_ref(compute).get(usize::from(u.slot)));
+        }
+        if is_root_view(u) {
+            let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
+            return self.root_view(list, compute, u.slot, uav).map(|(slot, _)| slot);
+        }
+        Ok(self.user_value(compute, u.slot, u.root, u.dword))
+    }
+
     /// The user-data value of a root argument, as translated shaders read
     /// it: a table's byte offset in its heap, a constant's value, a root
     /// view's address (title memory).
@@ -661,6 +682,9 @@ impl State {
                 .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                 .flatten()
             {
+                // Textures shaders pick by index that no table made yet:
+                // made now, so that the submission uploads them.
+                host.serve_textures(crate::frame::current());
                 list.defer_heap(&host.viewed);
             }
             crate::bindless::note_draw(writes);
@@ -719,28 +743,14 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
-                            // Where the root address lies in the copy its view shows.
-                            match root_view_offset(self.roots_ref(compute).get(usize::from(u.slot))) {
-                                Ok(offset) => offset,
-                                Err(why) => {
-                                    once!(slot = u.slot, root = ?self.roots_ref(compute).get(usize::from(u.slot)), pipeline = p.name, "{why}: dropped");
-                                    not_run(why);
-                                    return false;
-                                }
+                        None => match self.user_dword(list, compute, u) {
+                            Ok(value) => value,
+                            Err(why) => {
+                                once!(slot = u.slot, pipeline = p.name, "{why}: dropped");
+                                not_run(why);
+                                return false;
                             }
-                        }
-                        None if is_root_view(u) => {
-                            let uav = u.dword == victory_shader::emit::ROOT_UAV_VIEW;
-                            match self.root_view(list, compute, u.slot, uav) {
-                                Ok((slot, _)) => slot,
-                                Err(why) => {
-                                    not_run(why);
-                                    return false;
-                                }
-                            }
-                        }
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        },
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -1174,6 +1184,10 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        #[cfg(feature = "diagnostics")]
+        if crate::budget::skip_draw(None) {
+            return;
+        }
         let emulated = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.emulated.as_deref());
         let ran = if let Some(e) = emulated {
             let ran = self.dispatch_mesh_emulated(list, e, x);
@@ -1738,6 +1752,10 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        #[cfg(feature = "diagnostics")]
+        if crate::budget::skip_draw(Some(vertices.saturating_mul(instances))) {
+            return;
+        }
         // Rectangles: completed by the pipeline's geometry shader, else
         // expanded into vertex buffers of their own.
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1842,6 +1860,10 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        #[cfg(feature = "diagnostics")]
+        if crate::budget::skip_draw(Some(indices.saturating_mul(instances))) {
+            return;
+        }
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
         if rects {
             once!("indexed rectangles not drawn");
@@ -1884,6 +1906,11 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        // As done: nothing is wrong with the call.
+        #[cfg(feature = "diagnostics")]
+        if kind != DISPATCH && crate::budget::skip_draw(None) {
+            return true;
+        }
         // What a dropped call would have written.
         #[cfg(feature = "diagnostics")]
         let bound = if kind == DISPATCH { self.written_text() } else { self.bound_text() };
@@ -2371,6 +2398,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         );
         assert_eq!(made, S_OK);
         out
+    }
+
+    /// Root constants are read by their number: dword 4, the number that
+    /// marks a root descriptor's view offset, was taken for that mark and the
+    /// dispatch reading it dropped.
+    #[test]
+    fn root_constants_are_read_whatever_their_number() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_constants(true, 8, &[10, 11, 12, 13, 14, 15], 0);
+        for dword in 0..6 {
+            let u = victory_shader::emit::UserData { index: 0, slot: 8, root: RootType::Constants, dword };
+            assert_eq!(state.user_dword(&list, true, &u), Ok(10 + dword), "dword {dword}");
+        }
     }
 
     /// The causes of a missing root view offset are told apart.

@@ -23,7 +23,8 @@ use crate::shadow::Shadow;
 enum Seen {
     /// `len` bytes at `address` of a buffer's host copy; unordered access.
     Buffer(Arc<Shadow>, u64, u64, bool),
-    /// A title texture (resource object) whose contents the title writes.
+    /// A title texture (resource object) with a host texture: uploaded if
+    /// the title writes its contents, kept resident either way.
     Texture(usize),
     /// A view left without a host view (textures the title placed itself),
     /// by kind (diagnostics: `KINDS`).
@@ -152,10 +153,12 @@ impl Viewed {
 fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
+    // Every host texture: kept resident while viewed ([`uploads`]), the
+    // ones the host GPU writes too.
     if let View::Shader(resource, _) = view
-        && let Some(texture) = crate::resource::host_resource(*resource as This)
+        && crate::resource::host_resource(*resource as This).is_some()
     {
-        return crate::texture::title_written(texture).then_some(Seen::Texture(*resource));
+        return Some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -210,10 +213,13 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
             if !done.insert(r) {
                 continue;
             }
+            // Asking for it stamps it used and makes it resident again if
+            // eviction took it: a shader may pick it by index in this
+            // submission, and no list tracks it (`crate::resource`).
             let Some(texture) = crate::resource::host_resource(r as This) else {
                 continue;
             };
-            if crate::texture::upload_changed(list, r as This, texture) {
+            if crate::texture::title_written(texture) && crate::texture::upload_changed(list, r as This, texture) {
                 crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
                 recorded = true;
                 #[cfg(feature = "diagnostics")]
@@ -329,7 +335,7 @@ pub(crate) fn log(frames: f64) {
         tracing::info!(
             "heap views: {draws:.0} draws/frame index the heap ({writes:.0} writing through it), \
              {uploaded:.0} textures uploaded/frame; slots: {buffers} buffer views ({} ranges, \
-             {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
+             {:.1} MB, {copies} copies), {textures} textures ({} distinct); \
              left null: {}; host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
             inner.ranges.len(),
             bytes as f64 / 1e6,
@@ -529,7 +535,46 @@ void main(uint3 id : SV_DispatchThreadID) {
                 std::ptr::write_bytes(tex_bytes.cast_mut(), texel, size);
             }
         };
-        rounds(src, dst, tex, write);
+        rounds(src, dst, |at| own_view(tex, at), write);
+    }
+
+    /// The same with the texture viewed as memory the title placed itself
+    /// (`create_placed_srv`), which no table reads: its slot waits in the
+    /// heap's texture queue until `serve_textures` makes it, then reads the
+    /// texels, not the null view's zeros.
+    #[test]
+    fn placed_textures_picked_by_index_are_read() {
+        let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
+        let tex = resource(3, 4, 1, 28, LINEAR);
+        let (tex_bytes, tex_desc) = crate::resource::texture_memory(tex).unwrap();
+        let size = crate::resource::texture_layout(&tex_desc).unwrap().planes[0].layout.size as usize;
+        let address = tex_bytes as u64;
+        let placed = move |at: u64| {
+            let resource: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, LINEAR, 0, 0];
+            // Format, 2D, the default mapping, then the most detailed level
+            // and the level count; the memory address after the plain view.
+            let mut desc = [0u32; 16];
+            desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, at);
+        };
+        let write = |base: u32, texel: u8| {
+            let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+            // SAFETY: the resources' own memory, 256 bytes and the texture's.
+            unsafe {
+                let words = std::slice::from_raw_parts_mut(src_bytes.cast::<u32>(), 64);
+                for (i, w) in words.iter_mut().enumerate() {
+                    *w = base + i as u32;
+                }
+                std::ptr::write_bytes(tex_bytes.cast_mut(), texel, size);
+            }
+        };
+        rounds(src, dst, placed, write);
+    }
+
+    /// A shader view of `tex` itself at heap slot `at`.
+    fn own_view(tex: This, at: u64) {
+        crate::descriptor::create_srv(std::ptr::null(), tex, std::ptr::null(), at);
     }
 
     /// The same with the buffer and the texture in one view of physical
@@ -553,15 +598,16 @@ void main(uint3 id : SV_DispatchThreadID) {
                 std::ptr::write_bytes((b + PAGE_BYTES) as *mut u8, texel, size);
             }
         };
-        rounds(src, dst, tex, write);
+        rounds(src, dst, |at| own_view(tex, at), write);
     }
 
     const PAGE_BYTES: usize = crate::watch::PAGE;
 
     /// Three rounds of: record a dispatch reading slots 0 and 2 and writing
     /// slot 1, let the title `write` (after recording, before submitting),
-    /// submit, check the output's host copy.
-    fn rounds(src: This, dst: This, tex: This, write: impl Fn(u32, u8)) {
+    /// submit, check the output's host copy. `texture` writes the view of a
+    /// texture at the slot handle it is given (slot 2).
+    fn rounds(src: This, dst: This, texture: impl Fn(u64), write: impl Fn(u32, u8)) {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -584,7 +630,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
         crate::descriptor::create_srv(null, src, &srv, slot(0));
         crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
-        crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(2));
+        texture(slot(2));
         let heap_host = title_heap.host().expect("a host view heap");
         let (root, pso) = compile();
         let list = host.new_list().unwrap();
@@ -602,6 +648,8 @@ void main(uint3 id : SV_DispatchThreadID) {
                 list.list.SetPipelineState(&pso);
                 list.list.Dispatch(4, 1, 1);
             }
+            // As a heap-indexing draw does (`crate::draw`).
+            heap_host.serve_textures(crate::frame::current() + round as u64);
             list.defer_heap(&heap_host.viewed);
             list.close();
             // The title writes after recording, before submitting.

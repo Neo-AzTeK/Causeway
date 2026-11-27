@@ -19,11 +19,6 @@ const DIR_VARIABLE: &str = "CAUSEWAY_PROBLEMS_DIR";
 const STALE: u64 = 8 * 3600;
 /// Notes must stay cheap to read back; older detail goes to the log.
 const NOTE_LINES: usize = 150;
-/// Another AI owns these (owner, 2026-11-25).
-const EXTERNAL_PATHS: &[&str] = &[
-    "crates/victory-gpu/src/descriptor",
-    "crates/victory-gpu/src/descriptor.rs",
-];
 /// Changed by any problem's diff without being claimed.
 const SHARED_PATHS: &[&str] = &["docs", "Cargo.lock"];
 
@@ -424,10 +419,9 @@ fn within(path: &str, folder: &str) -> bool {
 struct Ranked {
     rank: u32,
     id: String,
-    owner: String,
 }
 
-/// The table rows `| rank | id | owner | ...` of `docs/problems.md`.
+/// The table rows `| rank | id | ...` of `docs/problems.md`.
 fn ranked(text: &str) -> Vec<Ranked> {
     text.lines()
         .filter_map(|line| {
@@ -435,7 +429,6 @@ fn ranked(text: &str) -> Vec<Ranked> {
             Some(Ranked {
                 rank: cells.next()?.parse().ok()?,
                 id: cells.next()?.trim_matches('`').to_owned(),
-                owner: cells.next()?.to_owned(),
             })
         })
         .collect()
@@ -505,24 +498,6 @@ impl Registry {
         std::fs::read_to_string(self.here.root.join("docs/problems.md"))
             .map(|t| ranked(&t))
             .unwrap_or_default()
-    }
-
-    /// Who else owns a problem, by this checkout's list or `main`'s: a branch
-    /// cannot take one over by editing its copy.
-    fn external(&self, id: &str) -> Result<Option<String>> {
-        let main = git(&self.here.root, &["show", "main:docs/problems.md"])
-            .map(|t| ranked(&t))
-            .unwrap_or_default();
-        let mut rows = self.table();
-        rows.extend(main);
-        ensure!(
-            !rows.is_empty(),
-            "no table in docs/problems.md, here or in main"
-        );
-        Ok(rows
-            .into_iter()
-            .find(|r| r.id == id && r.owner != "here")
-            .map(|r| r.owner))
     }
 
     fn stale(&self, state: &State) -> bool {
@@ -638,9 +613,7 @@ impl Registry {
             ));
         }
         for file in changed {
-            if EXTERNAL_PATHS.iter().any(|e| within(file, e)) {
-                found.push(format!("{file}: descriptor work belongs to another AI"));
-            } else if !SHARED_PATHS
+            if !SHARED_PATHS
                 .iter()
                 .copied()
                 .chain(state.files.iter().map(String::as_str))
@@ -809,13 +782,11 @@ impl Registry {
         let unranked = here.iter().filter(|id| !table.iter().any(|r| r.id == **id));
         let rows = table
             .iter()
-            .map(|r| (r.rank.to_string(), r.id.clone(), r.owner.clone()))
-            .chain(unranked.map(|id| ("-".into(), id.clone(), "here".into())));
+            .map(|r| (r.rank.to_string(), r.id.clone()))
+            .chain(unranked.map(|id| ("-".into(), id.clone())));
         let mut out = format!("registry: {}", self.dir.display());
-        for (rank, id, owner) in rows {
-            let what = if owner != "here" {
-                format!("external ({owner})")
-            } else if here.contains(&id) {
+        for (rank, id) in rows {
+            let what = if here.contains(&id) {
                 match self.state(&id) {
                     Err(e) => format!("DAMAGED: {e:#}"),
                     Ok(s) if s.session.is_empty() => s.status.name().into(),
@@ -864,9 +835,6 @@ impl Registry {
         take_over: bool,
         owner: Option<&str>,
     ) -> Result<String> {
-        if let Some(who) = self.external(id)? {
-            bail!("{id} belongs to {who} (docs/problems.md): do not work on it");
-        }
         let mut state = self.state(id)?;
         ensure!(
             state.status != Status::Fixed,
@@ -883,12 +851,6 @@ impl Registry {
             .iter()
             .map(|f| normal(f))
             .collect::<Result<Vec<_>>>()?;
-        for file in &files {
-            ensure!(
-                !EXTERNAL_PATHS.iter().any(|e| within(file, e)),
-                "{file}: descriptor work belongs to another AI"
-            );
-        }
         let held = state.session.clone();
         if !held.is_empty() && held != self.here.session {
             ensure!(

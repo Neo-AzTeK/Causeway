@@ -891,7 +891,8 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// With the title texture, for the GPU conversion ([`Batch::convert`]).
+    Texture(std::sync::Arc<crate::texture::Staging>, usize),
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
@@ -913,6 +914,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Conversion buffers (`crate::detile`), pooled again at the reset.
+    pooled: Vec<crate::detile::Pooled>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1072,9 +1075,17 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let mut converting = crate::texture::ConversionLists::new();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            if let Some(converted) = converting.record(self, std::mem::take(&mut batch.convert)) {
+                converted.touch_textures();
+                if let Some(prelude) = converted.prelude() {
+                    lists.push(Some(prelude));
+                }
+                lists.push(converted.list.cast().ok());
+            }
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
             if let Some(prelude) = list.prelude() {
@@ -1280,6 +1291,10 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        // The submission has run: its conversion lists go back to the pool
+        // now, before the dumps below submit lists of their own on this
+        // thread (the pool's lock would be taken twice).
+        drop(converting);
         // The submission has run and the next waits for our lock.
         release_retired();
         self.log_messages();
@@ -2077,6 +2092,10 @@ impl HostList {
         }
     }
 
+    pub(crate) fn keep_pooled(&self, buffer: crate::detile::Pooled) {
+        self.deferred().pooled.push(buffer);
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -2097,8 +2116,8 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>, resource: usize) {
+        self.deferred().copies.push(Step::Texture(staging, resource));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -2117,7 +2136,7 @@ impl HostList {
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
                     Step::Run(_) | Step::Host(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
-                    Step::Texture(_) => C::StepTextureUs,
+                    Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
                     Step::Memory(_) => C::StepMemoryUs,
                 },
@@ -2172,9 +2191,13 @@ impl HostList {
                     shadow.writing(*address, *len, *marked);
                     continue;
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, resource) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if staging.on_gpu() {
+                            batch.convert.push((staging.clone(), *resource));
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -2217,6 +2240,9 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Textures the GPU detiles, with their title textures: recorded into
+    /// one list that runs before the submission's.
+    convert: Vec<(std::sync::Arc<crate::texture::Staging>, usize)>,
 }
 
 impl Batch {
@@ -2516,6 +2542,15 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.video_buffer(size, D3D12_RESOURCE_FLAG_NONE)
+    }
+
+    /// A buffer in video memory that shaders write.
+    pub(crate) fn unordered_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.video_buffer(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    }
+
+    fn video_buffer(&self, size: u64, flags: D3D12_RESOURCE_FLAGS) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -2528,6 +2563,7 @@ impl Host {
             MipLevels: 1,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
@@ -2676,6 +2712,18 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
         crate::memory::log_frame();
+        #[cfg(feature = "diagnostics")]
+        {
+            let of = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+            crate::budget::frame([
+                of(&SUBMISSION_US[0]),
+                of(&SUBMISSION_US[1]),
+                of(&PREPARING[0]),
+                of(&PREPARING[2]),
+                of(&COPY_BACK[0]),
+                crate::draw::dispatched(),
+            ]);
+        }
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
