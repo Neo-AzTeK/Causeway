@@ -53,7 +53,7 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
-    _blob: Vec<u8>,
+    _blob: Blob,
     /// Pipelines stored since the last save.
     added: u64,
     /// Title pipelines the pre-build put in the library or found there, by
@@ -112,6 +112,8 @@ impl Drop for Held<'_> {
 static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// The library last loaded, renamed aside while mapped ([`Blob::map`]).
+const LOADED_FILE: &str = "host-pipelines.loaded.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
@@ -123,7 +125,7 @@ fn library() -> Option<&'static Mutex<Library>> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
+            let blob = DIR.get().and_then(|d| Blob::map(d)).unwrap_or_default();
             let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
@@ -140,9 +142,94 @@ fn library() -> Option<&'static Mutex<Library>> {
         .as_ref()
 }
 
+/// A library's bytes: mapped from its file (not copied into our memory,
+/// where gigabytes of it counted against the host's commit limit), or
+/// owned.
+enum Blob {
+    Owned(Vec<u8>),
+    Mapped(*const u8, usize),
+}
+
+// SAFETY: a read-only view, never written, unmapped only on drop.
+unsafe impl Send for Blob {}
+
+impl Default for Blob {
+    fn default() -> Self {
+        Blob::Owned(Vec::new())
+    }
+}
+
+impl std::ops::Deref for Blob {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Blob::Owned(v) => v,
+            // SAFETY: a mapped read-only view of `len` bytes, live until drop.
+            Blob::Mapped(at, len) => unsafe { std::slice::from_raw_parts(*at, *len) },
+        }
+    }
+}
+
+impl Drop for Blob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        if let Blob::Mapped(at, _) = *self {
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+        }
+    }
+}
+
+impl Blob {
+    /// The saved library of `dir`, mapped. The file is then renamed aside
+    /// (to [`LOADED_FILE`], which the view keeps alive), so a save writes a
+    /// new file instead of replacing one that is mapped; with no saved file,
+    /// the one renamed aside by the last run.
+    fn map(dir: &std::path::Path) -> Option<Blob> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY};
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const DELETE: u32 = 0x1_0000;
+        const SHARE_READ_DELETE: u32 = 1 | 4;
+        let (saved, aside) = (dir.join(LIBRARY_FILE), dir.join(LOADED_FILE));
+        let path = if saved.exists() { saved } else { aside.clone() };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(SHARE_READ_DELETE)
+            .open(&path)
+            .ok()?;
+        let len = file.metadata().ok()?.len() as usize;
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: an open file; the mapping holds it after the handle goes.
+        let mapping = unsafe {
+            CreateFileMappingW(file.as_raw_handle() as _, std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
+        };
+        if mapping.is_null() {
+            return None;
+        }
+        // SAFETY: a mapping of the whole file; the view keeps it alive.
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) };
+        // SAFETY: our handle; the view holds the section.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(mapping) };
+        if view.Value.is_null() {
+            return None;
+        }
+        if path != aside
+            && let Err(e) = std::fs::rename(&path, &aside)
+        {
+            tracing::warn!(error = %e, "host pipeline library not renamed aside: the next save may fail");
+        }
+        Some(Blob::Mapped(view.Value as *const u8, len))
+    }
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
+fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
@@ -171,7 +258,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let library = make(&[]).ok()?;
     Some(Library {
         library,
-        _blob: Vec::new(),
+        _blob: Blob::default(),
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
@@ -626,10 +713,10 @@ mod tests {
                 }
             }
         }
-        let first = open(&device, Vec::new()).expect("an empty library");
+        let first = open(&device, Blob::default()).expect("an empty library");
         let made = Shared(device.clone(), root.clone(), first.library.clone());
         (0..N).for_each(|i| made.store(i, &codes[i]));
-        let again = open(&device, made.serialized()).expect("the library again");
+        let again = open(&device, Blob::Owned(made.serialized())).expect("the library again");
         let shared = Shared(device, root, again.library.clone());
         let stores = Mutex::new(());
         std::thread::scope(|s| {
@@ -655,12 +742,31 @@ mod tests {
         }
     }
 
+    /// A saved library is mapped and renamed aside; a save then writes a
+    /// new file while the old one stays mapped, and without a new file
+    /// the next start maps the one aside.
+    #[test]
+    fn saved_libraries_map_and_saves_go_beside_them() {
+        let dir = tempfile::tempdir().expect("a folder");
+        std::fs::write(dir.path().join(LIBRARY_FILE), b"first").expect("written");
+        let blob = Blob::map(dir.path()).expect("mapped");
+        assert_eq!(&blob[..], b"first");
+        assert!(!dir.path().join(LIBRARY_FILE).exists() && dir.path().join(LOADED_FILE).exists());
+        write_atomically(&dir.path().join(LIBRARY_FILE), b"second").expect("a save while mapped");
+        assert_eq!(&blob[..], b"first");
+        drop(blob);
+        let blob = Blob::map(dir.path()).expect("mapped again");
+        assert_eq!(&blob[..], b"second");
+        drop(blob);
+        assert_eq!(&Blob::map(dir.path()).expect("the one aside")[..], b"second");
+    }
+
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let library = open(&device, Blob::Owned(b"not a pipeline library".repeat(16))).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());

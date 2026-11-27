@@ -21,13 +21,16 @@ pub enum Owner {
     SourceRead,
     /// Decoded loads cached.
     DecodeCache,
+    /// Bytes of disk loads written into title memory since start (not left
+    /// without bytes).
+    LoadsWritten,
     /// The pipeline library's serialized size.
     PipelineLibrary,
     /// Title physical-page sections, committed.
     TitleSections,
 }
 
-const N: usize = 9;
+const N: usize = 10;
 static BYTES: [AtomicI64; N] = [const { AtomicI64::new(0) }; N];
 
 pub fn add(owner: Owner, n: i64) {
@@ -55,10 +58,21 @@ pub(crate) fn line() -> String {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     let mb = |v: f64| v / 1e6;
+    // The host's commit (every process's, sections included) against its
+    // limit: what a failed allocation ran into.
+    let mut p = windows_sys::Win32::System::ProcessStatus::PERFORMANCE_INFORMATION {
+        cb: size_of::<windows_sys::Win32::System::ProcessStatus::PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a sized structure.
+    unsafe { windows_sys::Win32::System::ProcessStatus::K32GetPerformanceInfo(&mut p, p.cb) };
+    let page = p.PageSize as f64;
     format!(
-        "memory: private {:.0} MB, working set {:.0} MB; title sections {:.0} MB, buffer copies {:.0} MB, \
+        "memory: host commit {:.0} of {:.0} MB; private {:.0} MB, working set {:.0} MB; title sections {:.0} MB, buffer copies {:.0} MB, \
          snapshot pool {:.0} MB, pipeline library {:.0} MB, decode cache {:.0} MB; loads left without \
-         bytes {:.0} MB now, filled {:.0} MB ({:.0} MB by title accesses), read from sources {:.0} MB",
+         bytes {:.0} MB now, filled {:.0} MB ({:.0} MB by title accesses), read from sources {:.0} MB; loads written {:.0} MB",
+        mb(p.CommitTotal as f64 * page),
+        mb(p.CommitLimit as f64 * page),
         mb(c.PagefileUsage as f64),
         mb(c.WorkingSetSize as f64),
         mb(get(Owner::TitleSections)),
@@ -70,5 +84,6 @@ pub(crate) fn line() -> String {
         mb(get(Owner::LazyFilled)),
         mb(get(Owner::LazyFaults)),
         mb(get(Owner::SourceRead)),
+        mb(get(Owner::LoadsWritten)),
     )
 }

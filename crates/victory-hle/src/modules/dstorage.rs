@@ -985,6 +985,7 @@ fn lazily(request: &Request, len: usize) -> Option<Result<(), HRESULT>> {
             now.push((written_to, len));
         }
         for (a, b) in now {
+            victory_gpu::ledger::add(victory_gpu::ledger::Owner::LoadsWritten, (b - a) as i64);
             let _writing = victory_gpu::kernel_will_write(d + a, b - a);
             // SAFETY: the title's destination holds `len` bytes, and nothing
             // else writes it until completion.
@@ -1024,6 +1025,7 @@ fn lazily(request: &Request, len: usize) -> Option<Result<(), HRESULT>> {
         now.push((written_to, len));
     }
     for (a, b) in now {
+        victory_gpu::ledger::add(victory_gpu::ledger::Owner::LoadsWritten, (b - a) as i64);
         let mut data = vec![0; b - a];
         if !load.bytes(a, &mut data) {
             return Some(Err(INVALID_DATA));
@@ -1140,6 +1142,7 @@ fn into_destination(
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    victory_gpu::ledger::add(victory_gpu::ledger::Owner::LoadsWritten, len as i64);
     // The probe of loads (H0.4): what was read (source, offset, options) and
     // where to. A page destination is named by its first page number.
     #[cfg(feature = "diagnostics")]
