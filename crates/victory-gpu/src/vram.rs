@@ -91,13 +91,6 @@ pub(crate) fn has_room(budget: u64, usage: u64) -> bool {
     percent(budget, usage) < START_PCT
 }
 
-/// Whether a texture shaders were seen reading (read marks) may be made:
-/// usage under [`CRITICAL_PCT`]. Past [`START_PCT`] it starts eviction,
-/// which takes textures no list or read reached lately.
-pub(crate) fn has_room_for_read(budget: u64, usage: u64) -> bool {
-    percent(budget, usage) < CRITICAL_PCT
-}
-
 /// Textures to evict: of `(key, idle_ms, bytes)`, those idle for at least
 /// `decision.idle_ms`, longest idle first, until `decision.free` bytes are
 /// freed (the one that crosses the line included). Keys, in that order.
@@ -120,7 +113,7 @@ pub(crate) fn pick<K: Copy>(decision: Decision, candidates: &[(K, u64, u64)]) ->
 }
 
 #[cfg(windows)]
-pub(crate) use host::{init, room, room_for_read, tick};
+pub(crate) use host::{init, room, tick};
 
 #[cfg(windows)]
 mod host {
@@ -169,16 +162,6 @@ mod host {
         let asked = monitor.adapter.as_ref().and_then(query);
         let (budget, usage) = resolve(asked, monitor.plan, crate::resource::resident_bytes());
         has_room(budget, usage)
-    }
-
-    /// [`has_room_for_read`] now, as [`room`] reads its figures.
-    pub(crate) fn room_for_read() -> bool {
-        let Some(monitor) = MONITOR.get() else {
-            return true;
-        };
-        let asked = monitor.adapter.as_ref().and_then(query);
-        let (budget, usage) = resolve(asked, monitor.plan, crate::resource::resident_bytes());
-        has_room_for_read(budget, usage)
     }
 
     /// At most every [`SAMPLE_MS`]: samples budget and usage, logs them at

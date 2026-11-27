@@ -1046,10 +1046,10 @@ impl HostHeap {
         };
         let mut served = 0;
         for (index, handle, read) in picked {
-            // A slot shaders read is made up to a higher line: eviction
-            // makes room from textures no list or read reached lately.
-            let room = if read { crate::vram::room_for_read() } else { crate::vram::room() };
-            if !room {
+            // Read slots come first but share the line of the rest: past it,
+            // eviction runs against textures kept resident by the heap, and
+            // memory thrashes (one world run then timed out on the GPU).
+            if !crate::vram::room() {
                 break;
             }
             #[cfg(feature = "diagnostics")]
