@@ -18,7 +18,8 @@ are no defects, say so in a line. No summary of the change, no style notes.
 
 Also answer each of these; a "yes" or a gap is a defect:
 - Does the diff make a comment false, or remove one that gave a reason, without
-  the code now enforcing it?
+  the code now enforcing it? Does a comment on or in a changed function still
+  say what the code now does?
 - Is a test named by `// invariant(<test>)` weakened, skipped or changed so it
   no longer proves the comment? Does a new invariant's test fail without the
   code it guards?

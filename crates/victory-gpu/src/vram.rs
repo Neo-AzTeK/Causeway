@@ -93,6 +93,14 @@ pub(crate) fn resolve(query: Option<(u64, u64)>, plan: MemoryPlan, own: u64) -> 
     }
 }
 
+/// Whether host textures may be made ahead of any list's use (the texture
+/// queue of `descriptor::host`): usage under [`START_PCT`] of the budget, so
+/// that making them never starts lowering (which would take back what was
+/// just made, and textures shaders read by index are not stamped by lists).
+pub(crate) fn has_room(budget: u64, usage: u64) -> bool {
+    percent(budget, usage) < START_PCT
+}
+
 /// Textures to lower: of `(key, idle_ms, bytes)`, those idle for at least
 /// `decision.idle_ms`, longest idle first, until `decision.free` bytes are
 /// freed (the one that crosses the line included). Keys, in that order.
@@ -115,7 +123,7 @@ pub(crate) fn pick<K: Copy>(decision: Decision, candidates: &[(K, u64, u64)]) ->
 }
 
 #[cfg(windows)]
-pub(crate) use host::{init, tick};
+pub(crate) use host::{init, room, tick};
 
 #[cfg(windows)]
 mod host {
@@ -152,6 +160,18 @@ mod host {
         unsafe { adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }
             .ok()
             .map(|()| (info.Budget, info.CurrentUsage))
+    }
+
+    /// [`has_room`] now, from the adapter's live figures (else the plan's
+    /// budget against the host textures resident). Before [`init`] (tests
+    /// without a device): room.
+    pub(crate) fn room() -> bool {
+        let Some(monitor) = MONITOR.get() else {
+            return true;
+        };
+        let asked = monitor.adapter.as_ref().and_then(query);
+        let (budget, usage) = resolve(asked, monitor.plan, crate::resource::resident_bytes());
+        has_room(budget, usage)
     }
 
     /// At most every [`SAMPLE_MS`]: samples budget and usage, logs them at

@@ -84,7 +84,7 @@ fn area_of(reason: &str) -> &'static str {
     } else if any(&["not supported", "GFX10", "translate", "unsupported", "lowering"]) {
         "shader lowering"
     } else if any(&["descriptor", "heap", "slots"]) {
-        "descriptors (other AI)"
+        "descriptors"
     } else {
         "pipeline"
     }
@@ -173,7 +173,7 @@ impl Log {
             lost.id = why.split(':').next().unwrap_or("?").to_owned();
             lost.kind = lost.id.clone();
             lost.tag = "slots";
-            lost.area = "descriptors (other AI)";
+            lost.area = "descriptors";
             lost.reason = "no dynamic descriptor slots".into();
             lost.group = lost.reason.clone();
         }

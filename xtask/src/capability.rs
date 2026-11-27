@@ -24,48 +24,26 @@ const TEST_HOST_FILES: [&str; 2] =
 const TEST_HOST_MARKER: &str = "// test-host-query:";
 const MARKER_REACH: usize = 6;
 
-/// Descriptor and heap code has another owner. Its unmarked calls are counted
-/// here, exactly, so that none is added and the number only goes down.
-pub const OTHER_OWNER: &[(&str, usize)] = &[("crates/victory-gpu/src/descriptor/host.rs", 1)];
-
 const FIX: &str = "read a `Caps` field or a planner; for one format use \
                    `caps::per_resource` (docs/hardware-range.md)";
 
 const TEST_HOST_FIX: &str = "in the test host, put `// test-host-query: why` above \
                              the call (docs/hardware-range.md)";
 
-/// What is wrong in `sources`, the repository's Rust files as (path, text),
-/// with `other_owner` calls left in files this check may not change.
-pub fn check(sources: &[(String, String)], other_owner: &[(&str, usize)]) -> Vec<String> {
+/// What is wrong in `sources`, the repository's Rust files as (path, text).
+pub fn check(sources: &[(String, String)]) -> Vec<String> {
     let mut problems = Vec::new();
     for (path, text) in sources {
         if path.starts_with(CHECKER_DIR) || path.starts_with(CAPS_DIR) {
             continue;
         }
         let unmarked = unmarked(path, text, &mut problems);
-        if other_owner.iter().all(|(p, _)| p != path) {
-            let fix = if TEST_HOST_FILES.contains(&path.as_str()) { TEST_HOST_FIX } else { FIX };
-            problems.extend(unmarked.iter().map(|line| {
-                format!("{path}:{line}: the host GPU is asked outside `caps/`: {fix}")
-            }));
-        }
-    }
-    for &(path, allowed) in other_owner {
-        let found = sources
-            .iter()
-            .filter(|(p, _)| p == path)
-            .map(|(p, text)| unmarked(p, text, &mut Vec::new()).len())
-            .sum::<usize>();
-        if found > allowed {
-            problems.push(format!(
-                "{path}: {found} queries of the host GPU, {allowed} allowed: {FIX}"
-            ));
-        } else if found < allowed {
-            problems.push(format!(
-                "{path}: only {found} queries of the host GPU left: lower its count in \
-                 OTHER_OWNER (xtask/src/capability.rs) to {found}"
-            ));
-        }
+        let fix = if TEST_HOST_FILES.contains(&path.as_str()) { TEST_HOST_FIX } else { FIX };
+        problems.extend(
+            unmarked
+                .iter()
+                .map(|line| format!("{path}:{line}: the host GPU is asked outside `caps/`: {fix}")),
+        );
     }
     problems
 }
@@ -137,7 +115,7 @@ mod tests {
     const GPU: &str = "crates/victory-gpu/src/host.rs";
 
     fn run(path: &str, text: &str) -> Vec<String> {
-        check(&[(path.to_owned(), text.to_owned())], &[])
+        check(&[(path.to_owned(), text.to_owned())])
     }
 
     fn call() -> String {
@@ -198,14 +176,5 @@ mod tests {
     fn no_marker_excuses_code_outside_the_test_host() {
         let found = run(GPU, &format!("{TEST_HOST_MARKER} why\n{}", call()));
         assert_eq!(found.len(), 2, "the marker and the call: {found:?}");
-    }
-
-    #[test]
-    fn another_owners_calls_are_counted_exactly() {
-        let owned = [("crates/a.rs", 1)];
-        let found = |text: String| check(&[("crates/a.rs".to_owned(), text)], &owned).len();
-        assert_eq!(found(call()), 0);
-        assert_eq!(found(call().repeat(2)), 1);
-        assert_eq!(found(String::new()), 1);
     }
 }

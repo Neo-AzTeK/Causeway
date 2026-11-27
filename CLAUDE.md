@@ -17,11 +17,11 @@ and ask the owner for the title's folder if none is set.
 | Need | File |
 |------|------|
 | rules, flow, checks, hardware range | `CONTRIBUTING.md` |
-| cost, delegation, reading, output | `docs/agent-workflow.md` |
+| how to work efficiently: loop, proof, borrowing, cost, reading | `docs/agent-workflow.md` |
 | cross-crate flow, import resolution | `docs/architecture.md` |
 | debug variables, smoke runs | `docs/debugging.md` |
 | frame record and replay (plan) | `docs/frame-replay.md` |
-| problem sessions, problem list | `docs/problem-sessions.md`, `docs/problems.md`; skill `problem-session` |
+| todo and problem list (update after each task); separate problem sessions (optional) | `docs/problems.md`; `docs/problem-sessions.md`, skill `problem-session` |
 | capabilities, planners, fakes | `docs/hardware-range.md`, `docs/gpu-review-checklist.md` |
 | adapters verified / not verified | `docs/adapters.md` |
 | asset policy | `docs/asset-policy.md` |
@@ -35,18 +35,21 @@ and ask the owner for the title's folder if none is set.
 - Before a build or test, check no title is running (the check under "The GPU"
   in `docs/problem-sessions.md`; offline `translate`/`census` scans do not
   count): it spoils that run's timings, and several crates' tests use the GPU.
-- Descriptor and view-heap work belongs to another AI.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
-- One main session works the current goal (one correct world frame, then
-  speed) end to end, problems included. Start another session or agent only
-  for a separate task that has its own test. Problems keep their notes and
-  claims (`/problem-session <id>`), and the main session holds the
-  connected ones. No agents by default.
-- Fix the earliest missing or wrong step of the frame first. Speed work waits
-  until the frame is correct. Test a change on a frame replay
-  (`docs/frame-replay.md`) once one exists, rather than reasoning from logs.
-- A problem session, after compaction or a pause: `cargo xtask problem resume
-  <id>` and read its notes before acting.
+- One main session does the work, debugging included, toward one goal at a
+  time. Now: one correct frame; fix the earliest missing or wrong step first,
+  then speed. Test a change on a frame replay (`docs/frame-replay.md`)
+  rather than reasoning from logs. Add a session or agent only for a
+  separate task with a clear test, or when the owner asks. No agents by
+  default.
+- Before working on a listed problem that has notes, also after compaction or
+  a pause: `cargo xtask problem resume <id>` and read them.
+- One place per kind of note, so old notes cannot contradict new ones: live
+  state and todo only in `docs/problems.md`, a problem's running notes only in
+  `cargo xtask problem`; agent memory holds only owner rules, machine-local
+  paths and never-push lists, not branch tips or session logs. When a rule
+  changes, edit or delete the old note in the same step; do not add a
+  "superseded" note beside it.
 - Merge only on the owner's explicit yes; push only with their OK.
 - Grep, then read at most 150 lines; never a source file over 800 lines whole
   (`lower.rs`); at most 60 lines of output per command; do not re-read a file

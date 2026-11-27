@@ -852,6 +852,12 @@ static RESIDENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 #[cfg(windows)]
 static RESIDENT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Bytes of live host textures made resident ([`RESIDENT`]).
+#[cfg(windows)]
+pub(crate) fn resident_bytes() -> u64 {
+    RESIDENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Makes the host textures raised since the last submission resident and
 /// sets their priorities ([`residency`]). The submission's caller holds
 /// the submission lock, so raises that came before it are all here.

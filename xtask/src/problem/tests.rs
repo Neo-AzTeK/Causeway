@@ -17,8 +17,7 @@ impl World {
         world.git(&["init", "-q", "-b", "main"]);
         world.write(
             "docs/problems.md",
-            "| rank | id | owner |\n|---|---|---|\n| 1 | `first` | here |\n\
-             | 2 | `theirs` | other AI |\n",
+            "| rank | id | effect |\n|---|---|---|\n| 1 | `first` | e |\n",
         );
         world.commit("start");
         world.git(&["checkout", "-q", "-b", "work"]);
@@ -210,20 +209,11 @@ fn only_the_owner_lets_a_problem_go_and_release_frees_it() {
 }
 
 #[test]
-fn overlapping_and_external_files_are_refused() {
+fn overlapping_files_are_refused() {
     let world = World::new("overlap");
     let (a, b) = (world.session("aaa", T), world.session("bbb", T));
     new(&a, "first");
     new(&a, "second");
-    new(&a, "theirs");
-    assert!(error(&a, &claim("theirs", &[])).contains("belongs to other AI"));
-    assert!(
-        error(
-            &a,
-            &claim("first", &["crates/victory-gpu/src/descriptor/host.rs"])
-        )
-        .contains("another AI")
-    );
     a.apply(&claim("first", &["crates/victory-gpu/src"]))
         .unwrap();
     let wanted = claim("second", &["crates\\victory-gpu\\src\\Host.rs"]);
@@ -260,19 +250,6 @@ fn overlapping_and_external_files_are_refused() {
     new(&c, "third");
     c.apply(&claim("third", &["xtask"])).unwrap();
     assert!(error(&b, &claim("second", &["xtask/src"])).contains("meets xtask of third"));
-
-    // The root module of the protected folder is protected too.
-    let module = "crates/victory-gpu/src/descriptor.rs";
-    assert!(error(&a, &claim("first", &[module])).contains("another AI"));
-    world.write(module, "x\n");
-    let state = a.state("first").unwrap();
-    let found = a.problems("first", &state, &a.changed().unwrap()).unwrap();
-    assert!(
-        found
-            .iter()
-            .any(|p| p.contains("descriptor.rs: descriptor work")),
-        "{found:?}"
-    );
 
     for bad in ["../x", "C:/x", "a/*", "/x"] {
         assert!(normal(bad).is_err(), "{bad}");
@@ -453,20 +430,6 @@ fn nothing_is_proven_without_a_change_main_lacks() {
     assert!(error(&a, &proven).contains("changes nothing that main lacks"));
     world.git(&["checkout", "-q", "main"]);
     assert!(error(&a, &proven).contains("on its own branch"));
-}
-
-#[test]
-fn a_branch_cannot_take_over_another_owners_problem() {
-    let world = World::new("external");
-    let a = world.session("aaa", T);
-    new(&a, "theirs");
-    world.write(
-        "docs/problems.md",
-        "| rank | id | owner |\n| 1 | `theirs` | here |\n",
-    );
-    assert!(error(&a, &claim("theirs", &[])).contains("belongs to other AI"));
-    std::fs::remove_file(world.root().join("docs/problems.md")).unwrap();
-    assert!(error(&a, &claim("theirs", &[])).contains("belongs to other AI"));
 }
 
 #[test]

@@ -34,8 +34,7 @@ is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
 | memory | `memory`, `uma` | `GetDesc1`, `QueryVideoMemoryInfo`, ARCHITECTURE1 | `memory_plan` |
 | format use | `formats` (probed list) | `FORMAT_SUPPORT` | `format_choice` |
 
-Descriptor and heap code belongs to another owner: what it may read from here
-is `binding_plan` (class, `max_views`, `max_samplers`); today it does not call
+What descriptor and heap code may read from here is `binding_plan` (class, `max_views`, `max_samplers`); today it does not call
 it (see "Still open"). Limits are the specification's per tier; a driver may allow
 more. Where a tier sets no bound (`max_views: None`), try the size wanted and
 treat a creation failure as the refusal.
@@ -76,7 +75,8 @@ budget.
 `reference::all()`: the NVIDIA generations (`nvidia_maxwell`, `nvidia_pascal`
 = the owner's GTX 1070, `nvidia_turing`, `nvidia_ampere`, `nvidia_ada`,
 `nvidia_blackwell`; the side case `nvidia_maxwell1`, first-generation Maxwell
-at binding tier 2; `nvidia_modern` is the class name older tests use), `amd_rdna` (waves 32 to 64), `amd_gcn` (wave64 only),
+at binding tier 2; `nvidia_modern` is the class name older tests use), `amd_rdna` (waves 32 to 64), `amd_rdna2_vkd3d` (an RX 6800S read
+under Wine/vkd3d-proton), `amd_gcn` (wave64 only),
 `intel_arc` (8 to 32), `intel_igpu` (UMA, 128 MiB "dedicated"), `warp`.
 Each entry of `reference::PROFILES` carries the `Source` of its figures
 (documentation and inference, or a real device's log with its date); check it
@@ -135,10 +135,9 @@ checker's own, under `xtask/`, aside):
 Part of the test host also runs in the title (`fuses_fmad`, which asks
 OPTIONS19 and uses no sampler).
 
-Still open, all in descriptor and heap code (other owner): one `FORMAT_SUPPORT`
-query in `descriptor/host.rs` (`typed_store`, which also caches its answers
-across devices), counted in `OTHER_OWNER` so that no other is added; heap sizing
-by `binding_plan`. `format_choice` and `Caps::formats` have no caller. The
+Still open, in descriptor and heap code: `typed_store` in `descriptor/host.rs`
+asks through `caps::per_resource` but caches its answers across devices; heap
+sizing by `binding_plan`. `format_choice` and `Caps::formats` have no caller. The
 `Host` keeps one `Caps` and nothing replaces it after a device loss.
 
 ## Prior art (ideas only; no code taken)

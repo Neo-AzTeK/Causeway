@@ -1,7 +1,8 @@
 # Problem sessions
 
-One session takes one overall problem and keeps it until it is 100% fixed.
-Several run side by side. The ranked list is `docs/problems.md`. Start one by
+Optional: by default one main session does the work (`docs/agent-workflow.md`).
+These rules apply when a problem is handed to a separate session, which keeps
+it until it is 100% fixed. The ranked list is `docs/problems.md`. Start one by
 telling a new session:
 
     /problem-session <id>
@@ -111,10 +112,7 @@ another's is refused. Then narrow it, or wait, or agree how the two stay apart
 which covers those two claims only; it is better to ask the owner than to guess
 for a large shared file. `check`
 fails on a changed file that is not claimed (`docs/` and `Cargo.lock` are
-free) and on any descriptor file: that work belongs to another AI, as do the
-rows of `docs/problems.md` whose owner is not `here`. Descriptor edits in
-files other than `crates/victory-gpu/src/descriptor.rs` and the `descriptor/`
-folder are not detected: block on those.
+free).
 Whoever merges second first merges `main` into its branch and redoes the check
 chain and the proof run.
 

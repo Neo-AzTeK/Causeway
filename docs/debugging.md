@@ -11,10 +11,12 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | stack dump per thread at listed seconds |
 | `VICTORY_WATCH=<rva>,...` | logs title `u32` changes at RVAs |
+| `VICTORY_DRAW_BUDGET_MS=33` | test mode: skips draws past that many ms (small draws, compute and copies still run); H in the game window draws one whole frame and holds the game there until H again |
+| `VICTORY_PROFILE=<file>` | CSV line of times and draw counts per presented frame (keep outside repo) |
 | `VICTORY_KEYS=30:Enter,12-280/4:Enter,285-300:W` | presses keys at seconds, intervals, or holds through ranges regardless of focus |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | dumps title memory to cache folder on crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with capture flags above, saves all render targets for captured frames |
+| `VICTORY_DUMP_TARGETS=1` | with capture flags above, saves all render targets for captured frames; read with `cargo xtask dumps <run> --frame <n>` (list, `--only <part>`), or measure one dump split by another under masks (`--measure <part> --by <part> --mask <part>:<min>`) |
 | `VICTORY_D3D12_DEBUG=1` | enables host D3D12 debug layer |
 | `VICTORY_D3D12_GBV=1` | with debug layer, GPU-based validation (reports bad descriptors without fault; slow) |
 | `VICTORY_D3D12_DRED=1` | on GPU failure, logs hit allocation and in-flight commands |
@@ -24,7 +26,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_PROBE_WINDOW=<hash>:<user data index>[:big]` | in listed frames (or all frames with `:big`), logs words of table buffers >64 B (title and host copy) at user-data byte offset; with `:big`, only when loop counts at `+4` / `+0x374` exceed 4096 or window passes view |
 | `VICTORY_GPU_TIMING=1` | with probe window, runs/times each submission list separately and logs slow lists and commands |
 | `VICTORY_D3D12_WARP=1` | runs host device on WARP software adapter (slow; no driver reset) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | caps translated shader loops at `n` iterations/lane instead of 2^20 (separate cache entries); faster world frames at lower `n` indicate loop-bound slowness |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | caps translated shader loops at `n` iterations/lane instead of the stage limits (pixel 128, vertex and mesh 256, compute 4,096, lower when deeply nested; 2^20 means the stage limits; separate cache entries); faster world frames at lower `n` indicate loop-bound slowness |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records process audio output to WAV |
 | `VICTORY_XMA_DUMP=<dir>` | dumps context and input for first 32 XMA voices |
 

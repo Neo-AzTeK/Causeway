@@ -4,6 +4,7 @@ mod capability;
 mod comments;
 mod machine;
 mod compare;
+mod dumps;
 mod load;
 mod policy;
 mod problem;
@@ -56,6 +57,9 @@ enum Cmd {
     /// Judge one smoke run against earlier runs, per world line: speed against
     /// the spread, fidelity counters; exits with an error on a regression.
     Compare(compare::Compare),
+    /// What a frame's dumped render targets hold (`VICTORY_DUMP_TARGETS=1`):
+    /// list them, or measure one split by another under masks.
+    Dumps(dumps::Dumps),
     /// Smoke runs requested by many sessions, run one at a time by one runner:
     /// `queue add`, `queue run`, `queue status`.
     Queue(Box<queue::Queue>),
@@ -69,6 +73,7 @@ fn main() -> Result<()> {
         Cmd::Problem(command) => problem::run(&root, &command),
         Cmd::Alone { command } => smoke::alone(&command),
         Cmd::Compare(args) => compare::run(&args),
+        Cmd::Dumps(args) => dumps::run(&args),
         Cmd::Queue(args) => queue::run(&root, &args),
         Cmd::Setup { game_dir } => setup::run(&root, game_dir.as_deref()),
     }

@@ -30,8 +30,8 @@ driver change).
 - When its checks pass, ask the owner. Merge into `main` only on their explicit
   yes, and push only with their OK. Never force-push or rewrite `main`. Open
   PRs only when the owner asks.
-- A game problem is owned by one problem session until fixed, with a stricter
-  bar for "done": `docs/problem-sessions.md`.
+- A game problem handed to a separate session is owned by it until fixed, with
+  a stricter bar for "done": `docs/problem-sessions.md`.
 - Mark a deliberate simplification `// shortcut:` with its limit.
 - A new dependency needs a measured gain or a correctness reason, and a
   GPL-3.0-compatible licence.
@@ -48,6 +48,11 @@ updated in the same diff. Match a comment to how binding it is:
 | explains why (hardware quirk, rejected approach) | keep it, short |
 | marks a deliberate limit | `// shortcut:` with the limit |
 | restates the code, or is stale | delete it in code you already change, never in a sweep |
+| reports a measurement (a figure, a date, a run, a shader of the title) | say the rule it led to; the figure goes in `docs/adapters.md` or run notes outside the repository |
+
+`cargo xtask policy` counts dated and "for now" comments so their number only
+goes down, and refuses title shader names and work split by owner in comments
+(`xtask/src/comments.rs`).
 
 `cargo xtask policy` (pre-commit, and the workspace tests) fails when an
 invariant names no existing test, and when the number of `decision NNNN`
