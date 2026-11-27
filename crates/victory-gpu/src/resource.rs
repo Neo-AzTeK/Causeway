@@ -1020,6 +1020,12 @@ impl HostTexture {
         }
     }
 
+    /// Bytes it takes on the host GPU.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// A submission holds it: stamped as used now and resident again if
     /// eviction took it, so a list recorded long ago finds it there.
     pub(crate) fn touch(&self) {
@@ -1453,6 +1459,11 @@ fn shared_texture(
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
     let t = std::sync::Arc::new(make_texture(&d, state, clear)?);
+    #[cfg(feature = "diagnostics")]
+    if let Some(tex) = texture_layout(desc) {
+        let plane = &tex.planes[0];
+        crate::levels::count("made", (address + plane.offset) as *const u8, &plane.layout, t.bytes);
+    }
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

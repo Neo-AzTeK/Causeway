@@ -642,6 +642,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         }
     };
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    #[cfg(feature = "diagnostics")]
+    crate::levels::count("first upload", memory, &layout, copy.bytes());
     let layout_size = layout.size as usize;
     let s = Arc::new(Staging {
         way,

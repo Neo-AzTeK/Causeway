@@ -67,6 +67,8 @@ pub mod signature;
 mod switch;
 #[cfg(windows)]
 mod tdr;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod levels;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
