@@ -21,6 +21,13 @@ Each item names its problem in the ranked table below.
       everywhere. Tonemap and upscale keep the picture they get, so this
       second loss is in lighting or composition. Measured in one frame of
       one shot; not pinned to one pass, no causal test yet
+- [ ] Texture slots shaders pick by index stay empty because memory runs
+      out (`placed-texture-slots`): probes show the waiting slots need about
+      as much video memory again as the textures already resident, which
+      are all mapped (holding only mapped levels would not free room) and
+      kept resident only because the heap views them. Next: learn which
+      heap slots shaders really read (a read bit per slot), then make and
+      keep only those
 - [ ] Owner decides how the original project's later updates come in: one
       commit at a time, or squashed; cleaned either way
 - [ ] Game run that includes the newest shader fix (lane mask joined with data)
