@@ -11,13 +11,18 @@ Goal: **one correct frame** (`docs/agent-workflow.md`).
 
 Each item names its problem in the ranked table below.
 
-- [ ] Trace the intro's first street shot from the newest build's dumps,
-      which work again (`scene-blocker`)
+- [ ] Owner chooses the next step for the 3D scene (`scene-blocker`). Traced
+      on the newest build: the geometry reaches the main pass and its normals
+      and depth, but most surfaces have no base colour there, the earliest
+      wrong step, as before (empty texture slots, the descriptor side). A
+      second loss after the main pass is possible, not shown: surfaces that
+      do have colour are black on screen in the traced shot (guess: exposure
+      or lighting). Settling it needs the same shot on two builds
 - [ ] Owner decides how the original project's later updates come in: one
       commit at a time, or squashed; cleaned either way
 - [ ] Game run that includes the newest shader fix (lane mask joined with data)
-      and shows the picture: ran on 2026-11-27 with dumps, the picture not
-      looked at yet (item above)
+      and shows the picture: ran on 2026-11-27 with dumps; surfaces still
+      black (item above); its own effect not separated
 - [ ] Run the `victory-gpu` tests with the new shader changes (`gpu-tests-hang`
       may get in the way)
 - [ ] Mesh programs whose outputs pass the host's size limit: see whether
