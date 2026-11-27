@@ -25,9 +25,14 @@ Each item names its problem in the ranked table below.
       out (`placed-texture-slots`): probes show the waiting slots need about
       as much video memory again as the textures already resident, which
       are all mapped (holding only mapped levels would not free room) and
-      kept resident only because the heap views them. Next: learn which
-      heap slots shaders really read (a read bit per slot), then make and
-      keep only those
+      kept resident only because the heap views them. Read bits are built:
+      shaders mark each host slot they read by index (`view_reads`, bits
+      after the write bits in the marks bitmap), and the texture queue makes
+      read slots first, up to the critical memory level; the full shader
+      scan lost no program. Next: a world run's "read marks since the last
+      queue line" figures (how many read slots wait null, how many get made)
+      and its frames against the last run; if read slots then fit, stop
+      keeping unread heap-viewed textures resident (null their slots first)
 - [ ] Owner decides how the original project's later updates come in: one
       commit at a time, or squashed; cleaned either way
 - [ ] Game run that includes the newest shader fix (lane mask joined with data)
