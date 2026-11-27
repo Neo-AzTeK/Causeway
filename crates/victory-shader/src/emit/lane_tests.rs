@@ -1474,10 +1474,11 @@ fn a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own() {
 }
 
 /// [`a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own`]
-/// with odd lanes going round once more (to their own wave's total), then a
-/// first-lane read of the sum after the loop: the lanes left at different
-/// iterations, so the sum is not alike there and the console's first lane
-/// (an even one) gives every lane the sum of the waves before its own.
+/// with the sum kept in v11 (no first-lane read in the loop) and odd lanes
+/// going round once more (to their own wave's total), then a first-lane read
+/// of the sum after the loop: the lanes left at different iterations, so the
+/// sum is not alike there and the console's first lane (an even one) gives
+/// every lane the sum of the waves before its own.
 #[test]
 fn a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane() {
     let (mut body, want) = wave_prefix(&[
@@ -1487,13 +1488,72 @@ fn a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane() {
         0x3614_0081, // v_and_b32 v10, 1, v0
         0x4A14_0F0A, // v_add_nc_u32 v10, v10, v7
     ]);
-    let exit = body.iter().position(|&w| w == 0x7DA4_0E12).unwrap();
-    body[exit] = 0x7DA4_1412; // v_cmpx_eq_u32 s18, v10
+    for (old, new) in [
+        (0x7E10_0280, 0x7E16_0280), // v_mov_b32 v11, 0 (for v8)
+        (0x7E22_0508, 0xBF80_0000), // s_nop 0 (for the first-lane read)
+        (0x4A10_1011, 0x4A16_110B), // v_add_nc_u32 v11, v11, v8
+        (0x7DA4_0E12, 0x7DA4_1412), // v_cmpx_eq_u32 s18, v10
+    ] {
+        let at = body.iter().position(|&w| w == old).unwrap();
+        body[at] = new;
+    }
     body.extend([
-        0x7E3C_0508, // v_readfirstlane_b32 s30, v8
+        0x7E3C_050B, // v_readfirstlane_b32 s30, v11
         0x7E10_021E, // v_mov_b32 v8, s30
     ]);
     if let Some(got) = two_halves_with_lds(&body, 256) {
         assert_eq!(got, want);
+    }
+}
+
+/// The loop of [`a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane`]
+/// alone: its first-lane read is not taken per host wave, since each half
+/// would carry its own last result out of a loop its lanes leave apart; the
+/// exchange it needs cannot be in a loop, so the program asks for waves of 64.
+#[test]
+fn a_first_lane_read_in_a_loop_lanes_leave_apart_is_not_taken_per_half() {
+    let (mut body, _) = wave_prefix(&[
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20 (unused)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3614_0081, // v_and_b32 v10, 1, v0
+        0x4A14_0F0A, // v_add_nc_u32 v10, v10, v7
+    ]);
+    let exit = body.iter().position(|&w| w == 0x7DA4_0E12).unwrap();
+    body[exit] = 0x7DA4_1412; // v_cmpx_eq_u32 s18, v10
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 256, 1).unwrap();
+    assert_eq!(
+        crate::emit::required_waves(&shader.dxil),
+        Some((64, 64)),
+        "{:?}",
+        shader.wave64_why
+    );
+}
+
+/// A value a loop's head writes from its counter, with the upper 32 lanes
+/// going round once more, then a first-lane read of it after the loop: each
+/// lane holds its own last iteration's value, and the console's first lane
+/// (lane 0, which left first) gives every lane 0, the upper host wave too.
+/// (A lane read first makes the console wave two halves of one wave.)
+#[test]
+fn a_loop_counter_copy_read_after_lanes_leave_apart_takes_the_first_lane() {
+    let body = [
+        0xD760_0013,
+        0x0201_7F00, // v_readlane_b32 s19, v0, 63 (unused)
+        0x2C06_0085, // v_lshrrev_b32 v3, 5, v0
+        0x4A06_0681, // v_add_nc_u32 v3, 1, v3
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7E02_0202, // L: v_mov_b32 v1, s2
+        0x8002_8102, // s_add_u32 s2, s2, 1
+        0x7DA2_0602, // v_cmpx_lt_u32 s2, v3
+        0xBF89_FFFC, // s_cbranch_execnz L
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E3C_0501, // v_readfirstlane_b32 s30, v1
+        0x7E10_021E, // v_mov_b32 v8, s30
+    ];
+    if let Some(got) = on_waves_of_32(&body, 64) {
+        assert_eq!(got, vec![0; 64]);
     }
 }

@@ -6844,7 +6844,7 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32"
                 if self.virt
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                        if inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.alike_at(x, self.cur_ir))) =>
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.own_first_lane(x, self.cur_ir))) =>
             {
                 // Alike in every lane of the console wave: the lane's own
                 // value is its first lane's, in either host wave.

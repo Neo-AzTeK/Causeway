@@ -87,6 +87,18 @@ impl Uniform {
         self.same.contains(&v) && self.def.get(&v).is_some_and(|&d| self.left_together(d, at))
     }
 
+    /// Whether a first-lane read in block `at` of `v` may take each host
+    /// wave's own lane: `v` is alike there, and no loop holding `at` lets
+    /// lanes leave at different iterations (each half would carry its own
+    /// last result out, as a scalar both halves take as one).
+    pub(super) fn own_first_lane(&self, v: Value, at: usize) -> bool {
+        self.alike_at(v, at)
+            && self
+                .loops
+                .get(at)
+                .is_some_and(|ls| ls.iter().all(|l| !self.apart[*l]))
+    }
+
     /// A value of block `d` read in block `at`: no loop that holds `d` but
     /// not `at` lets lanes leave at different iterations (each lane would
     /// carry its own last iteration's value out).
