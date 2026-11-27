@@ -130,7 +130,7 @@ static WRITERS: Mutex<Option<Writers>> = Mutex::new(None);
 
 /// Frames per writers line: long enough that a page written now and then
 /// counts as written.
-const FRAMES_PER_WINDOW: u64 = 600;
+const FRAMES_PER_WINDOW: u64 = 100;
 
 fn page_entry(w: &mut Writers, page: usize) -> &mut (Option<Class>, u8) {
     w.pages.entry(page).or_insert_with(|| {
