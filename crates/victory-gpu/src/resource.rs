@@ -962,7 +962,9 @@ fn lower_idle(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
     let picked: Vec<&Live> = crate::vram::pick(decision, &candidates).into_iter().map(|i| &live[i]).collect();
     let lowered = lower(device, &picked);
     if lowered > 0 {
-        tracing::info!("lowered {} idle host textures ({:.0} MB) to the lowest residency priority", picked.len(), lowered as f64 / 1e6);
+        // Often (each texture that goes idle again): the budget line names
+        // what is being lowered.
+        tracing::debug!("lowered {} idle host textures ({:.0} MB) to the lowest residency priority", picked.len(), lowered as f64 / 1e6);
     }
 }
 
@@ -984,7 +986,8 @@ fn lower(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, textures: 
     let priorities = vec![D3D12_RESIDENCY_PRIORITY_MINIMUM; objects.len()];
     // SAFETY: as many priorities as live objects.
     if let Err(e) = unsafe { device.SetResidencyPriority(objects.len() as u32, objects.as_ptr(), priorities.as_ptr()) } {
-        tracing::warn!(error = %e, count = objects.len(), "idle host textures not lowered");
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(error = %e, count = objects.len(), "idle host textures not lowered"));
         return 0;
     }
     // A use racing this store (a raise's fast path, which saw NORMAL) keeps
@@ -999,7 +1002,7 @@ fn lower(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, textures: 
 
 /// Bytes of live host textures resident at the lowest priority ([`LOW`]):
 /// given back to the memory manager, so not counted against the budget
-/// when deciding what to lower ([`lower_idle`]).
+/// when the adapter's usage cannot be queried (`crate::vram::counted`).
 #[cfg(windows)]
 static LOWEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2651,6 +2654,7 @@ pub(crate) mod tests {
             let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
             let key = copy.texture.as_raw() as usize;
             let entry = live.iter().find(|l| l.key == key).expect("a live entry");
+            assert_eq!(copy.residency(), NORMAL, "not lowered by another submission");
             assert_eq!(lower(&host.device, &[entry]), entry.bytes);
         }
         assert_eq!(copy.residency(), LOW, "still resident, at the lowest priority");

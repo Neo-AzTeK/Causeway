@@ -7,8 +7,8 @@
 //! budget, host textures no list reached for a while are lowered to the
 //! lowest residency priority (over the budget, the memory manager moves
 //! them out first; they stay resident, as heap-indexing shaders may reach
-//! them), longer-idle first, until usage less the bytes already at that
-//! priority is back to [`TARGET_PCT`]; the closer to the budget, the
+//! them), longer-idle first, until usage is back to [`TARGET_PCT`] (see
+//! [`counted`]); the closer to the budget, the
 //! shorter the idle time that qualifies. No size is fixed: every figure is a
 //! share of the budget. [`resolve`] picks the (budget, usage) pair: the
 //! query's, or when it fails the `MemoryPlan` budget (`caps::memory_plan`: the
@@ -73,6 +73,14 @@ pub(crate) fn decide(budget: u64, usage: u64) -> Decision {
         _ => IDLE_MS,
     };
     Decision { free: usage.saturating_sub(target), idle_ms }
+}
+
+/// The usage to decide on: the adapter's local-segment `usage` as the query
+/// gives it (`queried`: textures the memory manager moved out are not in
+/// it), else the host's resident bytes less the `lowest` of them already at
+/// the lowest priority, which the policy has given back.
+pub(crate) fn counted(queried: bool, usage: u64, lowest: u64) -> u64 {
+    if queried { usage } else { usage.saturating_sub(lowest) }
 }
 
 /// The (budget, usage) to decide on: the query's `(budget, current usage)`,
@@ -149,7 +157,7 @@ mod host {
     /// At most every [`SAMPLE_MS`]: samples budget and usage, logs them at
     /// most every [`LOG_MS`], and returns what to lower given `own` bytes
     /// of host textures resident, `lowest` of them at the lowest priority
-    /// already (not counted as used). `None` between samples.
+    /// already ([`counted`]). `None` between samples.
     pub(crate) fn tick(own: u64, lowest: u64) -> Option<Decision> {
         let monitor = MONITOR.get()?;
         let now = Instant::now();
@@ -160,7 +168,7 @@ mod host {
         state.sampled = Some(now);
         let asked = monitor.adapter.as_ref().and_then(query);
         let (budget, usage) = resolve(asked, monitor.plan, own);
-        let decision = decide(budget, usage.saturating_sub(lowest));
+        let decision = decide(budget, counted(asked.is_some(), usage, lowest));
         if state.logged.is_none_or(|t| now.duration_since(t).as_millis() >= u128::from(LOG_MS)) {
             state.logged = Some(now);
             tracing::info!(
@@ -279,6 +287,11 @@ mod tests {
         // The policy still works on the fallback: 3 GB of 4 GB is pressure.
         let (budget, usage) = resolve(None, nothing, own);
         assert!(decide(budget, usage).free > 0);
+        // Bytes already at the lowest priority count only without the query:
+        // the adapter's usage leaves out what the memory manager moved out.
+        assert_eq!(counted(false, usage, usage / 2), usage - usage / 2);
+        assert_eq!(counted(true, usage, usage / 2), usage);
+        assert_eq!(counted(false, 1, 2), 0);
         assert_eq!(decide(budget, 2 * GB).free, 0);
         // A small card is under pressure at the same own bytes, a large one not.
         assert!(decide(small.budget, own).free > 0);
