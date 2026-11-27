@@ -11,19 +11,13 @@ Goal: **one correct frame** (`docs/agent-workflow.md`).
 
 Each item names its problem in the ranked table below.
 
-- [ ] Title crash (a write to address zero in the title's code) at a captured
-      frame when render targets are dumped: comes with detiling on the host
-      GPU (`a69a361`); its parent runs clean, and the same build without the
-      dumps runs clean. Likely why, from the code and the runs, fix not tried:
-      a submission keeps the conversion lists' lock to its end, and a dump
-      made at that end submits again and waits on the same lock. Until fixed,
-      scene work needs the commit before it or runs without dumps
-      (`scene-blocker`; a problem of its own if the owner agrees)
+- [ ] Trace the intro's first street shot from the newest build's dumps,
+      which work again (`scene-blocker`)
 - [ ] Owner decides how the original project's later updates come in: one
       commit at a time, or squashed; cleaned either way
 - [ ] Game run that includes the newest shader fix (lane mask joined with data)
-      and shows the picture: ran twice on 2026-11-27, both crashed before the
-      world could be captured (item above)
+      and shows the picture: ran on 2026-11-27 with dumps, the picture not
+      looked at yet (item above)
 - [ ] Run the `victory-gpu` tests with the new shader changes (`gpu-tests-hang`
       may get in the way)
 - [ ] Mesh programs whose outputs pass the host's size limit: see whether
@@ -56,6 +50,10 @@ Not seen to change the picture yet. Where each ran: `docs/adapters.md`.
 - [x] Shader flag for UAVs outside pixel and compute (validator refusals)
 - [x] Compute shaders with implicit derivatives pass the validator
 - [x] Lane mask joined with data at a uniform join
+- [x] Render-target dumps no longer stop the game: a submission kept the
+      lock of the GPU detiling's lists while the dumps at its end submitted
+      again (it stopped the title at the first captured frame since
+      `a69a361`); one game run with dumps ran its full time
 
 ## Ranked problems
 

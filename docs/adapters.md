@@ -42,11 +42,11 @@ written down.
 
 | Change | Checked by | Not yet shown |
 |--------|------------|---------------|
-| root constants read whatever their dword number | part of the 2026-11-27 title run | the run's result; an earlier version of it came before a device removal |
+| root constants read whatever their dword number | a full 6-minute title run, 2026-11-27, RTX 2060 SUPER: no device removal | effect on the picture; other adapters |
 | loop limits by shader stage | tests; part of the 2026-11-27 title run | the run's result; whether a real loop is cut short |
 | "UAVs at every stage" shader flag | tests, validator; part of that run | effect in the title |
 | compute shaders with implicit derivatives ask for validator 1.8 | tests, validator; part of that run | effect in the title; whether an older Windows D3D12 runtime accepts such a module |
-| lane mask joined with data keeps its number | tests, one of them on the GPU (RTX 2060 SUPER); validator | any title run |
+| lane mask joined with data keeps its number | tests, one of them on the GPU (RTX 2060 SUPER); validator; part of the same full title run | effect in the title |
 
 The validator in these rows is the Windows SDK's `dxil.dll` (10.0.26100.0).
 
