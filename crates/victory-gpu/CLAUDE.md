@@ -31,6 +31,13 @@
   `register`) is never a `Vec` or stack array: `shadow::loose` write-protects
   the 4 MiB window around it, and over the host heap that hangs (about every
   second run). Use `watch::tests::pool` or `watch::tests::owned_window`.
+- Shader output a test reads from a host copy must not be copied over: any
+  submission with a list bound to the page table (`crate::memory`, another
+  test's, at random) brings every copy up to date, a copy of untracked memory
+  (the C heap, where committed resources live in tests) whole, and a tracked
+  one where its pages changed. Put the output in `watch::tests::pool` memory
+  that nothing writes, let the test's own submission take it before the
+  dispatch, and assert `!Shadow::stale` over it before reading.
 - A hanging test: run the binary directly, `timeout 60 <exe> --test-threads=1
   <filters>`; the last `test name ...` line names the stuck one.
 - No wall-clock bounds near a few milliseconds and no "consecutive" assertions
