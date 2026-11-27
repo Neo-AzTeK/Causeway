@@ -1476,9 +1476,9 @@ fn a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own() {
 /// [`a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own`]
 /// with the sum kept in v11 (no first-lane read in the loop) and odd lanes
 /// going round once more (to their own wave's total), then a first-lane read
-/// of the sum after the loop: the lanes left at different iterations, so the
-/// sum is not alike there and the console's first lane (an even one) gives
-/// every lane the sum of the waves before its own.
+/// of the sum after the loop: the halves exchange there, and the console's
+/// first lane (an even one) gives every lane the sum of the waves before its
+/// own. (The sum needs itself, so it is never proven alike.)
 #[test]
 fn a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane() {
     let (mut body, want) = wave_prefix(&[
@@ -1553,6 +1553,9 @@ fn a_loop_counter_copy_read_after_lanes_leave_apart_takes_the_first_lane() {
         0x7E3C_0501, // v_readfirstlane_b32 s30, v1
         0x7E10_021E, // v_mov_b32 v8, s30
     ];
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 64, 0).unwrap();
+    assert_eq!(crate::emit::required_waves(&shader.dxil), Some((32, 32)));
     if let Some(got) = on_waves_of_32(&body, 64) {
         assert_eq!(got, vec![0; 64]);
     }
