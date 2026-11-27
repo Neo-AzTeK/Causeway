@@ -18,7 +18,8 @@
 //! Textures read through descriptor tables are brought up to date, and for
 //! shaders that index the heap themselves every texture with a resource
 //! object the heap views (`crate::bindless`); textures the title placed in
-//! memory itself are not made for the heap (see `descriptor::host`). Plane
+//! memory itself are made for the heap by its texture queue, a share per
+//! frame while video memory has room (`HostHeap::serve_textures`). Plane
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 

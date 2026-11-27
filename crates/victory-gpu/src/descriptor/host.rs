@@ -143,6 +143,10 @@ const TABLED_GRACE: u64 = 8;
 /// Slots the queue makes in one frame at most, per heap: making a host
 /// texture and uploading it costs time in the frame that does it.
 const SERVED_PER_FRAME: usize = 256;
+/// Frames a slot the queue could not make waits before it is tried again:
+/// long enough that a texture the host has no memory for does not take the
+/// frame's share every frame.
+const RETRY_FRAMES: u64 = 30;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -853,9 +857,12 @@ impl HostHeap {
                     handle,
                 };
                 made.queue.insert(index, waiting);
-            } else if made.postponed[index as usize] {
-                made.queue.remove(&index);
             }
+            let left = if !later && made.postponed[index as usize] {
+                made.queue.remove(&index)
+            } else {
+                None
+            };
             made.postponed[index as usize] = later;
             #[cfg(feature = "diagnostics")]
             let (placed, mut at) = (making.1 == 4, std::time::Instant::now());
@@ -874,6 +881,15 @@ impl HostHeap {
             self.set_mark(slot, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(slot));
+            }
+            // The queue's slot the host could not make (its texture: out of
+            // memory, say): waits again, tried [`RETRY_FRAMES`] later, its
+            // place among writes kept. A table read finding it fails as
+            // before (once, then left null until rewritten).
+            let retry = kept.is_none() && for_draw && !tabled && is_placed_texture(&view);
+            if let Some(waiting) = left.filter(|_| retry) {
+                made.postponed[index as usize] = true;
+                made.queue.insert(index, Waiting { due: frame + RETRY_FRAMES, ..waiting });
             }
             #[cfg(feature = "diagnostics")]
             lap(crate::copystat::PART_MAKE);
@@ -1942,10 +1958,13 @@ mod tests {
         super::super::record(handle, View::Placed(false, resource, desc));
     }
 
-    /// A postponed slot waits in the queue and is made once a frame by
-    /// `serve_textures` (as a draw would make it), not twice in a frame; a
-    /// slot a draw read through a table waits `TABLED_GRACE` frames when
-    /// written again; the newest write is made first.
+    /// A postponed slot waits in the queue and is tried once a frame by
+    /// `serve_textures` (as a draw would make it), not twice in a frame; one
+    /// the host cannot make waits `RETRY_FRAMES` again; a slot a draw read
+    /// through a table waits `TABLED_GRACE` frames when written again; the
+    /// newest write is tried first. These views have no memory, so none is
+    /// made: `bindless`'s `placed_textures_picked_by_index_are_read` reads a
+    /// made one.
     #[test]
     fn the_queue_makes_postponed_slots_for_shaders() {
         let Some(heap) = HostHeap::new(false, 4) else {
@@ -1965,17 +1984,17 @@ mod tests {
         assert_eq!(heap.queued(), 1);
         let before = made();
         assert_eq!(heap.serve_textures(frame), 1);
-        assert_eq!(made() - before, 1, "made by the queue");
-        assert!(!postponed(1), "made as a draw makes it");
-        assert_eq!(heap.queued(), 0);
+        assert_eq!(made() - before, 1, "tried by the queue");
+        assert!(postponed(1), "not made: it waits again");
+        assert_eq!(heap.made.lock().unwrap().queue[&1].due, frame + RETRY_FRAMES);
         assert_eq!(heap.made.lock().unwrap().tabled[1], 0, "the queue is not a table read");
 
         // Once a frame: a slot written after the frame's pass waits.
         place(handle(2), 4);
         heap.sync(0, 4, handle);
         assert_eq!(heap.serve_textures(frame), 0);
-        assert_eq!(heap.queued(), 1);
-        assert_eq!(heap.serve_textures(frame + 1), 1);
+        assert_eq!(heap.queued(), 2);
+        assert_eq!(heap.serve_textures(frame + 1), 1, "slot 2; slot 1 not due again yet");
 
         // A table's slot written again waits for the draw that reads it.
         heap.mirror(3, handle(3), true);
@@ -1993,8 +2012,8 @@ mod tests {
             (m.queue[&1].write, m.queue[&3].write)
         };
         assert!(order.0 > order.1);
-        assert_eq!(heap.serve_textures(frame + TABLED_GRACE), 2);
-        assert_eq!(heap.queued(), 0);
+        assert_eq!(heap.serve_textures(frame + TABLED_GRACE), 2, "slots 1 and 3");
+        assert_eq!(heap.queued(), 3, "all wait again, none made");
     }
 
     /// A slot holding a view of a texture the title placed is left null for
