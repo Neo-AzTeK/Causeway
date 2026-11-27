@@ -359,13 +359,17 @@ the bytes they touch, not by measured savings.
 
 ## Tried
 
-- **Title memory used by the GPU in place** (`VICTORY_IN_PLACE=1`, off). It
-  serves H0.1 from the other side. The runtime maps title memory as 64 KiB
-  views, so the big GPU heap never opened whole. An open heap also pins its
-  view, so Windows refused the title's unmaps, and the title crashed. Leads:
-  - open the section rather than the view (`docs/problems.md`);
-  - for pools the title allocates whole, open them at allocation time and
-    release before its free (needs a hook on the free).
+- **Title memory used by the GPU in place.** It serves H0.1 from the other
+  side. Opening the runtime's 64 KiB views by address (`VICTORY_IN_PLACE=1`)
+  pins them, so Windows refused the title's unmaps and the title crashed.
+  **Built, on by default:** physical pages are now committed sections of
+  1 GiB at most, which the device opens whole (a probe: committed only,
+  under 4 GiB), and buffers are placed over runs of consecutive pages
+  (`inplace.rs`). One world run (machine busy): median 500 ms = 197
+  preparing + 220 GPU + 43 copy-back, against ~880-980 before. Cost: the
+  sections' commit is taken up front (~6.1 GB), and a cold-cache boot then
+  met the commit limit (32 GB RAM, 9.5 GB pagefile). Left: pools the title
+  allocates itself (open them at allocation time, release before the free).
 - **Heap slot search** replaced by a bitmap: recording sums fell, frame time
   did not.
 - **Earlier preparing work:** −38% of refresh-check cost. Estimate then: another
