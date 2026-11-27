@@ -240,9 +240,10 @@ impl Shadow {
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.in_place.is_some() {
-            // The GPU reads it where it lies: pages disk loads left
-            // without bytes take them first.
-            crate::watch::fill_lazy(self.start as usize, self.len as usize);
+            // The GPU reads it where it lies: pages of this range disk
+            // loads left without bytes take them first (the rest of the
+            // view, textures read through `host::read`, stays without).
+            crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
             list.keep_in_place(self);
             return;
         }
@@ -354,7 +355,9 @@ impl Shadow {
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         // Written in place: nothing to snapshot or copy back.
         if self.in_place.is_some() {
-            crate::watch::fill_lazy(self.start as usize, self.len as usize);
+            // A GPU write lands past the guard: the load's bytes go in
+            // first, or a later fill would cover what the GPU wrote.
+            crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
             list.keep_in_place(self);
             return;
         }

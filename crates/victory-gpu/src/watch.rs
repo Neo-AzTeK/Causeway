@@ -329,7 +329,13 @@ fn set_protection(page: usize, protection: u32) -> bool {
 /// Addresses showing the same physical page (`alias_of`) left without
 /// bytes by the same load now show the bytes too: their entries go, and
 /// they are guarded as other pages ([`settle`]).
-fn fill(g: &mut Guards, page: usize, (load, at): (Arc<crate::lazy::Load>, usize)) {
+fn fill(g: &mut Guards, page: usize, entry: (Arc<crate::lazy::Load>, usize)) {
+    fill_from(g, page, entry, None);
+}
+
+/// [`fill`], with the load's bytes read already where `read` is given
+/// (false: they could not be read).
+fn fill_from(g: &mut Guards, page: usize, (load, at): (Arc<crate::lazy::Load>, usize), read: Option<(&[u8], bool)>) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     use crate::ledger::{Owner, add};
     add(Owner::LazyPages, -(PAGE as i64));
@@ -340,7 +346,14 @@ fn fill(g: &mut Guards, page: usize, (load, at): (Arc<crate::lazy::Load>, usize)
     // SAFETY: a committed page we just made read-write; the title's
     // threads that touch it wait in our handler for the guard lock.
     let out = unsafe { std::slice::from_raw_parts_mut((page * PAGE) as *mut u8, PAGE) };
-    if !load.bytes(at, out) {
+    let ok = match read {
+        Some((bytes, ok)) => {
+            out.copy_from_slice(bytes);
+            ok
+        }
+        None => load.bytes(at, out),
+    };
+    if !ok {
         tracing::warn!(page = format_args!("{:#x}", page * PAGE), "a disk load's bytes could not be read again: zeros");
         out.fill(0);
     }
@@ -478,16 +491,43 @@ pub(crate) fn read_lazy(src: usize, dst: *mut u8, len: usize) -> bool {
 /// GPU is about to read that memory where it lies (copies used in place,
 /// `crate::inplace`).
 pub(crate) fn fill_lazy(at: usize, len: usize) {
-    let mut g = guards();
-    if g.lazy.is_empty() {
+    if crate::ledger::bytes(crate::ledger::Owner::LazyPages) <= 0 {
         return;
     }
-    let pages: Vec<usize> = g.lazy.range(at / PAGE..at.saturating_add(len).div_ceil(PAGE)).map(|(&p, _)| p).collect();
+    let pages: Vec<usize> = {
+        let g = guards();
+        g.lazy.range(at / PAGE..at.saturating_add(len).div_ceil(PAGE)).map(|(&p, _)| p).collect()
+    };
     for page in pages {
-        if let Some(entry) = g.lazy.remove(&page) {
-            fill(&mut g, page, entry);
-            settle(&mut g, page);
+        fill_unlocked(page);
+    }
+}
+
+/// Fills page `page` if a disk load left it without bytes, reading the
+/// load's bytes without the guard lock: a read may wait on the disk or
+/// decode a whole load, and every guarded write in the process waits on
+/// that lock. Until the page is filled it stays without access, so threads
+/// touching it fault and fill it too; whichever finishes first writes it.
+/// False if the page was not left without bytes.
+fn fill_unlocked(page: usize) -> bool {
+    loop {
+        let Some((load, at)) = guards().lazy.get(&page).cloned() else {
+            return false;
+        };
+        let mut bytes = vec![0u8; PAGE];
+        let ok = load.bytes(at, &mut bytes);
+        let mut g = guards();
+        match g.lazy.get(&page) {
+            // Filled by another thread meanwhile.
+            None => return true,
+            Some((l, a)) if Arc::ptr_eq(l, &load) && *a == at => {}
+            // Loaded over again meanwhile: read that load.
+            Some(_) => continue,
         }
+        g.lazy.remove(&page);
+        fill_from(&mut g, page, (load, at), Some((&bytes, ok)));
+        settle(&mut g, page);
+        return true;
     }
 }
 
@@ -975,30 +1015,37 @@ fn install() {
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        // Reads and other faults are ours only while loads left pages
+        // Reads and other faults are ours only once loads have left pages
         // without bytes: the lock is not taken for others (a fault in code
         // holding it would wait forever).
-        if r.ExceptionInformation[0] != WRITE && crate::ledger::bytes(crate::ledger::Owner::LazyPages) <= 0 {
+        let lazy_seen = crate::ledger::bytes(crate::ledger::Owner::LazyPages) > 0
+            || crate::ledger::bytes(crate::ledger::Owner::LazyFilled) > 0;
+        if r.ExceptionInformation[0] != WRITE && !lazy_seen {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
-        // Held across all checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
         // Any access to a page a disk load left without bytes fills it; a
         // write then faults again on the guard as any other.
-        if let Some(entry) = g.lazy.remove(&(at / PAGE)) {
-            fill(&mut g, at / PAGE, entry);
-            settle(&mut g, at / PAGE);
+        if lazy_seen && fill_unlocked(at / PAGE) {
             crate::ledger::add(crate::ledger::Owner::LazyFaults, PAGE as i64);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if r.ExceptionInformation[0] != WRITE {
-            return EXCEPTION_CONTINUE_SEARCH;
+            // A read of a page another thread filled since this one
+            // faulted: it reads again.
+            const READ: usize = 0;
+            return if r.ExceptionInformation[0] == READ && readable(at) {
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            };
         }
+        // Held across all checks: another thread may have opened the block
+        // since this one faulted, and a copy may have guarded it again since
+        // (then it is ours again, not read-only for some other reason).
+        let mut g = guards();
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -1017,6 +1064,18 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Whether `at` is committed memory a read may touch now.
+fn readable(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && info.Protect != 0
 }
 
 /// Whether `at` is committed read-write memory now.
