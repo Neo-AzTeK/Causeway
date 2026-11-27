@@ -155,6 +155,9 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::ledger::add(victory_gpu::ledger::Owner::TitleVirtual, size as i64);
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
