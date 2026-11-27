@@ -50,7 +50,10 @@ Each item names its problem in the ranked table below.
       to is `docs/memory-design.md` (4 steps, being built). Step 1, the
       changed-page count, is in and tested; two world runs show no clear
       change in refresh batches (the spread between runs is larger), and
-      the time spent in checks is not measured yet: time it before step 2.
+      the time spent in checks is not measured yet. Step 2 was tested
+      first as a probe (`VICTORY_PROBE_VRAM_COPIES`, H6.1): copies in video
+      memory leave GPU time unchanged, so steps 2-3 are held; GPU time is
+      in the shaders themselves (H6.3-H6.6) or in correctness (H6.6).
       Remaining hypotheses in
       `docs/frame-cost.md`, one at a time, writing each result there. Order
       (cheap tests first, then by bytes touched):
@@ -76,7 +79,8 @@ Each item names its problem in the ranked table below.
       - [ ] H5.1 views per frame seen the frame before
       - [ ] H1.4 kernel read against plain copy (offline benchmark)
       - [ ] H1.5 / H5.4 the same scene with the release build
-      - [ ] H6.1 one heavy pass with its buffers in video memory
+      - [x] H6.1 buffers in video memory: mostly refuted (GPU time about
+            unchanged with every copy in video memory)
       - [ ] H6.6 second-long one-off stalls (paging, GPU faults, device
             drift); redo the GPU ranking from runs without removal
       - [ ] H6.3 / H6.4 / H6.5 wave 64, translated code, idle gaps

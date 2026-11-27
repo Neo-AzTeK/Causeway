@@ -1,6 +1,7 @@
 # Title memory on a discrete GPU: design
 
-Proposal, 2026-11-27. Step 1 built; steps 2-4 not. It rests on the tested hypotheses in
+Proposal, 2026-11-27. Step 1 built. Steps 2-3 held: the probe for step 2 (H6.1)
+found no GPU-time gain on a discrete card; step 4 not built. It rests on the tested hypotheses in
 `docs/frame-cost.md` (H0.1-H0.6, H1.2, H6.2). Live work stays in
 `docs/problems.md`.
 

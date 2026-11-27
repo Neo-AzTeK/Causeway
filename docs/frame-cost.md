@@ -289,6 +289,13 @@ memory (up to 250 ms).
   write only buffers, and a console moves those at GDDR6 speed. Test: run
   one heavy pass with its buffers placed in video memory and compare its
   timestamps.
+  **Mostly refuted, 2026-11-27** (`VICTORY_PROBE_VRAM_COPIES`, two quiet
+  400 s world runs of one build, on and off, RTX 2060 SUPER): every host copy
+  but single-view ones was in video memory, none refused. GPU time per world
+  frame moved by about 2%, within run-to-run spread; preparing rose by the
+  probe's extra copies. Shaders reading host copies over the bus are not
+  where GPU time goes on this machine. Not tested on an integrated GPU or a
+  card with a narrower bus.
 - **H6.2 (missing, correctness): the copy count is wrong.** The count is read
   from a buffer. If its host copy is stale (an earlier pass wrote the count
   into another copy of the same memory, H1.3), or holds garbage, the program
