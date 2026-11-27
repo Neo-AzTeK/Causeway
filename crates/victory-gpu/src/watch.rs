@@ -664,8 +664,11 @@ pub fn writing(at: usize, len: usize) -> Writing {
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new, and read-write.
+/// shows is new, and read-write. Called before an unmap.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Copies the GPU uses in place pin the pages: they go first, before
+    // the runtime unmaps.
+    crate::shadow::let_go(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.

@@ -49,6 +49,10 @@ pub(crate) struct Shadow {
     /// The block of a view-copy heap its buffer is placed on ([`BLOCKS`]),
     /// given back when the copy dies (copies of single views, [`exact`]).
     block: Option<Block>,
+    /// The heap of title memory the GPU uses in place (`crate::inplace`):
+    /// `data` is title memory itself, and there is nothing to refresh,
+    /// snapshot or copy back.
+    in_place: Option<ID3D12Heap>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -187,6 +191,9 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        if self.in_place.is_some() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -243,11 +250,37 @@ impl Shadow {
             before: Mutex::default(),
             marks,
             block,
+            in_place: None,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
+    }
+
+    /// Title memory the GPU uses in place: no copy, no watch.
+    fn opened(o: crate::inplace::Opened) -> Arc<Shadow> {
+        // SAFETY: a live buffer.
+        let gpu = unsafe { o.buffer.GetGPUVirtualAddress() };
+        Arc::new(Shadow {
+            buffer: o.buffer,
+            data: o.start as *mut u8,
+            gpu,
+            start: o.start,
+            len: o.len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            marks: None,
+            block: None,
+            in_place: Some(o.heap),
+        })
+    }
+
+    /// Whether the GPU uses its title memory in place (tests).
+    #[cfg(test)]
+    pub(crate) fn in_place(&self) -> bool {
+        self.in_place.is_some()
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -303,6 +336,9 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+        if self.in_place.is_some() {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -368,6 +404,13 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        if self.in_place.is_some() {
+            // The GPU wrote title memory itself: copies of it elsewhere
+            // (views, textures) take the range again. What it computed
+            // from memory with no copy (`back` false) stays there too.
+            drop(crate::watch::writing(address, len));
+            return 0;
+        }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -547,6 +590,9 @@ impl Shadow {
     /// to copy: a page there changed since it was taken, or the memory is not
     /// tracked (copied whole each time).
     pub(crate) fn stale(&self, address: usize, len: usize) -> bool {
+        if self.in_place.is_some() {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         from < to && self.tracked.as_ref().is_none_or(|t| t.any_changed(from, to))
@@ -556,6 +602,9 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.in_place.is_some() {
+            return 0;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -906,6 +955,63 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// Section views the GPU uses in place, by start: one copy serves every
+/// buffer and loose range in the view ([`find`], [`loose`]).
+static OPEN: Mutex<BTreeMap<u64, Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// The in-place copy of the view holding `[at, at + n)`, opened on first
+/// use; none where it needs a host copy (`crate::inplace::open`).
+fn in_place(at: u64, n: u64) -> Option<Arc<Shadow>> {
+    let mut map = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = map.range(..=at).next_back()
+        && at.saturating_add(n) <= s.start + s.len
+    {
+        return Some(s.clone());
+    }
+    let shadow = Shadow::opened(crate::inplace::open(at, n)?);
+    tracing::info!(
+        start = format_args!("{:#x}", shadow.start),
+        len = shadow.len,
+        "title memory used by the GPU in place"
+    );
+    map.insert(shadow.start, shadow.clone());
+    changed();
+    Some(shadow)
+}
+
+/// Before the runtime unmaps title memory `[at, at + len)`: the in-place
+/// copies over it let go of their heaps, which pin the pages (Windows
+/// refuses to unmap them while one does). Buffers there are copied again on
+/// their next use.
+pub(crate) fn let_go(at: u64, len: u64) {
+    let end = at.saturating_add(len);
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        let hit: Vec<u64> = map.range(..end).filter(|(_, s)| s.start + s.len > at).map(|(&k, _)| k).collect();
+        hit.iter().filter_map(|k| map.remove(k)).collect()
+    };
+    if gone.is_empty() {
+        return;
+    }
+    for entry in buffers().values_mut() {
+        if entry.shadow.as_ref().is_some_and(|s| gone.iter().any(|g| Arc::ptr_eq(s, g))) {
+            entry.shadow = None;
+        }
+    }
+    changed();
+    for shadow in gone {
+        let held = Arc::strong_count(&shadow) - 1;
+        if held > 0 {
+            tracing::warn!(
+                start = format_args!("{:#x}", shadow.start),
+                len = shadow.len,
+                held,
+                "title memory unmapped while lists or slots still hold its in-place copy: Windows refuses the unmap"
+            );
+        }
+    }
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
@@ -924,6 +1030,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        if let Some(shadow) = in_place(key.0, len) {
+            entry.shadow = Some(shadow.clone());
+            changed();
+            return Some(shadow);
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
@@ -965,6 +1076,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
+    }
+    if let Some(shadow) = in_place(address, end - address) {
+        return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
