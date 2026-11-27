@@ -1,132 +1,263 @@
-# Where a world frame's time goes, and why
+# Where a world frame's time goes: facts, assumptions, hypotheses
 
-Written 2026-11-27 from world runs of the same scene on an RTX 2060 SUPER
-(diagnostics build, Series X profile). It answers one question for each slow
-part: is it slow because of how we implemented it, or because something is
-missing? Figures are rounded per-frame medians over world frames. Run folders
-and shader hashes stay on the developer's machine (rule #1). Live work stays in
-`docs/problems.md`.
+From world runs of one scene on an RTX 2060 SUPER (diagnostics build, Series X
+profile), 2026-11-27. Figures are rounded per-frame medians over world frames.
+Run folders and shader hashes stay on the developer's machine (rule #1). Live
+work stays in `docs/problems.md`.
 
-## Short answer
+**How to read this.** Each slow part has three layers, kept apart on purpose:
 
-- **CPU preparation (about 500-700 ms) is mostly our implementation.** It is the
-  cost of keeping host copies of the title's memory up to date, and of
-  following what the title writes. Little of it comes from a missing function.
-- **GPU time (about 550 ms) is mostly where memory lives.** Every buffer the GPU
-  reads or writes is a host copy in system memory, reached over PCIe. A smaller,
-  unmeasured share is waves of 64 being run as two waves of 32.
-- **Missing functionality mostly hides cost; it does not add it.** Between about
-  1,000 and 3,900 draws per frame are dropped (nearly all for lack of
-  descriptor slots), and some pipelines are refused. Today's frame is both slow
-  and incomplete. Each missing part we add makes the frame heavier before it
-  gets faster.
-- **The parts run one after another.** The host waits for the GPU after every
-  submission (about 40 per frame), so a frame costs about preparing + GPU +
-  copy-back, with no overlap.
+- **Measured:** what the counters say.
+- **Assumed:** what the code or an earlier explanation takes for granted. These
+  go stale first; each says what would show it wrong.
+- **Hypotheses (H):** possible causes, each with the evidence so far and a test
+  that would confirm or refute it. Kind: **impl** (our implementation),
+  **missing** (a function or feature we lack), **design** (a choice that
+  several parts depend on).
 
-## The frame, part by part
+None of the hypotheses below is tested yet. When one is tested, write the
+result next to it, and move it out of the hypotheses when it is settled.
 
-| part | ms/frame | thread | cause | kind |
-|------|----------|--------|-------|------|
-| refresh batches: title writes copied into host copies | ~300 | submitting | memory is unified on the console, separate on the host: every write the title makes to GPU-visible memory must be found and copied | implementation (design) |
-| of it, moving bytes (kernel reads) | ~120 | submitting | copies use a kernel read so an unmapped page cannot fault | implementation |
-| of it, finding what changed (watches, page protection, guard faults) | ~80 | submitting | changes are tracked per 64 KiB page | implementation |
-| shader-write snapshots and the flushes they force | ~150 | submitting | copy-back must know what the GPU wrote, so a before-image is taken | implementation (design) |
-| heap sync: title-written descriptor slots | ~55 (660k slots checked) | submitting | console descriptors are plain memory the title writes; we re-read and translate them | both: hardware difference, made costly by re-checking |
-| written-back pages that shaders marked | ~40 | submitting | shaders write title memory through computed addresses | implementation |
-| texture uploads for bindless heaps | ~30 | submitting | textures are host objects, refreshed when their memory changes | implementation |
-| copy-back after the GPU | 50-110 | submitting | GPU writes in host copies go back to title memory | implementation (design) |
-| recording draws (summed over title threads) | ~1,170 for ~6,500 draws (~180 µs each) | title threads, parallel | one host buffer view per placed buffer per draw (`for_view` ~100, view making ~50, bindless ~45), behind one heap lock | implementation |
-| GPU | ~550 | GPU | see below | mostly memory placement |
+## The frame
 
-Preparing and recording overlap with each other, but neither overlaps with the
-GPU: the submitting thread holds the submission lock through the GPU wait.
+| part | ms/frame | where |
+|------|----------|-------|
+| preparing, in all | ~500-700 | submitting thread |
+| of it, refresh batches (title memory copied into host copies) | ~300 | submitting thread |
+| of it, descriptor heap sync | ~55 | submitting thread |
+| of it, texture uploads for bindless heaps | ~30 | submitting thread |
+| GPU | ~550 | GPU |
+| copy-back, including pages shaders marked (~40) | 50-110 | submitting thread |
+| recording draws, summed over title threads | ~1,170 for ~6,500 draws | title threads, parallel |
 
-## GPU time
+The host waits for the GPU after each of ~40 submissions per frame, holding the
+submission lock, so a frame is about preparing + GPU + copy-back. Dropped work
+(below) makes all of these smaller than the full frame would be.
 
-Per-command GPU timestamps (`VICTORY_GPU_TIMING=1`; it waits after each list,
-which inflates the total, so use it for ranking, not totals) rank the commands:
+## The assumption under most of it
 
-1. **A small compute program that copies buffer to buffer.** It is 68 console
-   instructions: each lane copies 16 bytes per loop turn, and the byte count is
-   read from a buffer. With the same group count, one dispatch takes 1 ms and
-   another up to 1.3 s. Its cost is the bytes it moves divided by bandwidth,
-   and both buffers are host copies in system memory. A console copies such
-   memory at GDDR6 speed, this host over PCIe. **Kind: memory placement.**
-   Not verified: whether the largest counts are the title's real sizes, or a
-   wrong count that runs until the compute loop limit (4,096 turns per lane).
-   If it is the limit, the copy is also cut short, which is a correctness loss.
-   Next check: log the count it reads.
-2. **A second copy program of the same shape**, with the same pattern: up to 1.5
-   s per dispatch. **Kind: memory placement.**
-3. **A mesh culling program written for waves of 64** (65 loop branches, 83
-   registers), up to 1.7 s per indirect draw. On a host with waves of 32 it
-   runs as two halves. **Kind: missing hardware feature, so translation
-   cost**, together with memory placement. The share of each is not measured.
-4. **A wave-64 compute program using group memory**, up to 250 ms. Same kind
-   as 3.
-5. Further down, many 5-30 ms dispatches of large compute passes. They read and
-   write big buffers in system memory.
+**Assumed:** "Memory is unified on the console and separate on the host, so all
+GPU-visible memory needs a host copy kept in step with title memory."
 
-Long dispatches of this kind are also what removes the device
-(`gpu-long-dispatch`): one timing run lost the device 90 s into the world.
+That is only true of memory both processors use. Most GPU memory is probably
+never touched by the CPU after it is filled: render targets, culling outputs,
+meshlet lists, indirect arguments the GPU writes for itself. The code does not
+tell the two kinds apart. Every buffer gets a system-memory host copy, a write
+watch, change checks on every declared read, before-images and copy-back.
 
-## Missing functionality, and what it hides
+- **H0.1 (design): most of the bytes we track and copy are GPU-only.** If so,
+  refresh checks, snapshots, copy-back and part of the GPU time would all fall
+  for that memory if it lived only on the GPU side. Evidence: lists declare
+  ~22 GB/frame of reads, but only ~5 GB lie in pages flagged as changed, and
+  ~0.3 GB is actually copied. So most declared memory is not written by the
+  CPU between uses. Test: per host copy, record over a run whether the CPU
+  writes it after the first fill and whether the GPU writes it. Then sum bytes
+  by class (CPU→GPU, GPU-only, both, neither).
+- **H0.2 (missing): the title already says which memory is GPU-only, and we
+  drop it.** Heaps and committed resources come with a heap kind (default,
+  upload, readback). `resource.rs` uses it only for the title-side
+  allocation's attributes (`Memory::for_resource`); `shadow::register` keeps
+  only address and length, so host placement never sees it. Caution: on the console a "default" heap is still
+  CPU-addressable, so the kind is a hint the title may break. Test: count CPU
+  writes (guard faults, write watch) into buffers on default heaps. If there
+  are none or almost none, the kind can drive placement, with a fallback for
+  pages the CPU does touch.
+- **H0.3 (design): the CPU rarely reads what the GPU writes.** Copy-back
+  assumes it might, everywhere. Test: guard a sample of pages after copy-back
+  against reads (not only writes) and count faults per buffer.
 
-| what is missing | effect now | effect on cost once added |
-|-----------------|------------|---------------------------|
-| dynamic descriptor slots on a capped view heap (`descriptor-slots`) | ~1,000 (median) to 3,900 draws/frame dropped, mostly indirect mesh draws | more recording, refreshes and GPU work |
-| waves of 64 on wave-32 hosts (`wave64-refusals`) | 26 pipelines refused | more GPU work |
-| shaders not translated (`untranslated-shaders`) | a few programs per frame dropped | small |
-| shader writes to memory with no host copy | ~7,700 ranges/frame withheld, ~450 MB of views kept | correctness, then copy-back cost |
+If H0.1 and H0.2 hold, the largest lever is buffer placement: video memory for
+GPU-only buffers, system memory and copies only where the CPU writes or reads.
+It touches the preparing, copy-back and GPU rows at once.
+
+## Refresh batches (~300 ms)
+
+**Measured:** ~5,300 refreshes run per frame, and ~160,000 skip as unchanged.
+Of ~5 GB of changed-flagged pages checked, ~0.3 GB is copied. Moving bytes
+takes ~120 ms (kernel reads, ~2.6 GB/s). Watches take ~45 ms, page protection
+~30 ms and the guard fault handler ~70 ms. ~3,300 tracked pages are written per
+frame, ~3,600 are marked through another mapping of the same memory, and
+~1,400 of them were also written the frame before.
+
+**Assumed:** "What is copied is what the title's CPU wrote."
+
+- **H1.1 (impl): 64 KiB pages magnify small writes.** The title writes a few
+  constants and we copy the whole page. The ~0.3 GB/frame copied looks large
+  next to what a console title's CPU writes in a frame. Test: when a page is
+  copied, compare it with the copy's old bytes in 64-byte pieces (as xcl
+  does) and count the pieces that differ.
+- **H1.2 (design): our own write-backs come back as "CPU writes".** Copy-back
+  writes GPU results into title memory (~75 MB/frame through write marks).
+  That marks the pages changed, so the other host copies of the same memory
+  copy them in again. GPU work then pays twice, and it is counted as CPU work.
+  Test: keep the set of pages our copy-back wrote this frame, and count how
+  much of the next refreshes falls in it.
+- **H1.3 (design): one title page lives in several host copies.** These are the
+  whole buffer, a 4 MiB loose window, single-view copies and page-table
+  copies. Each is refreshed separately. Earlier probe notes: ~1.6 copies per
+  page taken, ~25 trackers per page. Test: bytes refreshed per frame against
+  distinct title bytes refreshed.
+- **H1.4 (impl): kernel reads are slow.** The kernel read (`ReadProcessMemory`)
+  avoids a fault on unmapped pages, but runs at ~2.6 GB/s where a plain copy
+  runs at several times that. Test: an offline benchmark of both on mapped
+  memory. A plain copy with a fault handler (or a check of the mapping,
+  cached) would keep the safety.
+- **H1.5 (impl): checking costs more than copying.** About 30 checks run for
+  each copy actually made, and the diagnostics timers sit on that path
+  (earlier notes: ~470 ns per skipped check in the diagnostics build against
+  ~120 in release). Test: the same scene with the release build. Run counts
+  will need a release-side counter.
+
+## Shader-write step (~150 ms, previously misread)
+
+**Measured:** this step's time includes the refresh flush it forces before each
+snapshot. Snapshots themselves are ~300 MB in ~32 ms per frame.
+
+The earlier version of this document read the ~150 ms as snapshot cost. That
+was wrong: most of it is refresh work that would run anyway, only earlier.
+
+- **H2.1 (impl): splitting batches makes refreshes cost more.** Each forced
+  flush ends a batch early, so fewer ranges are merged and pages are taken
+  more than once. Test: refresh time per byte, in submissions with and
+  without shader writes.
+- **H2.2 (design): before-images exist only because there are two copies.**
+  Memory with a single home (H0.1) needs none.
+
+## Descriptor heap sync (~55 ms)
+
+**Measured:** ~660,000 heap slots are checked per frame, and ~50,000 are made.
+
+**Assumed:** "The title writes descriptors into its heaps itself, so each
+written page must be re-read."
+
+- **H3.1 (impl): page granularity.** A written 64 KiB page holds 2,048 slots.
+  The title changes a few, and all 2,048 are rechecked: ~92% of checks find
+  nothing. Test: count changed slots per written page.
+- **H3.2 (impl): the title rewrites equal descriptors every frame**, for
+  example tables in a ring. Comparing the slot's 32 bytes with the last
+  translated value would skip the translation. Test: count rewrites with
+  unchanged bytes.
+- **H3.3 (missing): host shaders cannot read console descriptors themselves.**
+  This is a real difference between the machines: we must translate them.
+  The translation cost is ours, the need is not.
+
+## Copy-back (50-110 ms)
+
+**Measured:** copy-back of snapshot ranges finds ~0 MB changed. The real
+traffic is pages shaders marked: ~75 MB/frame written back in ~40-65 ms.
+
+**Assumed:** "GPU writes must reach title memory."
+
+- **H4.1 (design): most marked writes go to memory the CPU never reads** (see
+  H0.3). They are written back only so that other host copies of the same
+  memory see them (H1.3), and those copies then refresh again (H1.2). This is
+  a cycle the copy design makes, not something the title needs.
+- **H4.2: some writes are read by the CPU** (query results, GPU-driven streaming
+  feedback, readback buffers). Those must stay; the readback heap kind marks
+  some of them (H0.2).
+
+## Recording draws (~180 µs per draw, title threads)
+
+**Measured:** per frame, `for_view` ~100 ms, placed-buffer view making ~50 ms and
+bindless records ~45 ms. ~23-28k placed-buffer slots are made per frame, all
+behind one heap lock.
+
+**Assumed:** "Each draw needs host views of its buffers."
+
+- **H5.1 (impl): the same views are made again every frame.** The title binds
+  the same buffers frame after frame. A cache keyed by (address, length,
+  stride, format) would skip most of the work. Test: count views per frame
+  whose key was seen the frame before.
+- **H5.2 (impl): one heap lock serialises the title's recording threads.** The
+  slot search under it was fixed already; the stack tallies still show waits
+  in `mirror`. Test: share of title-thread samples waiting on that lock.
+- **H5.3 (missing): host shaders cannot take a buffer's address from its
+  console descriptor.** So every buffer needs a host view. Translating
+  buffer descriptors to address reads through the title-memory page table
+  (an xcl idea) would remove most of these views.
+- **H5.4 (impl): diagnostics cost.** DRED alone is ~1.5x per draw, and the timing
+  runs keep it off. Other diagnostics bookkeeping is on the same path.
+
+## GPU (~550 ms)
+
+**Measured:** per-command timestamps (`VICTORY_GPU_TIMING=1`, which inflates
+totals by waiting after each list) rank first two small compute programs that
+copy buffer to buffer. Each lane copies 16 bytes per loop turn, and the byte
+count is read from a buffer. At the same group count, one dispatch takes 1 ms
+and another 1.3-1.5 s. Next come a mesh culling program written for waves of
+64 (up to 1.7 s per indirect draw) and a wave-64 compute program using group
+memory (up to 250 ms).
+
+**Assumed:** "The GPU is slow because the host GPU is slower than the console's."
+
+- **H6.1 (design): buffers in system memory, across PCIe.** Every host copy is
+  in system memory (custom heap, write-back, L0). The copy programs read and
+  write only buffers, and a console moves those at GDDR6 speed. Test: run
+  one heavy pass with its buffers placed in video memory and compare its
+  timestamps.
+- **H6.2 (missing, correctness): the copy count is wrong.** The count is read
+  from a buffer. If its host copy is stale (an earlier pass wrote the count
+  into another copy of the same memory, H1.3), or holds garbage, the program
+  copies far too much. It runs until the compute loop limit (4,096 turns per
+  lane), and its output is also cut short. This fits times that vary
+  1,000-fold at the same group count. Test: log the count, read from the
+  copy the GPU used, after the submission.
+- **H6.3 (missing): waves of 64 run as two waves of 32.** The host has no wave
+  size of 64, and exchanges between lanes cost extra in translation. The
+  share is unknown. Test: the same programs on an adapter with waves of 64
+  (AMD).
+- **H6.4 (impl): translated code does more per access** (page-table lookups
+  for computed addresses, bounds handling). Test: compare instruction counts
+  of the host shader and the console program for the top passes.
+- **H6.5 (impl): measured GPU time includes idle gaps.** It is wall time from
+  submission to fence, ~40 times a frame. Test: timestamps at each
+  submission's start and end against the wall time.
+
+## Waiting after every submission
+
+**Assumed:** "The host must wait for each submission before preparing the next."
+
+- **H7.1 (design): the wait exists for copy-back and snapshots.** Memory that
+  has a single home (H0.1) needs neither, so the next submission could be
+  prepared while the GPU runs, hiding up to the smaller of preparing and GPU
+  time. The order "copy-back, then bottom-of-pipe writes" must stay
+  (`crates/victory-gpu/CLAUDE.md`).
+
+## Missing functionality hides cost
+
+| missing | now | once added |
+|---------|-----|------------|
+| dynamic descriptor slots on a capped view heap (`descriptor-slots`) | ~1,000 (median) to ~3,900 draws/frame dropped, mostly indirect mesh draws | more recording, refreshes and GPU |
+| waves of 64 on wave-32 hosts (`wave64-refusals`) | 26 pipelines refused | more GPU |
+| untranslated programs (`untranslated-shaders`) | a few per frame | small |
+| shader writes to memory with no host copy | ~7,700 ranges/frame withheld | correctness |
 | two device methods | unknown | unknown |
 
-## Tried and ruled out
+So the frame is both slow and incomplete. The hypotheses above are ranked by
+the bytes they touch, not by measured savings.
 
-- **Title memory used by the GPU in place** (idea from xcl-dev/xcl,
-  `VICTORY_IN_PLACE=1`, off by default). It works for a whole view, but the
-  runtime maps title memory as 64 KiB views, so the big GPU heap never opens
-  whole. An open heap also pins its pages, and Windows then refuses the
-  title's unmaps: the title crashed in a world run. Lead: open the section
-  instead of the view (`docs/problems.md`).
-- **Heap slot search** (a linear scan under the heap lock) was the top lock
-  wait on title threads. Replaced by a bitmap: draw recording sums fell, frame
-  time did not move.
-- Earlier preparing work cut refresh-check cost by about 38%. The estimate
-  then was that another 50% is not reachable without changing the page-table
-  rewrite (problem notes of `frame-preparing-cost`).
+## Tried
 
-## What this means for the work order
+- **Title memory used by the GPU in place** (`VICTORY_IN_PLACE=1`, off). It
+  serves H0.1 from the other side. The runtime maps title memory as 64 KiB
+  views, so the big GPU heap never opened whole. An open heap also pins its
+  view, so Windows refused the title's unmaps, and the title crashed. Leads:
+  - open the section rather than the view (`docs/problems.md`);
+  - for pools the title allocates whole, open them at allocation time and
+    release before its free (needs a hook on the free).
+- **Heap slot search** replaced by a bitmap: recording sums fell, frame time
+  did not.
+- **Earlier preparing work:** −38% of refresh-check cost. Estimate then: another
+  50% is not reachable without changing the page-table rewrite (problem
+  notes of `frame-preparing-cost`). That estimate assumed the copy design;
+  H0.1-H0.3 question the design itself.
 
-1. Keep correctness first: dropped draws and refused pipelines make the frame
-   both wrong and look cheaper than it is.
-2. The biggest single lever is **where buffer memory lives**: video memory
-   for buffers that only the GPU uses (copy targets, culling outputs), with
-   copy-back only where the title reads them. This attacks both the GPU copies
-   and the snapshots.
-3. **Overlap the CPU and the GPU**: prepare the next submission while the GPU
-   runs the current one. Copy-back ordering must stay (`victory-gpu`
-   CLAUDE.md).
-4. Then the per-draw buffer views (descriptors read as addresses, xcl idea
-   2), and refresh batches.
+## Where the evidence comes from
 
-## Gaps in measurement
-
-- No per-command GPU time without the per-list wait, which changes the totals.
-- The size each GPU copy program is asked to move is not logged.
-- Every figure comes from the diagnostics build; the release build is not
-  measured. DRED alone costs about 1.5x per draw (`docs/debugging.md`).
-- One adapter only (RTX 2060 SUPER); host copies sit in system memory on every
-  discrete GPU, so the GPU conclusion should hold there. Integrated GPUs share
-  memory and are not measured.
-
-## How to repeat
-
-- Preparing parts: a smoke run with `--env VICTORY_D3D12_DRED=0`; the
-  `copystat` lines (`copies per frame`, `recording per frame`,
-  `placed buffer parts per frame`) in the log, world frames only.
-- GPU ranking: `--env VICTORY_GPU_TIMING=1`; the `slow list command` lines,
-  summed per program.
-- A program's console code: `VICTORY_DUMP_SHADERS=<dir>` and
-  `VICTORY_DUMP_HASHES=<h,...>` on a run (outside the repository).
-- Where title threads wait: `VICTORY_STACKS` and `cargo xtask stacks --tally`.
+- Preparing parts: `copystat` lines in a smoke run with
+  `--env VICTORY_D3D12_DRED=0`, world frames only.
+- GPU ranking: `--env VICTORY_GPU_TIMING=1`, `slow list command` lines summed
+  per program.
+- Console code of a program: `VICTORY_DUMP_SHADERS` / `VICTORY_DUMP_HASHES` on
+  a run (outside the repository).
+- Title-thread waits: `VICTORY_STACKS`, `cargo xtask stacks --tally`.
