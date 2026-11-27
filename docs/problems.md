@@ -71,8 +71,9 @@ Each item names its problem in the ranked table below.
 - [ ] Refusals with no fix found yet (`untranslated-shaders`): structured
       buffer of unknown stride; a descriptor read as data (may need the
       descriptor heap's contents; that work is ours too)
-- [ ] Look for fixes in forks not yet checked: `avatarmanz/VIctory-7900XTX`,
-      `DexNom/VIctory`
+- [x] Look for fixes in forks not yet checked: `avatarmanz/VIctory-7900XTX`,
+      `DexNom/VIctory`: done 2026-11-27, best leads are x7900 wave32 shader commits and DexNom `76749ce` (lane mask); list in `E:Causeway-tools
+otesork-scan.md`
 - [ ] Reach one fixed test scene that every run can repeat (`scene-blocker`)
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
