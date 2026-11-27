@@ -800,7 +800,7 @@ fn texture_to_buffer(
     let to = to as usize + first as usize;
     list.defer_read_back(move || {
         // Kept open while the rows are written.
-        let _writing = crate::watch::writing(to, (span - first) as usize);
+        let _writing = crate::watch::gpu_writing(to, (span - first) as usize);
         for z in 0..u64::from(size[2]) {
             for y in 0..rows {
                 let out = to as u64 + z * title_slice + y * title_pitch;

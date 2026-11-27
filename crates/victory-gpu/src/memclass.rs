@@ -1,7 +1,8 @@
 //! What the title said about its memory when it allocated it (diagnostics,
 //! `VICTORY_PROBE_CLASSES=1`): the console bits our allocation drops
 //! (GPU access, write-combining, memory type), kept per address range, and
-//! each frame's tracked and CPU-written pages tallied by them. Tests whether
+//! each frame's tracked and written pages tallied by them; and per window of
+//! frames, the pages tracked by who wrote them (H0.1). Tests whether
 //! the title marks the memory only its GPU uses (`docs/frame-cost.md`, H0.2).
 
 use std::collections::{BTreeMap, HashMap};
@@ -74,11 +75,12 @@ pub(crate) fn frame(tracked: impl Iterator<Item = usize>, written: impl Iterator
     if !wanted() {
         return;
     }
+    let tracked: Vec<usize> = tracked.collect();
     let mut t = TALLY.lock().unwrap_or_else(|e| e.into_inner());
     let t = t.get_or_insert_with(Tally::default);
     {
         let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        for at in tracked {
+        for &at in &tracked {
             t.pages.entry(class_of(&ranges, at)).or_default().0 += 1;
         }
         for at in written {
@@ -103,6 +105,80 @@ pub(crate) fn frame(tracked: impl Iterator<Item = usize>, written: impl Iterator
         );
         *t = Tally::default();
     }
+    writers_frame(tracked);
+}
+
+/// Who wrote a page of title memory: the title's code (a guard fault), the
+/// kernel for it (file reads, DirectStorage), or GPU work (write-backs of
+/// host copies, list copies into title memory).
+#[derive(Debug, Clone, Copy)]
+pub enum Writer {
+    Cpu = 1,
+    Kernel = 2,
+    Gpu = 4,
+}
+
+/// Over a window of frames: page index → (its class when first seen,
+/// writers seen), for every page tracked or written in the window.
+#[derive(Default)]
+struct Writers {
+    frames: u64,
+    pages: HashMap<usize, (Option<Class>, u8)>,
+}
+
+static WRITERS: Mutex<Option<Writers>> = Mutex::new(None);
+
+/// Frames per writers line: long enough that a page written now and then
+/// counts as written.
+const FRAMES_PER_WINDOW: u64 = 600;
+
+fn page_entry(w: &mut Writers, page: usize) -> &mut (Option<Class>, u8) {
+    w.pages.entry(page).or_insert_with(|| {
+        (class_of(&RANGES.lock().unwrap_or_else(|e| e.into_inner()), page * crate::watch::PAGE), 0)
+    })
+}
+
+/// `[at, at + len)` was written by `who` (diagnostics).
+pub(crate) fn wrote(who: Writer, at: usize, len: usize) {
+    if !wanted() || len == 0 {
+        return;
+    }
+    let mut w = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let w = w.get_or_insert_with(Writers::default);
+    for page in at / crate::watch::PAGE..at.saturating_add(len).div_ceil(crate::watch::PAGE) {
+        page_entry(w, page).1 |= who as u8;
+    }
+}
+
+/// Counts the pages tracked in the window by class and by who wrote them
+/// (bit 1 the title's code, 2 the kernel, 4 GPU work; 0 nobody), and logs
+/// them each window, in MB (`docs/frame-cost.md`, H0.1).
+fn writers_frame(tracked: Vec<usize>) {
+    let mut w = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let w = w.get_or_insert_with(Writers::default);
+    for at in tracked {
+        page_entry(w, at / crate::watch::PAGE);
+    }
+    w.frames += 1;
+    if w.frames < FRAMES_PER_WINDOW {
+        return;
+    }
+    let mut by: std::collections::BTreeMap<(Option<Class>, u8), u64> = std::collections::BTreeMap::new();
+    for &(class, mask) in w.pages.values() {
+        *by.entry((class, mask)).or_default() += 1;
+    }
+    let mb = |pages: u64| (pages * crate::watch::PAGE as u64) >> 20;
+    let text: Vec<String> =
+        by.iter().map(|((class, mask), pages)| format!("{class:x?} w{mask}: {} MB", mb(*pages))).collect();
+    let all: u64 = by.values().sum();
+    tracing::info!(
+        target: "victory_gpu::trace",
+        "writers over {} frames, {} MB of title memory tracked or written: {}",
+        w.frames,
+        mb(all),
+        text.join("; ")
+    );
+    *w = Writers::default();
 }
 
 #[cfg(test)]

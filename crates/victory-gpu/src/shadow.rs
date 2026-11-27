@@ -219,7 +219,7 @@ impl Shadow {
             return 0;
         }
         {
-            let _writing = crate::watch::writing(from, n);
+            let _writing = crate::watch::gpu_writing(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
         }
         // Our write is not the title's: the copy holds the page as it is.
@@ -408,7 +408,7 @@ impl Shadow {
             // The GPU wrote title memory itself: copies of it elsewhere
             // (views, textures) take the range again. What it computed
             // from memory with no copy (`back` false) stays there too.
-            drop(crate::watch::writing(address, len));
+            drop(crate::watch::gpu_writing(address, len));
             return 0;
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -472,7 +472,7 @@ impl Shadow {
                     if changed {
                         #[cfg(feature = "diagnostics")]
                         let t3 = std::time::Instant::now();
-                        let _writing = crate::watch::writing(start + at, n);
+                        let _writing = crate::watch::gpu_writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
@@ -574,7 +574,7 @@ impl Shadow {
             }
         };
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
+            let _writing = crate::watch::gpu_writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
             #[cfg(feature = "diagnostics")]
             note_write_back(self, from as u64);

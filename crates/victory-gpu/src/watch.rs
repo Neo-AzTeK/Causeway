@@ -655,7 +655,22 @@ impl Drop for Writing {
 /// keeps them open while the result lives. The runtime calls it (as
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
-pub fn writing(at: usize, len: usize) -> Writing {
+pub fn kernel_will_write(at: usize, len: usize) -> Writing {
+    #[cfg(feature = "diagnostics")]
+    crate::memclass::wrote(crate::memclass::Writer::Kernel, at, len);
+    writing(at, len)
+}
+
+/// [`writing`] for what GPU work wrote: write-backs of host copies, and
+/// copies the title's lists make into title memory.
+pub(crate) fn gpu_writing(at: usize, len: usize) -> Writing {
+    #[cfg(feature = "diagnostics")]
+    crate::memclass::wrote(crate::memclass::Writer::Gpu, at, len);
+    writing(at, len)
+}
+
+/// What [`kernel_will_write`] and [`gpu_writing`] do.
+fn writing(at: usize, len: usize) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -736,6 +751,8 @@ fn install() {
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            #[cfg(feature = "diagnostics")]
+            crate::memclass::wrote(crate::memclass::Writer::Cpu, at, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
