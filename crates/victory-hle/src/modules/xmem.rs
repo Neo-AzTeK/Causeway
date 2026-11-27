@@ -994,9 +994,37 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
+    #[cfg(feature = "diagnostics")]
+    answered(_which, &stats);
     // SAFETY: checked non-null; the title passes room for the structure.
     unsafe { out.write(stats) };
     1
+}
+
+/// With `VICTORY_PROBE_CLASSES=1`: the title's memory questions and our
+/// answers, at most one line per 10 s with the calls since (H0.5 in
+/// `docs/frame-cost.md`: whether our answers make it evict and reload).
+#[cfg(feature = "diagnostics")]
+fn answered(which: u32, stats: &WorkingSet) {
+    static LAST: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    if !victory_gpu::memclass::wanted() {
+        return;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let (at, calls) = last.get_or_insert((std::time::Instant::now() - std::time::Duration::from_secs(10), 0));
+    *calls += 1;
+    if at.elapsed() >= std::time::Duration::from_secs(10) {
+        tracing::info!(
+            target: "victory_gpu::trace",
+            which,
+            calls = *calls,
+            used_mb = stats.title_used >> 20,
+            limit_mb = stats.title_limit >> 20,
+            gpu_optimal_limit_mb = stats.gpu_optimal_limit >> 20,
+            "memory asked"
+        );
+        *last = Some((std::time::Instant::now(), 0));
+    }
 }
 
 /// Hands title memory (standard, in 2 MiB pages) to the system. The other
