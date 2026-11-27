@@ -70,27 +70,26 @@ overall problem, worked by at most one session
 (`docs/problem-sessions.md`). `cargo xtask problem list` adds who holds what on
 this machine. Ids and ranks change only when the owner re-ranks, or a diff adds,
 splits or closes a problem; `cargo xtask problem` reads this table, so keep its
-first three columns and number the rows from 1.
+first two columns and number the rows from 1.
 
-`owner` is `here`, or who else owns it: no session here claims it.
 **No rank below 1 is proven.** Nothing yet shows which loss keeps the 3D scene
 from showing; the order is a guess from dropped-work counts, which do not
 measure what the picture loses.
 
-| rank | id | owner | effect | how sure |
-|------|----|-------|--------|----------|
-| 1 | `scene-blocker` | here | which loss keeps the 3D scene from showing is unknown; the answer ranks the rest | unknown |
-| 2 | `wave64-refusals` | here | compute needing waves of 64 is refused: most refused pipelines in world runs | counts measured; picture effect a guess |
-| 3 | `descriptor-slots` | other AI | draws and dispatches dropped for lack of descriptor slots; a large share of drops | counts measured (some mislabelled as pipeline losses); picture effect a guess |
-| 4 | `mesh-pipeline-invalid` | here | a mesh pipeline the host rejects loses many indirect draws in some runs, almost none in others | cause unknown |
-| 5 | `gpu-long-dispatch` | here | long dispatches remove the GPU; held off by loop limits, a skip switch, and by leaving a fix for indirect dispatches reverted | skip proven to avoid one removal; the second link strongly suggested by one run; loop limits' effect not recorded |
-| 6 | `untranslated-shaders` | here | some programs do not translate or are refused by the validator (several reasons); one reason may need data only the descriptor heap has | refusals counted; picture effect a guess |
-| 7 | `title-crash-breakpoint` | here | the title stopped itself on a failed internal check once, during a long world run | seen once, not reproduced since |
-| 8 | `compile-backlog` | here | on a cold shader cache, work is dropped for a long stretch while pipelines are made | measured on cold cache only; warm effect small |
-| 9 | `frame-preparing-cost` | here | CPU preparation is a large share of each world frame | measured, some runs not on a quiet machine |
-| 10 | `texture-refresh-menus` | here | on the GTX 1070 slow texture refresh stalls the menus, so unattended runs miss the world | measured on that adapter, older build |
-| 11 | `gpu-tests-hang` | here | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
-| 12 | `device-methods-missing` | here | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
+| rank | id | effect | how sure |
+|------|----|--------|----------|
+| 1 | `scene-blocker` | which loss keeps the 3D scene from showing is unknown; the answer ranks the rest | unknown |
+| 2 | `wave64-refusals` | compute needing waves of 64 is refused: most refused pipelines in world runs | counts measured; picture effect a guess |
+| 3 | `descriptor-slots` | draws and dispatches dropped for lack of descriptor slots; a large share of drops | counts measured (some mislabelled as pipeline losses); picture effect a guess |
+| 4 | `mesh-pipeline-invalid` | a mesh pipeline the host rejects loses many indirect draws in some runs, almost none in others | cause unknown |
+| 5 | `gpu-long-dispatch` | long dispatches remove the GPU; held off by loop limits, a skip switch, and by leaving a fix for indirect dispatches reverted | skip proven to avoid one removal; the second link strongly suggested by one run; loop limits' effect not recorded |
+| 6 | `untranslated-shaders` | some programs do not translate or are refused by the validator (several reasons); one reason may need data only the descriptor heap has | refusals counted; picture effect a guess |
+| 7 | `title-crash-breakpoint` | the title stopped itself on a failed internal check once, during a long world run | seen once, not reproduced since |
+| 8 | `compile-backlog` | on a cold shader cache, work is dropped for a long stretch while pipelines are made | measured on cold cache only; warm effect small |
+| 9 | `frame-preparing-cost` | CPU preparation is a large share of each world frame | measured, some runs not on a quiet machine |
+| 10 | `texture-refresh-menus` | on the GTX 1070 slow texture refresh stalls the menus, so unattended runs miss the world | measured on that adapter, older build |
+| 11 | `gpu-tests-hang` | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
+| 12 | `device-methods-missing` | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
 
 ## Finding what keeps the 3D scene from showing
 

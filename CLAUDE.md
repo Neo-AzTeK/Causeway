@@ -34,7 +34,6 @@ and ask the owner for the title's folder if none is set.
 - Before a build or test, check no title is running (the check under "The GPU"
   in `docs/problem-sessions.md`; offline `translate`/`census` scans do not
   count): it spoils that run's timings, and several crates' tests use the GPU.
-- Descriptor and view-heap work belongs to another AI.
 - `target/**` reads are denied by `.claude/settings.json` on purpose.
 - One main session does the work, debugging included, toward one goal at a
   time. Now: one correct frame; fix the earliest missing or wrong step first,

@@ -34,8 +34,7 @@ is `crates/victory-gpu/src/caps.rs` (`Caps`, the planners, `reference`).
 | memory | `memory`, `uma` | `GetDesc1`, `QueryVideoMemoryInfo`, ARCHITECTURE1 | `memory_plan` |
 | format use | `formats` (probed list) | `FORMAT_SUPPORT` | `format_choice` |
 
-Descriptor and heap code belongs to another owner: what it may read from here
-is `binding_plan` (class, `max_views`, `max_samplers`); today it does not call
+What descriptor and heap code may read from here is `binding_plan` (class, `max_views`, `max_samplers`); today it does not call
 it (see "Still open"). Limits are the specification's per tier; a driver may allow
 more. Where a tier sets no bound (`max_views: None`), try the size wanted and
 treat a creation failure as the refusal.
