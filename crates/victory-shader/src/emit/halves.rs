@@ -10,8 +10,10 @@
 //! they are not a hazard here.
 //!
 //! A scalar is lane-derived if a vector instruction wrote it (a compare, a
-//! carry-out; not the lane reads, which the lowering exchanges), if it is the
-//! entry EXEC, or if a scalar instruction computed it from one.
+//! carry-out; not the lane reads, which the lowering exchanges or, for a
+//! first-lane read of a value alike in the console wave, takes as the same in
+//! both halves: `lower::uniform`), if it is the entry EXEC, or if a scalar
+//! instruction computed it from one.
 // shortcut: lane-derived is a property of the whole value, not of its bits; a
 // loop on a lane-derived scalar with no `s_barrier` it controls is accepted
 // (each half iterates alone, and the lowering refuses an exchange inside it).

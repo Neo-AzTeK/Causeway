@@ -267,7 +267,7 @@ struct Lower<'a> {
     /// With `virt`: VGPR values alike in every lane of a console wave
     /// ([`uniform::lane_uniform`]); a first-lane read of one needs nothing
     /// from the other host wave.
-    uniform: HashSet<Value>,
+    uniform: uniform::Uniform,
     /// With `virt`, made in the entry block: whether this host wave is the
     /// console wave's upper half (0 or 1), and its first exchange slot.
     halves: Option<(V, V)>,
@@ -818,7 +818,7 @@ impl<'a> Lower<'a> {
             uniform: if virt {
                 uniform::lane_uniform(p, x.st, uniform::wave_tid(x.native, x.io))
             } else {
-                HashSet::new()
+                uniform::Uniform::none()
             },
             halves: None,
             has_upper: None,
@@ -6844,7 +6844,7 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32"
                 if self.virt
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                        if inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))) =>
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.alike_at(x, self.cur_ir))) =>
             {
                 // Alike in every lane of the console wave: the lane's own
                 // value is its first lane's, in either host wave.

@@ -1472,3 +1472,28 @@ fn a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own() {
         assert_eq!(got, want);
     }
 }
+
+/// [`a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own`]
+/// with odd lanes going round once more (to their own wave's total), then a
+/// first-lane read of the sum after the loop: the lanes left at different
+/// iterations, so the sum is not alike there and the console's first lane
+/// (an even one) gives every lane the sum of the waves before its own.
+#[test]
+fn a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane() {
+    let (mut body, want) = wave_prefix(&[
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20 (unused)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3614_0081, // v_and_b32 v10, 1, v0
+        0x4A14_0F0A, // v_add_nc_u32 v10, v10, v7
+    ]);
+    let exit = body.iter().position(|&w| w == 0x7DA4_0E12).unwrap();
+    body[exit] = 0x7DA4_1412; // v_cmpx_eq_u32 s18, v10
+    body.extend([
+        0x7E3C_0508, // v_readfirstlane_b32 s30, v8
+        0x7E10_021E, // v_mov_b32 v8, s30
+    ]);
+    if let Some(got) = two_halves_with_lds(&body, 256) {
+        assert_eq!(got, want);
+    }
+}
