@@ -1286,6 +1286,10 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        // The submission has run: its conversion lists go back to the pool
+        // now, before the dumps below submit lists of their own on this
+        // thread (the pool's lock would be taken twice).
+        drop(converting);
         // The submission has run and the next waits for our lock.
         release_retired();
         self.log_messages();
