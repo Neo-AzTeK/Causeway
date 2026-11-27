@@ -49,6 +49,17 @@ Each item names its problem in the ranked table below.
 - [ ] Speed, after the picture: look at waiting for the GPU after every batch
       sent, and at the copies between the two views of memory; the gain is not
       measured (`frame-preparing-cost`)
+- [ ] Ideas from xcl-dev/xcl (GPL-2.0-only: ideas only, our own code), by
+      measured cost (world frame ~1.3 s: 709 ms preparing on the submitting
+      thread, 550 ms GPU): (1) changed-bytes upload: copy only 64-byte chunks
+      that differ from what was last sent, on a copy queue the title's queue
+      waits on in the GPU, so preparing leaves the submitting thread; (2)
+      buffer descriptors read as their title address through the page table,
+      not one host view each (23-28k placed-buffer slots a frame, 190-645 ms,
+      `for_view` up to 1.1 s, on title threads, all behind one heap lock);
+      (3) title memory the GPU uses in place (`OpenExistingHeapFromAddress`,
+      committed private memory below 4 GiB per heap): only for memory that is
+      not physical-page views, so a measure of how much that is comes first
 
 ## Done lately
 
