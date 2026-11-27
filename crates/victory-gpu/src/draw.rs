@@ -110,6 +110,10 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count, what
     /// for; given back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32, Use)>,
+    /// When the list first took dynamic slots of a title heap (the usage
+    /// line, `descriptor::host::held`).
+    #[cfg(feature = "diagnostics")]
+    holding_since: Option<std::time::Instant>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -145,6 +149,13 @@ impl Drop for State {
         if title_heaps {
             held::add(Use::Lists, -1);
         }
+        for &key in self.fresh_tables.keys() {
+            held::table(key, 0, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(since) = self.holding_since {
+            held::given_back(since.elapsed().as_millis() as u64);
+        }
     }
 }
 
@@ -155,6 +166,10 @@ impl State {
         if heap != MEMORY_HEAP {
             if !self.dynamic.iter().any(|&(h, ..)| h != MEMORY_HEAP) {
                 held::add(Use::Lists, 1);
+                #[cfg(feature = "diagnostics")]
+                {
+                    self.holding_since = Some(std::time::Instant::now());
+                }
             }
             held::add(what, i64::from(n));
         }
@@ -1457,6 +1472,7 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
+            held::table(key, n, true);
             self.hold(std::ptr::from_ref(heap) as usize, first, n, Use::Tables);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).

@@ -1180,11 +1180,61 @@ pub(crate) mod held {
         HELD[what as usize].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Fresh tables held by lists, by (table, what it holds): entries and
+    /// how many lists hold it; and lists given back: how many, and for how
+    /// long in all (ms) they held slots.
+    #[cfg(feature = "diagnostics")]
+    static TABLES: std::sync::Mutex<Option<std::collections::HashMap<(u64, u64), (u32, u32)>>> =
+        std::sync::Mutex::new(None);
+    #[cfg(feature = "diagnostics")]
+    static GIVEN_BACK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+    /// A list now holds (`held`) or no longer holds fresh table `key` of `n`
+    /// entries.
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    pub(crate) fn table(key: (u64, u64), n: u32, held: bool) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut g = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+            let map = g.get_or_insert_with(Default::default);
+            if held {
+                map.entry(key).or_insert((n, 0)).1 += 1;
+            } else if let Some(e) = map.get_mut(&key) {
+                e.1 -= 1;
+                if e.1 == 0 {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// A list gave its slots back after holding them `ms`.
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    pub(crate) fn given_back(ms: u64) {
+        #[cfg(feature = "diagnostics")]
+        {
+            GIVEN_BACK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            GIVEN_BACK[1].fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     #[cfg(feature = "diagnostics")]
     pub(super) fn line() -> String {
-        let [tables, runs, used, clears, pairs, lists] =
-            [0, 1, 2, 3, 4, 5].map(|k| HELD[k].load(std::sync::atomic::Ordering::Relaxed));
-        format!("tables {tables}, root runs {runs} ({used} used), clears {clears}, pairs {pairs}, by {lists} lists")
+        use std::sync::atomic::Ordering::Relaxed;
+        let [tables, runs, used, clears, pairs, lists] = [0, 1, 2, 3, 4, 5].map(|k| HELD[k].load(Relaxed));
+        let (distinct, slots, large) = {
+            let g = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+            let map = g.as_ref();
+            let all = map.into_iter().flat_map(|m| m.values());
+            all.fold((0, 0, 0), |(d, s, l), &(n, _)| (d + 1, s + n, l + if n >= 64 { n } else { 0 }))
+        };
+        let [back, ms] = [0, 1].map(|k| GIVEN_BACK[k].swap(0, Relaxed));
+        let age = ms.checked_div(back).unwrap_or(0);
+        format!(
+            "tables {tables} ({distinct} distinct of {slots} slots, {large} in tables of 64 or more), \
+             root runs {runs} ({used} used), clears {clears}, pairs {pairs}, by {lists} lists; \
+             {back} lists gave slots back, held {age} ms on average"
+        )
     }
 }
 
