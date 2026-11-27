@@ -22,14 +22,15 @@ measure what the picture loses. Measured figures stay on this machine, not here 
 | 2 | `wave64-refusals` | here | compute needing waves of 64 is refused: most refused pipelines in world runs | counts measured; picture effect a guess |
 | 3 | `descriptor-slots` | other AI | draws and dispatches dropped for lack of descriptor slots; a large share of drops | counts measured (some mislabelled as pipeline losses); picture effect a guess |
 | 4 | `mesh-pipeline-invalid` | here | a mesh pipeline the host rejects loses many indirect draws in some runs, almost none in others | cause unknown |
-| 5 | `gpu-long-dispatch` | here | long dispatches remove the GPU; held off by a skip switch, and by leaving a fix for indirect dispatches reverted | skip proven to avoid one removal; the second link strongly suggested by one run |
-| 6 | `untranslated-shaders` | here | some programs in world runs do not translate (several reasons); one reason may need data only the descriptor heap has | few draws lost; picture effect a guess |
-| 7 | `title-crash-breakpoint` | here | the title stopped itself on a failed internal check once, during a long world run | seen once, not reproduced since |
-| 8 | `compile-backlog` | here | on a cold shader cache, work is dropped for a long stretch while pipelines are made | measured on cold cache only; warm effect small |
-| 9 | `frame-preparing-cost` | here | CPU preparation is a large share of each world frame | measured, some runs not on a quiet machine |
-| 10 | `texture-refresh-menus` | here | on the GTX 1070 slow texture refresh stalls the menus, so unattended runs miss the world | measured on that adapter, older build |
-| 11 | `gpu-tests-hang` | here | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
-| 12 | `device-methods-missing` | here | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
+| 5 | `gpu-long-dispatch` | here | evicting idle host textures that bindless shaders still write hung the GPU seconds into most world runs (fix on a branch) | shown by runs: no such hang with the fix, against most main runs |
+| 6 | `gpu-long-lists` | here | emulated mesh draws and the ray-tracing BVH builder's compute run for seconds in one list and trip the GPU timeout, in about half the world runs once the eviction hang is gone (rank not confirmed by the owner) | GPU times measured in one run; why the draws are slow is unknown |
+| 7 | `untranslated-shaders` | here | some programs in world runs do not translate (several reasons); one reason may need data only the descriptor heap has | few draws lost; picture effect a guess |
+| 8 | `title-crash-breakpoint` | here | the title stopped itself on a failed internal check once, during a long world run | seen once, not reproduced since |
+| 9 | `compile-backlog` | here | on a cold shader cache, work is dropped for a long stretch while pipelines are made | measured on cold cache only; warm effect small |
+| 10 | `frame-preparing-cost` | here | CPU preparation is a large share of each world frame | measured, some runs not on a quiet machine |
+| 11 | `texture-refresh-menus` | here | on the GTX 1070 slow texture refresh stalls the menus, so unattended runs miss the world | measured on that adapter, older build |
+| 12 | `gpu-tests-hang` | here | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
+| 13 | `device-methods-missing` | here | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
 
 ## Finding what keeps the 3D scene from showing
 

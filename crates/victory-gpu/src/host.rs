@@ -1087,9 +1087,10 @@ impl Host {
         batch.flush();
         #[cfg(feature = "diagnostics")]
         drop(flushing);
-        // Stamped as used only now, with nothing slow left before eviction
+        // Stamped as used only now, with nothing slow left before lowering
         // looks: preparing a batch can take longer than the idle time it
-        // asks for, and a texture stamped before that could be taken.
+        // asks for, and a texture stamped before that could run at the
+        // lowest priority.
         #[cfg(feature = "diagnostics")]
         let touching = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::TouchUs);
         for list in runs {
@@ -1698,8 +1699,9 @@ impl HostList {
         self.track(&copy, wanted).map(|before| (texture, before))
     }
 
-    /// Stamps the host textures the list holds as used now, resident again if
-    /// eviction took them since it was recorded (`crate::vram`).
+    /// Stamps the host textures the list holds as used now, at the normal
+    /// priority again if they were lowered since it was recorded
+    /// (`crate::vram`).
     fn touch_textures(&self) {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         for (_, _, copy) in states.values() {
@@ -1850,6 +1852,20 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_read(&self, what: impl FnOnce() -> String, range: (u64, u64)) {
         self.note(what, Some(range));
+    }
+
+    /// A marker right before an emulated mesh pass's dispatch or draw
+    /// ([`crate::mesh`]): without it a hang or a time there names only the
+    /// barrier before, not which pass or whose.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_mesh_work(&self, what: &str) {
+        self.note(
+            || {
+                let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+                mesh_work_text(notes.iter().rev().map(|(n, _)| n.as_str()), what)
+            },
+            None,
+        );
     }
 
     #[cfg(feature = "diagnostics")]
@@ -3228,6 +3244,16 @@ fn removed_during(runs: &[&HostList], list: Option<usize>) -> String {
     String::new()
 }
 
+/// [`HostList::note_mesh_work`]'s text: `what`, and the pipeline of the
+/// last compute pass among the list's notes, newest first.
+#[cfg(feature = "diagnostics")]
+fn mesh_work_text<'a>(mut newest_first: impl Iterator<Item = &'a str>, what: &str) -> String {
+    let pipeline = newest_first
+        .find_map(|n| n.strip_prefix("emulated mesh: compute pass "))
+        .map_or("", |rest| rest.split(" | ").next().unwrap_or(rest));
+    format!("emulated mesh work: {what} {pipeline}")
+}
+
 /// For adapters without device-removed data (the software one): the last
 /// commands each list of the failed submission noted (diagnostics, with
 /// `VICTORY_D3D12_DRED`).
@@ -3277,6 +3303,8 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .position(barrier)
         .map_or(history.len(), |b| (done + b).max(done + 1));
     let mut text = format!(", commands {from}..{to} between its barriers:");
+    // A long block shows the commands around the one it stopped at.
+    let from = from.max(done.saturating_sub(6)).min(done);
     let mut shown = 0;
     for i in from..to {
         let op = history[i];
@@ -3510,5 +3538,22 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod mesh_work {
+    #[test]
+    fn mesh_work_notes_name_the_last_compute_pass() {
+        let notes = [
+            "indirect kind 1 max 1",
+            "emulated mesh: compute pass [mesh b, pixel c] | c: u9=0x1",
+            "emulated mesh: compute pass [mesh a, pixel c]",
+        ];
+        assert_eq!(
+            super::mesh_work_text(notes.into_iter(), "draw, 2 groups"),
+            "emulated mesh work: draw, 2 groups [mesh b, pixel c]"
+        );
+        assert_eq!(super::mesh_work_text(std::iter::empty(), "x"), "emulated mesh work: x ");
     }
 }

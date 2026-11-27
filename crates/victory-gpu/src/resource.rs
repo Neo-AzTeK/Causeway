@@ -785,8 +785,9 @@ pub(crate) struct HostTexture {
     bytes: u64,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
-    /// Its [`residency`] level, raised only (under its lock) and lowered by
-    /// eviction ([`evict_idle`]); shared with its [`LIVE`] entry.
+    /// Its [`residency`] level, raised (under its lock) and lowered from
+    /// [`NORMAL`] to [`LOW`] by [`lower_idle`]; shared with its [`LIVE`]
+    /// entry.
     residency: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// When a list or a view last reached it ([`now_ms`]); shared with its
     /// [`LIVE`] entry.
@@ -803,8 +804,9 @@ pub(crate) struct HostTexture {
 /// residency. Raised textures are made resident before the next submission
 /// runs ([`make_resident`], under the submission lock): a texture raised
 /// while recording a list is resident when the list runs.
-// Evicted again when video memory nears the adapter's budget and no list
-// reached the texture for a while ([`evict_idle`], policy in `crate::vram`).
+// Lowered to the lowest priority again (never evicted) when video memory
+// nears the adapter's budget and no list reached the texture for a while
+// ([`lower_idle`], policy in `crate::vram`).
 #[cfg(windows)]
 mod residency {
     /// Not resident: made so, nothing reached it yet.
@@ -855,17 +857,28 @@ static RESIDENT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// the submission lock, so raises that came before it are all here.
 #[cfg(windows)]
 pub(crate) fn make_resident(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
-    use windows::Win32::Graphics::Direct3D12::*;
-    use windows::core::Interface;
     // Held through the calls: a raise seen by another thread (its fast
     // path) is resident before that thread's submission runs.
     let mut raised = RAISED.lock().unwrap_or_else(|e| e.into_inner());
-    evict_idle(device);
+    apply(device, &mut raised);
+    // After the raises: a texture lowered now ends at the lowest priority
+    // its level says.
+    lower_idle(device);
+}
+
+/// Makes `raised` textures resident and sets their priorities, emptying it.
+#[cfg(windows)]
+fn apply(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    raised: &mut Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Pageable, u8, u8)>,
+) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
     if raised.is_empty() {
         return;
     }
     let started = std::time::Instant::now();
-    let (make, levels) = residency::plan(&raised, |p| p.as_raw() as usize);
+    let (make, levels) = residency::plan(raised, |p| p.as_raw() as usize);
     raised.clear();
     if !make.is_empty() {
         let make: Vec<Option<ID3D12Pageable>> = make.into_iter().map(Some).collect();
@@ -896,11 +909,11 @@ pub(crate) fn make_resident(device: &windows::Win32::Graphics::Direct3D12::ID3D1
     RESIDENT_US.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Live host textures, for eviction.
+/// Live host textures, for lowering idle ones ([`lower_idle`]).
 #[cfg(windows)]
 static LIVE: std::sync::Mutex<Vec<Live>> = std::sync::Mutex::new(Vec::new());
 
-/// A live host texture as eviction sees it, keyed by the resource's address.
+/// A live host texture as [`lower_idle`] sees it, keyed by the resource's address.
 /// Holds a reference to the resource: [`HostTexture`]'s drop removes it.
 #[cfg(windows)]
 struct Live {
@@ -918,16 +931,20 @@ fn now_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
-/// Evicts resident host textures no list reached for a while when video
-/// memory nears the adapter's budget (`crate::vram`). Called with the
-/// [`RAISED`] lock held and the GPU idle (the host waits for every
-/// submission), before the next lists run: textures a list will use were
-/// stamped at its submission ([`HostTexture::touch`]) and are too recent.
+/// Lowers resident host textures no list reached for a while to the lowest
+/// residency priority when video memory nears the adapter's budget
+/// (`crate::vram`): once the process goes over its budget, the memory
+/// manager moves them out of video memory first, and back in when the GPU
+/// reaches them. They are not evicted: heap-indexing shaders reach any
+/// view of the heap without a list naming its texture, so no texture with
+/// a view is known to be unreachable, and the GPU reaching an evicted one
+/// hangs it (problem gpu-long-dispatch: a clear writing a texture only
+/// through the heap). Called with the [`RAISED`] lock held, before the next
+/// lists run.
 #[cfg(windows)]
-fn evict_idle(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
-    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-    use windows::Win32::Graphics::Direct3D12::ID3D12Pageable;
-    let Some(decision) = crate::vram::tick(RESIDENT.load(Relaxed)) else {
+fn lower_idle(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(decision) = crate::vram::tick(RESIDENT.load(Relaxed), LOWEST.load(Relaxed)) else {
         return;
     };
     if decision.free == 0 {
@@ -935,31 +952,59 @@ fn evict_idle(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) {
     }
     let now = now_ms();
     let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    // Textures at the lowest priority already are not lowered again.
     let candidates: Vec<(usize, u64, u64)> = live
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.residency.load(Acquire) != NOT_RESIDENT)
+        .filter(|(_, l)| l.residency.load(std::sync::atomic::Ordering::Acquire) == NORMAL)
         .map(|(i, l)| (i, now.saturating_sub(l.last_used.load(Relaxed)), l.bytes))
         .collect();
-    let picked = crate::vram::pick(decision, &candidates);
-    if picked.is_empty() {
-        return;
+    let picked: Vec<&Live> = crate::vram::pick(decision, &candidates).into_iter().map(|i| &live[i]).collect();
+    let lowered = lower(device, &picked);
+    if lowered > 0 {
+        // Often (each texture that goes idle again): the budget line names
+        // what is being lowered.
+        tracing::debug!("lowered {} idle host textures ({:.0} MB) to the lowest residency priority", picked.len(), lowered as f64 / 1e6);
     }
-    let pageables: Vec<Option<ID3D12Pageable>> = picked.iter().map(|&i| Some(live[i].pageable.clone())).collect();
-    // SAFETY: live resources, none in flight (the host waits for every
-    // submission) and none of the current batch (stamped just now).
-    if let Err(e) = unsafe { device.Evict(&pageables) } {
-        tracing::warn!(error = %e, count = pageables.len(), "idle host textures not evicted");
-        return;
-    }
-    let mut freed = 0;
-    for &i in &picked {
-        live[i].residency.store(NOT_RESIDENT, Release);
-        freed += live[i].bytes;
-    }
-    RESIDENT.fetch_sub(freed, Relaxed);
-    tracing::info!("evicted {} idle host textures ({:.0} MB)", picked.len(), freed as f64 / 1e6);
 }
+
+/// Sets `textures` to the lowest residency priority, keeping them
+/// resident ([`LOW`]); a later use raises them again
+/// ([`HostTexture::raise`]). The bytes lowered; 0 if the host has no
+/// residency priorities.
+#[cfg(windows)]
+fn lower(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device, textures: &[&Live]) -> u64 {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_RESIDENCY_PRIORITY_MINIMUM, ID3D12Device1, ID3D12Pageable};
+    use windows::core::Interface;
+    if textures.is_empty() {
+        return 0;
+    }
+    let Ok(device) = device.cast::<ID3D12Device1>() else {
+        return 0;
+    };
+    let objects: Vec<Option<ID3D12Pageable>> = textures.iter().map(|l| Some(l.pageable.clone())).collect();
+    let priorities = vec![D3D12_RESIDENCY_PRIORITY_MINIMUM; objects.len()];
+    // SAFETY: as many priorities as live objects.
+    if let Err(e) = unsafe { device.SetResidencyPriority(objects.len() as u32, objects.as_ptr(), priorities.as_ptr()) } {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(error = %e, count = objects.len(), "idle host textures not lowered"));
+        return 0;
+    }
+    // A use racing this store (a raise's fast path, which saw NORMAL) keeps
+    // the texture resident, at the lowest priority until its next raise.
+    for l in textures {
+        l.residency.store(LOW, std::sync::atomic::Ordering::Release);
+    }
+    let bytes = textures.iter().map(|l| l.bytes).sum();
+    LOWEST.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    bytes
+}
+
+/// Bytes of live host textures resident at the lowest priority ([`LOW`]):
+/// given back to the memory manager, so not counted against the budget
+/// when the adapter's usage cannot be queried (`crate::vram::counted`).
+#[cfg(windows)]
+static LOWEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Bytes of live host textures resident, and milliseconds spent making
 /// them resident since the last call.
@@ -1014,8 +1059,8 @@ impl HostTexture {
         }
     }
 
-    /// A submission holds it: stamped as used now and resident again if
-    /// eviction took it, so a list recorded long ago finds it there.
+    /// A submission holds it: stamped as used now and at the normal
+    /// priority again if it was lowered since its list was recorded.
     pub(crate) fn touch(&self) {
         self.raise(NORMAL);
     }
@@ -1034,7 +1079,7 @@ impl HostTexture {
     /// submission on.
     fn raise(&self, level: u8) {
         use std::sync::atomic::Ordering::{Acquire, Release};
-        // Before the level is read: eviction takes only textures idle for
+        // Before the level is read: lowering takes only textures idle for
         // longer than a thread stays between here and its submission.
         self.last_used.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         // A level seen here was queued under the lock, which the next
@@ -1053,6 +1098,11 @@ impl HostTexture {
         if before == NOT_RESIDENT {
             RESIDENT.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
+        match (before, level) {
+            (LOW, _) => LOWEST.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed),
+            (_, LOW) => LOWEST.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed),
+            _ => 0,
+        };
     }
 
     /// Its level, for tests.
@@ -1102,7 +1152,7 @@ impl Drop for HostTexture {
             USED.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
         {
-            // Under the lock eviction holds: none runs on it now.
+            // Under the lock lowering holds: none runs on it now.
             use windows::core::Interface;
             let key = self.texture.as_raw() as usize;
             let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1110,8 +1160,12 @@ impl Drop for HostTexture {
                 live.swap_remove(i);
             }
         }
-        if self.residency.load(std::sync::atomic::Ordering::Acquire) != NOT_RESIDENT {
+        let level = self.residency.load(std::sync::atomic::Ordering::Acquire);
+        if level != NOT_RESIDENT {
             RESIDENT.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        if level == LOW {
+            LOWEST.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -2560,6 +2614,89 @@ pub(crate) mod tests {
         assert_eq!(copy.residency(), NORMAL);
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop(copy);
+        assert_eq!(resource_release(image), 0);
+    }
+
+    /// Idle textures are lowered, never evicted: one a list used stays
+    /// resident at the lowest priority, and the GPU still reaches it with no
+    /// raise in between (as heap-indexing shaders do: no list names it); its
+    /// next use raises it again.
+    #[test]
+    fn idle_textures_are_lowered_not_evicted() {
+        use super::residency::{LOW, NORMAL};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let mut desc = texture(64, 64, 28, 1);
+        desc.flags = 1;
+        let mut image = null;
+        let clear = [28, 0, 0, 0, 0];
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0x4, clear.as_ptr().cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let copy = resource(image).host.clone().expect("a host texture");
+        // A list uses it; a submission makes it resident.
+        crate::list::tests::clear(image);
+        assert_eq!(copy.residency(), NORMAL);
+        let submit = |record: &dyn Fn(&crate::host::HostList)| {
+            let list = host.new_list().unwrap();
+            record(&list);
+            list.close();
+            host.execute(&[&list]);
+        };
+        submit(&|_| {});
+        {
+            let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            let key = copy.texture.as_raw() as usize;
+            let entry = live.iter().find(|l| l.key == key).expect("a live entry");
+            assert_eq!(copy.residency(), NORMAL, "not lowered by another submission");
+            assert_eq!(lower(&host.device, &[entry]), entry.bytes);
+        }
+        assert_eq!(copy.residency(), LOW, "still resident, at the lowest priority");
+        // The GPU reads it with nothing raising it first.
+        // SAFETY: a plain query of a live texture.
+        let d = unsafe { copy.texture.GetDesc() };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: an out structure for one subresource.
+        unsafe { host.device.GetCopyableFootprints(&d, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total)) };
+        let (out, _) = host.shared_buffer(total).unwrap();
+        let state = D3D12_RESOURCE_STATES(copy.state.load(std::sync::atomic::Ordering::Relaxed) as i32);
+        submit(&|list| {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the copy does not release.
+                pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&out) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            // SAFETY: an open list; live resources, the texture in `state`.
+            unsafe {
+                if state != source {
+                    list.list.ResourceBarrier(&[crate::host::transition(&copy.texture, state, source)]);
+                }
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                if state != source {
+                    list.list.ResourceBarrier(&[crate::host::transition(&copy.texture, source, state)]);
+                }
+            }
+            list.keep(&out);
+        });
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        crate::list::tests::clear(image);
+        assert_eq!(copy.residency(), NORMAL, "raised again by its next use");
         drop(copy);
         assert_eq!(resource_release(image), 0);
     }

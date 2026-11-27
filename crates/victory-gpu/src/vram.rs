@@ -4,8 +4,11 @@
 //! the OS gives a process part of it (`IDXGIAdapter3::QueryVideoMemoryInfo`,
 //! local segment: on an integrated GPU that is the shared memory it may use).
 //! [`decide`] is a pure function of (budget, usage): past [`START_PCT`] of the
-//! budget, host textures no list reached for a while are evicted, longer-idle
-//! first, until usage is back to [`TARGET_PCT`]; the closer to the budget, the
+//! budget, host textures no list reached for a while are lowered to the
+//! lowest residency priority (over the budget, the memory manager moves
+//! them out first; they stay resident, as heap-indexing shaders may reach
+//! them), longer-idle first, until usage is back to [`TARGET_PCT`] (see
+//! [`counted`]); the closer to the budget, the
 //! shorter the idle time that qualifies. No size is fixed: every figure is a
 //! share of the budget. [`resolve`] picks the (budget, usage) pair: the
 //! query's, or when it fails the `MemoryPlan` budget (`caps::memory_plan`: the
@@ -13,16 +16,15 @@
 //! fixed guess) against the bytes the host made resident. This module asks the
 //! adapter for no capability: only the live usage, which `Caps` leaves out.
 //!
-//! Eviction runs under the submission lock, before the lists run
-//! (`resource::make_resident`): the host waits for every submission, so no
-//! evicted texture is in flight. Evicted textures are made resident again
-//! the next time anything hands them to the GPU (`resource::residency`).
+//! Lowering runs under the submission lock, before the lists run
+//! (`resource::make_resident`). A lowered texture is raised again the next
+//! time anything hands it to the GPU (`resource::residency`).
 
 use crate::caps::MemoryPlan;
 
-/// Usage, in percent of the budget, from which idle textures are evicted.
+/// Usage, in percent of the budget, from which idle textures are lowered.
 pub(crate) const START_PCT: u64 = 75;
-/// Usage, in percent of the budget, eviction frees down to (below
+/// Usage, in percent of the budget, lowering frees down to (below
 /// [`START_PCT`]: it does not start again at once).
 pub(crate) const TARGET_PCT: u64 = 70;
 /// Usage from which idle time stops mattering much ([`IDLE_HIGH_MS`]).
@@ -41,10 +43,10 @@ pub(crate) const SAMPLE_MS: u64 = 250;
 /// Time between log lines of budget and usage.
 pub(crate) const LOG_MS: u64 = 1000;
 
-/// What to evict.
+/// What to lower.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Decision {
-    /// Bytes to free (0: nothing is evicted).
+    /// Bytes to free (0: nothing is lowered).
     pub(crate) free: u64,
     /// Only textures no list reached for this long qualify.
     pub(crate) idle_ms: u64,
@@ -58,7 +60,7 @@ fn percent(budget: u64, usage: u64) -> u64 {
     (u128::from(usage) * 100 / u128::from(budget)).min(u128::from(u64::MAX)) as u64
 }
 
-/// What to evict at `usage` bytes of a `budget`.
+/// What to lower at `usage` bytes of a `budget`.
 pub(crate) fn decide(budget: u64, usage: u64) -> Decision {
     let pct = percent(budget, usage);
     if pct < START_PCT {
@@ -73,6 +75,14 @@ pub(crate) fn decide(budget: u64, usage: u64) -> Decision {
     Decision { free: usage.saturating_sub(target), idle_ms }
 }
 
+/// The usage to decide on: the adapter's local-segment `usage` as the query
+/// gives it (`queried`: textures the memory manager moved out are not in
+/// it), else the host's resident bytes less the `lowest` of them already at
+/// the lowest priority, which the policy has given back.
+pub(crate) fn counted(queried: bool, usage: u64, lowest: u64) -> u64 {
+    if queried { usage } else { usage.saturating_sub(lowest) }
+}
+
 /// The (budget, usage) to decide on: the query's `(budget, current usage)`,
 /// else (the plan's budget, bytes `own` the host made resident). A query that
 /// reports no budget counts as failed.
@@ -83,7 +93,7 @@ pub(crate) fn resolve(query: Option<(u64, u64)>, plan: MemoryPlan, own: u64) -> 
     }
 }
 
-/// Textures to evict: of `(key, idle_ms, bytes)`, those idle for at least
+/// Textures to lower: of `(key, idle_ms, bytes)`, those idle for at least
 /// `decision.idle_ms`, longest idle first, until `decision.free` bytes are
 /// freed (the one that crosses the line included). Keys, in that order.
 pub(crate) fn pick<K: Copy>(decision: Decision, candidates: &[(K, u64, u64)]) -> Vec<K> {
@@ -145,9 +155,10 @@ mod host {
     }
 
     /// At most every [`SAMPLE_MS`]: samples budget and usage, logs them at
-    /// most every [`LOG_MS`], and returns what to evict given `own` bytes
-    /// of host textures resident. `None` between samples.
-    pub(crate) fn tick(own: u64) -> Option<Decision> {
+    /// most every [`LOG_MS`], and returns what to lower given `own` bytes
+    /// of host textures resident, `lowest` of them at the lowest priority
+    /// already ([`counted`]). `None` between samples.
+    pub(crate) fn tick(own: u64, lowest: u64) -> Option<Decision> {
         let monitor = MONITOR.get()?;
         let now = Instant::now();
         let mut state = monitor.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -157,15 +168,16 @@ mod host {
         state.sampled = Some(now);
         let asked = monitor.adapter.as_ref().and_then(query);
         let (budget, usage) = resolve(asked, monitor.plan, own);
-        let decision = decide(budget, usage);
+        let decision = decide(budget, counted(asked.is_some(), usage, lowest));
         if state.logged.is_none_or(|t| now.duration_since(t).as_millis() >= u128::from(LOG_MS)) {
             state.logged = Some(now);
             tracing::info!(
-                "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB, evicting {:.0} MB",
+                "video memory: {:.0} MB used of a {:.0} MB budget ({}), host textures resident {:.0} MB ({:.0} MB at the lowest priority), lowering {:.0} MB",
                 usage as f64 / 1e6,
                 budget as f64 / 1e6,
                 if asked.is_some() { "DXGI" } else { "query failed: caps plan" },
                 own as f64 / 1e6,
+                lowest as f64 / 1e6,
                 decision.free as f64 / 1e6,
             );
         }
@@ -191,7 +203,7 @@ mod tests {
     ];
 
     #[test]
-    fn nothing_is_evicted_below_the_start_line() {
+    fn nothing_is_lowered_below_the_start_line() {
         for (name, budget) in MATRIX {
             let usage = budget * (START_PCT - 1) / 100;
             assert_eq!(decide(budget, usage).free, 0, "{name}");
@@ -200,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn eviction_frees_down_to_the_target_share_of_each_budget() {
+    fn lowering_frees_down_to_the_target_share_of_each_budget() {
         for (name, budget) in MATRIX {
             for pct in [START_PCT, 80, HIGH_PCT, 90, CRITICAL_PCT, 100, 120] {
                 let usage = budget * pct / 100;
@@ -236,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_budget_evicts_what_it_can_without_overflow() {
+    fn a_zero_budget_lowers_what_it_can_without_overflow() {
         let d = decide(0, 100);
         assert_eq!(d.free, 100);
         assert_eq!(d.idle_ms, IDLE_CRITICAL_MS);
@@ -275,6 +287,11 @@ mod tests {
         // The policy still works on the fallback: 3 GB of 4 GB is pressure.
         let (budget, usage) = resolve(None, nothing, own);
         assert!(decide(budget, usage).free > 0);
+        // Bytes already at the lowest priority count only without the query:
+        // the adapter's usage leaves out what the memory manager moved out.
+        assert_eq!(counted(false, usage, usage / 2), usage - usage / 2);
+        assert_eq!(counted(true, usage, usage / 2), usage);
+        assert_eq!(counted(false, 1, 2), 0);
         assert_eq!(decide(budget, 2 * GB).free, 0);
         // A small card is under pressure at the same own bytes, a large one not.
         assert!(decide(small.budget, own).free > 0);
