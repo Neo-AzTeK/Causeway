@@ -1,14 +1,13 @@
 # Debugging
 
-Reference for diagnostics builds; the [README](../README.md) has the basics.
-A release build has no debugging aids. Build them in with
+Reference for diagnostics builds; [README](../README.md) covers basics. Release builds omit debugging aids; compile with:
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
 | Variable | Effect |
-|----------|--------|
+| --- | --- |
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds, with function names (diagnostics build); `cargo xtask stacks <run>` lists the title's threads in our code and tallies where they ran or waited |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
@@ -38,80 +37,23 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder. After the title's own crash filter returns, its latest debug
-output is added (where it saved its report, if it did). A title that stops
-itself on a breakpoint (`int3`) is often at a failed check: diagnostics builds
-also log, for the unhandled report, up to eight quadwords at what each register
-but `rsp` points at, loaded images left out (title memory, in the log and the
-console: do not copy it into the repository).
+Crashes and host GPU failures append to `crashes.log` in the title's data folder after the title's crash filter returns, followed by latest debug output and report path if saved. An access violation's report names the reservation an uncommitted address lies in and the faulting thread's stack range. On `int3` breakpoints and access violations in diagnostics builds, unhandled reports also log up to eight quadwords at each register target except `rsp` (excluding loaded images; title memory in log/console—do not copy into repo).
 
 ## Smoke runs
 
-`cargo xtask smoke --exe <title exe> --out <folder outside the repository>`
-runs a title unattended with this build (300 s, `--seconds`), skips its menus
-with `VICTORY_KEYS` (`--keys` replaces them; they do nothing while an XInput pad is
-connected), and judges each graphics area in `report.txt` and `report.json`.
-`--log <file>` judges an existing log instead.
-`--world-lines <n>` ends the run once it has `n` steady world lines (one about
-every 5 s): world lines logged 90 s or more after the first, the warm-up. The log
-is read every 2 s and the title is ended one look after the `n`th, as at the end
-of the time; `--seconds` stays the cap, and a run that ends short of `n` fails the
-"steady world lines" area, which says how many it had.
+```powershell
+cargo xtask smoke --exe <title exe> --out <folder outside the repository>
+```
 
-A run measured on a busy machine reads slower and can lose draws to pipelines
-still being made. So after its build, a run waits for a quiet machine before it
-starts the title: no compiler or linker running (`rustc`, `clippy-driver`, `link`,
-`rust-lld`, `cl`), under 30% of all cores, at least 12 GB of commit free and at
-least 4 GB of RAM free (`--quiet-commit-gb`, `--quiet-ram-gb`; 0 asks for none;
-the title holds ~32 GB private), all for 20 s, for 600 s at most
-(`--quiet-wait`; 0 starts at once; `log.txt` is made when the title starts). A
-machine short of memory is *starved*: the title boots, translates and loads at
-a crawl and may never reach the world. The report reads that from the log (the
-pipeline library load over 1000 ms against 30 ms, cached shader translations
-that take 20 times their CPU time on the clock, or the story000 pack opened over
-120 s after boot) and then says **STARVED machine, rerun on a quiet machine**:
-in "world reached" when there is no world, and first in the digest's "Next". Such
-a run is run again, not debugged. While
-the title plays it records in `load.txt`, every 2 s, the CPU in all, the CPU of
-processes other than the title's (the system's busy time less the title's job),
-and the compilers running. The "machine load" area gives the wait, the load over
-the lines measured (the steady ones; all world lines if fewer than 3 are), and how
-many looks a build overlapped, in and outside them. It warns **MACHINE BUSY** when
-over a quarter of those looks have other processes above 20% of all cores. These
-two numbers are estimates: tune them on the recorded looks. It also writes `digest.md` (at most 60
-lines: run header with the switches the game saw, delta against `--baseline <report.json>`,
-frame cost, draws lost by cause and pipeline, refusals ranked by draws lost, a contact
-sheet and the top 3 next items). `--env NAME=VALUE` passes a `VICTORY_*` switch to the
-game (the runner removes all others) and the digest warns when the log does not show it.
-It exits with an error when an
-area failed; what a log does not show is "unknown".
+Runs a title unattended (`--seconds`, default `300`), drives menus via `VICTORY_KEYS` (`--keys` overrides; ineffective with XInput connected), and evaluates graphics areas in `report.txt` and `report.json` (`--log <file>` evaluates an existing log). `--world-lines <n>` stops one poll after reaching `n` **steady world lines** (logged every ~5 s, >= 90 s after the first/warm-up line), capped by `--seconds`; fewer than `n` fails "steady world lines".
 
-On a real GPU this can reset the display driver, so only one smoke run at a
-time starts on a machine, and none while another `victory.exe`, the testbed or
-any cargo test binary runs (it may be on the GPU; `victory census` and
-`victory translate` without `--pipelines` are not). A run or `cargo xtask alone --
-<command>` (which holds the same lock around GPU tests) that finds the lock held or
-a GPU process running waits, not refuses: it logs `waiting (N s so far): <holder>`
-at once and then every 60 s, and starts when both are free. It never ends or breaks
-the other. After 60 minutes it refuses, naming the holder, and a queued request
-records that in its `.done`. `--quiet` also refuses to start
-beside a compiler, a linker or such a scan: use it when timings matter. Each launched run
-is sampled every 5 s; `run.txt` and the digest header say `machine: quiet`,
-`NOT QUIET: ...` or `unknown` (by process name: other load is not seen).
-`--problem <id>` writes the run into that problem's log
-(`docs/problem-sessions.md`). Scripted keys can tick the title's legal terms on its
-first-start screens, so the runner refuses them unless the data folder is
-already set up (`--data-from <folder>` copies one for the run, `--data-dir
-<folder>` uses it in place). `--keys ""` plays by hand; `--accept-terms` allows
-a fresh folder and needs the owner's OK for that launch.
+To avoid slow reads and pipeline-compile draw losses, post-build runs wait up to `--quiet-wait` (default `600` s; `0` starts immediately) for 20 s of quiet state: no active compilers/linkers (`rustc`, `clippy-driver`, `link`, `rust-lld`, `cl`), total CPU < 30% of all cores, free commit >= `--quiet-commit-gb` (default `12` GB), and free RAM >= `--quiet-ram-gb` (default `4` GB; `0` disables either; title uses ~32 GB private). `log.txt` is created at title start. Memory-starved runs (pipeline library load > 1000 ms vs. ~30 ms, cached shader translation wall time > 20x CPU time, or `story000` pack opened > 120 s post-boot) report **STARVED machine, rerun on a quiet machine** in "world reached" (if no world) and first in digest "Next"—rerun rather than debug. `load.txt` samples total CPU, non-title CPU (system busy minus title job), and running compilers every 2 s. "machine load" reports wait time, load across measured lines (steady lines, or all world lines if < 3), and build overlaps in/outside them, warning **MACHINE BUSY** when > 25% of those looks have other processes > 20% of all cores (tune thresholds against recorded looks). Also writes `digest.md` (<= 60 lines: header with game-seen switches, `--baseline <report.json>` delta, frame cost, draws lost by cause/pipeline, refusals ranked by draws lost, contact sheet, top 3 next items). `--env NAME=VALUE` forwards only `VICTORY_*` variables (runner clears all others) and warns in the digest if unlogged. Exits non-zero on failed areas; missing log data is `"unknown"`.
+
+Only one smoke run starts at a time, and none while another `victory.exe`, testbed, or `cargo test` binary runs (`victory census` and `victory translate` without `--pipelines` excluded). `cargo xtask smoke` and `cargo xtask alone -- <command>` (GPU test lock) wait rather than fail when locked or GPU-busy, logging `waiting (N s so far): <holder>` immediately and every 60 s without killing holders, refusing after 60 minutes with holder recorded in `.done`. `--quiet` also waits on compilers, linkers, or GPU scans for timing accuracy. Active runs are sampled every 5 s; `run.txt` and digest header log `machine: quiet`, `NOT QUIET: ...`, or `unknown` (by process name only). `--problem <id>` appends to `docs/problem-sessions.md`. Scripted keys can accept first-run legal terms, so `--data-from <folder>` (copies) or `--data-dir <folder>` (in-place) is required unless `--keys ""` (manual) or `--accept-terms` (requires owner approval).
 
 ### Sharing the GPU: `queue`, and judging a run: `compare`
 
-Sessions do not launch real-GPU runs; they queue them. Requests are small TOML
-files in `E:\Causeway-tools\queue` (`--queue-dir`, or `VICTORY_QUEUE_DIR`); runs go
-to `E:\Causeway-tools\runs` (`--runs-dir`, `VICTORY_RUNS_DIR`). Both stay outside
-the repository.
+Sessions queue real-GPU runs instead of launching them directly. Queue TOMLs live in `E:\Causeway-tools\queue` (`--queue-dir` / `VICTORY_QUEUE_DIR`) and outputs in `E:\Causeway-tools\runs` (`--runs-dir` / `VICTORY_RUNS_DIR`), both outside the repository.
 
 ```powershell
 cargo xtask queue add --name mesh-9 --seconds 420 --env VICTORY_SHADER_LOOP_LIMIT=64 --baseline smoke-15 --requester local_... --wait
@@ -119,99 +61,26 @@ cargo run -q --target-dir target\queue-runner -p xtask -- queue run --exe E:\GTA
 cargo xtask queue status
 ```
 
-`add` writes `<name>.toml`: the worktree (this one by default), its commit (HEAD
-by default; the runner refuses a worktree at another commit, with uncommitted
-tracked changes, or that `git worktree list` does not show), `seconds`, `world_lines`
-(`--world-lines`; the worktree's own `xtask` must know it), `env`
-(`VICTORY_*` only), `baseline` (a run's name, or an absolute `report.json`),
-`requester`, and `data_dir`, `data_from`, `keys`. A smoke run on the default keys
-(no `--keys`, no `--accept-terms`) also stops early when
-no world line comes 150 s after the story000 pack opened (the log line
-`dstorage: file opened ... story000`; a starved boot gets those 150 s): smoke writes
-`rerun.txt` into the run's folder and the `.done` gets `error = "rerun: ..."`,
-unless the log has a crash or a removed device. Run it again if the digest says
-STARVED; otherwise read the log (a hang while loading looks the same). A baseline named by run must
-have a report, or be queued or running (`add` refuses it otherwise); if it still
-has none when this run's turn comes, the run goes on and its `.done` has a
-`warning`. Any other field, or a switch
-that is not `VICTORY_*`, refuses the request; `--accept-terms` is not one. `run`
-takes the oldest request and runs exactly `cargo xtask smoke --exe <its --exe> --out
-<runs>\<name> ...` in that worktree, one at a time (a runner holds `runner.lock`
-open, so a second cannot start while it lives, and the file a dead one left blocks
-nobody; the next runner ends what it left running; `--once` to stop when the queue
-is empty). The console goes to `<runs>\<name>.console.txt`. It then writes
-`<name>.done` (`exit`, `out`, `digest`, `console`, and `error` for a refused
-request, `exit = -1`, and the `requester`) beside the request: wait for that file, or
-pass `--wait`. There is one runner and it owns the order (oldest request first); never
-start a waiter per request. While the smoke lock is held (a run by hand) the head waits;
-a run that still finds the lock held when it starts goes back to the head (its request is
-untouched), and after 150 such tries (five minutes) it is given up on in its `.done`. A
-run that starts waits for the lock and for GPU processes itself (see above), so a
-request is refused only after that wait's 60 minutes, with the holder in its `.done`.
-`status` prints what runs (and for how long), then the queue in the order it runs, then
-the last finished.
+`add` records `<name>.toml`: worktree (default current), commit (default `HEAD`; runner rejects non-`HEAD`, dirty tracked files, or worktrees outside `git worktree list`), `seconds`, `world_lines` (`--world-lines`, known to worktree `xtask`), `env` (`VICTORY_*` only; `--accept-terms` rejected), `baseline` (run name or absolute `report.json`), `requester`, `data_dir`, `data_from`, and `keys`. Default-key runs (no `--keys`, no `--accept-terms`) stop early if no world line appears within 150 s of `dstorage: file opened ... story000`, writing `rerun.txt` and setting `.done` `error = "rerun: ..."` unless a crash or device removal occurred (rerun if STARVED; otherwise inspect log for hang). Named baselines must exist, be queued, or be running at `add` time; if still missing when run, execution proceeds with a `.done` `warning`. Unknown fields or non-`VICTORY_*` switches are rejected. `run` executes the oldest request via `cargo xtask smoke --exe <its --exe> --out <runs>\<name> ...` in its worktree sequentially (holds `runner.lock` open; stale locks do not block, dead runners' children are terminated by next runner, `--once` exits when empty), writing console output to `<runs>\<name>.console.txt` and `<name>.done` (`exit`, `out`, `digest`, `console`, `requester`, plus `error` with `exit = -1` on refusal). Never spawn per-request waiters. If the smoke lock is held at start, the head requeues untouched and gives up in `.done` after 150 retries (5 minutes); lock/GPU contention during a started run follows the 60-minute limit. `status` lists active runs (with elapsed time), queued order, and most recent completion.
 
-The runner gets its own target directory (the command above), or a request for the
-worktree it was built from could not rebuild `xtask` while it runs. A compile
-beside the booting title starves it (a black screen of minutes, or no world), so while
-a run boots the runner builds nothing. Once the title has reached its world and
-settled (10 s after the first world line) the runner builds the next request's
-worktree (`xtask`, then the `diag` title build; output in `<runs>\<name>.build.txt`),
-at idle priority on a quarter of the cores; it logs `runner: build ahead held while
-<name> boots` once before. No build reaches the lines measured: 75 s after the first
-world line, 15 s before the first steady one, a build still going is ended, and it is
-taken up again after the run (cargo keeps the crates it finished). The runner waits for
-it before it starts the next run. It skips a request for the playing run's worktree. The
-queue, the smoke lock and the run are looked at every 2 s.
+Use a separate `--target-dir` for the runner so rebuilding `xtask` for a request does not collide with the running runner. The runner does not build while a run boots (prevents multi-minute black screens or no world). Once settled (10 s after first world line), it prebuilds the next eligible worktree (`xtask` then `diag` title to `<runs>\<name>.build.txt`) at idle priority on one-quarter of cores, logging `runner: build ahead held while <name> boots` once beforehand; any still-running build is stopped 75 s after the first world line (15 s before steady lines) and resumed later (completed crates stay cached), awaited before starting the next run, and skipped if matching the active run's worktree. Queue, lock, and run state poll every 2 s.
 
-Before any cargo build, test or clippy, a session runs `cargo xtask queue wait-idle`
-(`--timeout <s>`, 900 by default): it returns at once when no run is booting, else it
-waits. A run boots from its `.running` file (so through its wait for a quiet machine
-and its own build) until 10 s after its first world line. A run stuck without a
-world no longer counts: 10 minutes after its log was made, or 30 minutes after it
-started when it has no log. It protects the boot only: a compile after it can still
-disturb the lines measured (the digest then says MACHINE BUSY), so prefer
-`-j 2` while a run plays. After the timeout it exits with an error naming the run:
-do not compile then. Already-started compiles are not stopped, and a smoke run
-started by hand is not seen (it has no `.running`).
+Before any `cargo build`, `test`, or `clippy`, sessions run `cargo xtask queue wait-idle` (`--timeout <s>`, default `900`). It returns immediately unless a run is booting (from `.running` creation until 10 s after first world line; stuck runs without a world expire 10 minutes after log creation or 30 minutes after start if no log). Post-boot builds can still cause **MACHINE BUSY**, so prefer `-j 2` during active runs. On timeout, it exits with an error naming the run—do not compile. Pre-existing compiles are not stopped, and manual smoke runs lack `.running`.
 
 ```powershell
 cargo xtask compare E:\Causeway-tools\runs\mesh-9 --baseline E:\Causeway-tools\runs\smoke-16 --baseline E:\Causeway-tools\runs\smoke-15
 ```
 
-`compare` reads each run's `log.txt` (`report.json` beside it for the non-flat
-pixel share, `load.txt` for the load) and judges the **steady** world lines only,
-on both sides (90 s or more after the first world line); the warm-up's frame rates
-are one more row, for information. It prints, per metric, the median and
-`[q1..q3]` of the run and of each baseline, a verdict against each (regression /
-improvement / within noise), and an overall one. Speed (fps, ms, preparing, gpu,
-copy-back) and drawn/dropped draws per frame (by cause, and by kind of named
-reason) regress when the median is worse by more than the larger interquartile
-range of the two runs (floor: 5% of the baseline, and 0.05 fps, 1 ms or 1 draw);
-fewer than 3 steady lines say nothing. Counts of the whole run (refused
-pipelines, untranslated shaders, black frames) regress on any rise; the non-flat
-share, on a drop of more than 20%; a run that never reached the world regresses.
-A regression against any baseline is one (`--all` asks for every baseline, for a
-noisy one that must not decide alone); an improvement counts only against every
-one. It exits with an error on any regression, and when it cannot judge: the run
-has fewer than 3 steady lines, no baseline has 3, or the run lacks a value a
-baseline has (no `report.json` for the non-flat share, no black-frame count, no
-drop lines). When the machine was busy during the run, or during every baseline, the
-verdict says **MACHINE BUSY** with what was measured after it, and the command
-fails: run again (a run that looks no worse then proves nothing, since load widens
-the spread). A busy baseline beside a quiet one is shown and not counted. A run
-without `load.txt` is "load not recorded", not busy. A drop reason renamed between builds moves its draws between
-`kind_*` rows: read those against the `dropped_*` rows, which are by cause.
+`compare` reads `log.txt`, `report.json` (non-flat pixel share), and `load.txt`, evaluating **steady world lines** (>= 90 s after first world line) on both run and baselines (warm-up FPS is informational only). It reports median and `[q1..q3]` per metric plus per-baseline and overall verdicts (`regression` / `improvement` / `within noise`). Speed (`fps`, `ms`, `preparing`, `gpu`, `copy-back`) and per-frame drawn/dropped draws (by cause and named-reason `kind_*`) regress when median is worse by > max IQR of the two runs, subject to floors (`5%` of baseline, and `0.05 fps`, `1 ms`, or `1 draw`); < 3 steady lines produce no verdict. Whole-run counts (refused pipelines, untranslated shaders, black frames) regress on any increase; non-flat share on a drop > 20%; failure to reach world is a regression. Regression against any baseline triggers overall regression (`--all` requires every baseline); improvement requires beating every baseline. Exits non-zero on regression or when unjudgeable (< 3 steady lines in run or no baseline with >= 3, or run missing a metric present in baseline such as `report.json` non-flat share, black frames, or drop lines). If the machine was busy during the run or during every baseline, verdict reports **MACHINE BUSY** with post-busy metrics and fails (rerun, as load inflates spread). A busy baseline alongside a quiet one is displayed without counting; missing `load.txt` is `"load not recorded"`, not busy. Renamed drop reasons shift draws among `kind_*` rows—compare against `dropped_*` cause totals.
 
 ## Testbed (no game, no title run)
 
-`victory-testbed` checks the translation layer headlessly:
+`victory-testbed` tests the translation layer headlessly:
 
-    cargo run -q -p victory-testbed -- hle list
-    cargo run -q -p victory-testbed -- hle call xmem.dll XMemIsToolsMemAvailable
-    cargo run -q -p victory-testbed -- alu 4a000302 --in 40,2,0,0 [--hardware]
+```powershell
+cargo run -q -p victory-testbed -- hle list
+cargo run -q -p victory-testbed -- hle call xmem.dll XMemIsToolsMemAvailable
+cargo run -q -p victory-testbed -- alu 4a000302 --in 40,2,0,0 [--hardware]
+```
 
-`alu` takes GFX10 instruction words in hex. They run as one thread after a
-prologue that copies the four `--in` dwords to `v1..v4`; the result is `v0`.
-WARP is the default; `--hardware` runs on the real GPU (CLAUDE.md: ask the owner first). `hle call` passes up to four
-integers: call only exports that need no running title.
+`alu` runs GFX10 hex dwords for one thread after copying four `--in` dwords to `v1..v4`, returning result in `v0`. Defaults to WARP; `--hardware` targets real GPU (ask owner first per `CLAUDE.md`). `hle call` takes up to four integers—call only exports that do not require a running title.

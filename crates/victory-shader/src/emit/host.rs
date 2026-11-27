@@ -189,6 +189,22 @@ impl Host {
         asked.is_ok() && (o.WaveLaneCountMin..=o.WaveLaneCountMax).contains(&lanes)
     }
 
+    /// Whether pixel shaders may read `SV_Barycentrics` (D3D12 options 3).
+    #[cfg(any(test, feature = "testbed"))]
+    pub fn has_barycentrics(&self) -> bool {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        // test-host-query: only tests and the testbed ask.
+        // SAFETY: the structure the feature names, and its size.
+        let asked = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                std::ptr::from_mut(&mut o).cast(),
+                size_of_val(&o) as u32,
+            )
+        };
+        asked.is_ok() && o.BarycentricsSupported.as_bool()
+    }
+
     /// The high-performance hardware adapter (or `VICTORY_D3D12_ADAPTER` by
     /// 0-based DXGI index or case-insensitive name substring), or WARP with
     /// `warp` (or `VICTORY_WARP=1`).

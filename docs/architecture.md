@@ -21,14 +21,7 @@
                                          victory-shader ◄─► cache_dir
 ```
 
-Shaders are translated when the title creates a pipeline, from the bytes it
-passes, wherever it loaded them from (executable, archive, memory).
-Converting them ahead of time from files (`victory translate --cache`) is
-only a warm-up: it fills the same cache, under the same key. With
-`--pipelines` it also makes the host pipelines of the title's shader pack
-into the pipeline library, from the creation streams the engine would pass
-(`victory-game` builds them, `victory-gpu` reads them as it reads the
-title's), so a run finds them under the names it gives them itself.
+Shaders translate at pipeline creation from title-supplied bytes regardless of source (executable, archive, memory). Ahead-of-time conversion (`victory translate --cache`) merely pre-warms the same cache under identical keys; `--pipelines` also pre-populates the host pipeline library from engine creation streams (`victory-game` builds, `victory-gpu` reads identically to title streams) so runs match them by name.
 
 ## Crates
 
@@ -36,72 +29,36 @@ title's), so a run finds them under the names it gives them itself.
 |-------|------|
 | `victory-core` | config, asset-policy guard, logging |
 | `victory-pe` | read-only PE32+ and import-library analysis |
-| `victory-loader` | prepare, map, bind and start the title image |
+| `victory-loader` | prepare, map, bind, and start title image |
 | `victory-hle` | console API implementations, host pass-through policy |
-| `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
+| `victory-gpu` | D3D12.X objects, command lists, and GPU memory → host D3D12 |
 | `victory-shader` | Xbox shader containers → host shaders |
-| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
+| `victory-formats` | GPU texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | Title-specific formats, build identities, hooks |
-| `apps/victory` | command-line front end |
+| `victory-game` | title-specific formats, build identities, hooks |
+| `apps/victory` | CLI front end |
 | `xtask` | asset-policy check, git hooks |
-| `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
+| `tests/fixtures/hle-probe` | stand-in "title" (in-house code) for loader tests |
 
-Everything except `victory-game` is platform-level and can be tested with
-any Xbox Series title.
+All crates except `victory-game` are platform-level and testable against any Xbox Series title.
 
 ## Import resolution
 
-For every `dll!function` the title imports, in order:
+Each title `dll!function` import resolves in priority order:
 
-1. our implementation in `victory-hle::modules` (always wins);
-2. the host's own function, if `HostPolicy` allows that DLL;
-3. an export of a DLL the title ships beside its executable, mapped like
-   the executable (only DLLs neither of the above serves);
-4. a generated stub that names the import when called (`--unimplemented
-   trap` breaks into the debugger and aborts; `zero` logs once and returns 0).
+1. `victory-hle::modules` implementation (always wins).
+2. Host function, if `HostPolicy` permits the DLL.
+3. Export from a title-bundled DLL alongside the executable, mapped like the executable (only if neither 1 nor 2 handles the DLL).
+4. Generated stub naming the import on call (`--unimplemented trap` breaks into debugger and aborts; `zero` logs once and returns `0`).
 
-`LoadLibrary*` of a console-only DLL we implement (e.g. `xgameruntime.dll`)
-returns a pseudo handle; `GetProcAddress` on it finds our functions.
-`LoadLibrary*` of a title DLL returns its mapped image, mapping it first if
-nothing imports it. By name, as by import, a title gets only host DLLs
-`HostPolicy` passes through, and `GetProcAddress` on one returns our
-override where import binding would.
-`QueryApiImpl` hands out our runtime objects by provider and interface id
-(`victory-hle::modules::xgameruntime` lists the areas); online areas answer
-as an offline console. Game saves are files under `VICTORY_DATA_DIR`.
+`LoadLibrary*` on implemented console-only DLLs (e.g., `xgameruntime.dll`) returns a pseudo-handle resolved by `GetProcAddress` against our overrides. `LoadLibrary*` on title DLLs maps (if unimported) and returns the mapped image. Name lookups enforce `HostPolicy` like import binding, and `GetProcAddress` on host DLLs returns our overrides where bound. `QueryApiImpl` provides runtime objects by provider and interface ID (`victory-hle::modules::xgameruntime` lists areas; online areas behave as an offline console). Game saves reside under `VICTORY_DATA_DIR`.
 
-Title storage is a drive on the console, and titles build paths on that.
-`victory-hle::modules::files` binds every path-taking title import
-(kernel32 and the C/C++ runtime) and rewrites paths on a virtual drive to
-the host folder behind it; persistent local storage is one such drive over
-a folder under `VICTORY_DATA_DIR`. Other paths reach the host unchanged.
+`victory-hle::modules::files` hooks all path-taking title imports (`kernel32` and C/C++ runtime), remapping console virtual-drive paths to backing host folders (including persistent local storage under `VICTORY_DATA_DIR`) while passing other paths through unchanged.
 
-An exe's code reaches its static TLS as slot 0; mapped as a DLL it gets
-another slot, so the loader redirects those loads (`victory-loader::tls`).
-`victory run --execute` installs a crash reporter that names faults as
-`module+rva` and unwinds the faulting thread's stack
-(`victory-loader::crash`).
+Because an executable accesses static TLS at slot 0 while DLL-mapped images receive another slot, `victory-loader::tls` redirects static TLS loads. `victory run --execute` installs a crash reporter logging faults as `module+rva` and unwinding the faulting thread's stack (`victory-loader::crash`).
 
-`victory census` shows this classification without running anything (it
-does not map title DLLs; `victory run` without `--execute` does).
+`victory census` reports import classification statically without mapping title DLLs (`victory run` without `--execute` maps them).
 
 ## Shaders
 
-`victory_shader::ir::build` turns a native program into SSA, one
-instruction per machine instruction. `victory_shader::structure` then
-removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
-become per-lane branches, and vector instructions keep a guard only where
-a lane can reach them with its EXEC bit clear. `victory_shader::range::build`
-runs both, again where a bound on the index of a register-relative move
-(`v_movrel*`) is proven on the per-lane form, so the move names only the
-registers it can reach. `victory_shader::resource`
-traces each descriptor and scalar memory address to the root parameter it
-comes from (table, heap, root descriptor or constant). A descriptor a
-waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
-to the per-lane load or choice that gives each lane its own (a mask's
-`v_cndmask_b32`, or an if/else whose arms each set it: traced on the paths
-the lanes take, from structurisation), and accessed with a non-uniform heap
-index in one pass. `victory translate`
-runs every shader it finds (containers, SGD5 files) through these and
-lists what they cannot handle yet.
+`victory_shader::ir::build` lowers native programs to 1:1 instruction SSA. `victory_shader::structure` eliminates `EXEC`, converting lane masks to per-lane booleans, wave-wide mask tests to per-lane branches, and guarding vector instructions only where reachable with `EXEC` clear. `victory_shader::range::build` re-runs both passes when proving index bounds on register-relative moves (`v_movrel*`) in per-lane form, restricting moves to reachable registers. `victory_shader::resource` traces descriptors and scalar memory addresses to root parameters (table, heap, root descriptor, or constant). Waterfall-loop descriptors read via `v_readfirstlane_b32` trace back along structurized control flow to per-lane sources (`v_cndmask_b32` or `if`/`else` assignments) for single-pass non-uniform heap access. `victory translate` runs all discovered shaders (containers, SGD5 files) through these passes and lists unsupported constructs.

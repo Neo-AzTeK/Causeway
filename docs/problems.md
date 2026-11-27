@@ -11,6 +11,37 @@ Goal: **one correct frame** (`docs/agent-workflow.md`).
 
 Each item names its problem in the ranked table below.
 
+- [ ] Keep write guards (`watch.rs` `protect`) off mapped views that are
+      not the title's memory (`host-bugcheck`). Both dumps have one stack:
+      the video memory manager evicting a system-memory allocation locks its
+      pages in our process for write, the lock fails, and Windows stops.
+      `protect` makes any committed non-private view in a loose copy's 4 MiB
+      window read-only, and the D3D12 runtime's mapped allocations are such
+      views; our fault handler hides the user-mode writes, the kernel's lock
+      is not caught. Not proven: first log any guard on a view the runtime
+      did not report; low memory could also fail the lock
+
+- [x] `descriptor-slots` confirmed on `main`: two quiet world runs lose no
+      draw for lack of slots. The merge did not raise refusals. The pixel
+      programs refused for "a descriptor read only as data" are counted
+      under their own reason on every path, before and after the merge, and
+      lose the same per frame whenever they are on screen. Runs differ only
+      in how long that content stays on screen (same commit: short in one
+      run, long in the next). Refused work without them is the same on
+      both sides (problem notes, "Confirm: refusal shift")
+- [ ] The title's code wrote to memory reserved but never committed and the
+      run stopped (0xc0000005 in the title's image, one quiet run of `main`
+      before the `descriptor-slots` merge; `image-uncommitted-write`). Not a
+      missing commit: a bytecode interpreter in the title stored through an
+      out-of-range operand index into a register file on its own stack, past
+      the stack's top. Find where the bad index came from; the crash report
+      now names the reservation, the thread's stack and what the registers
+      point at, for the next time it happens
+- [x] `victory-shader` test `direct_barycentrics_weigh_the_second_and_third_vertex`
+      failed on a host without barycentrics (GTX 1070) instead of skipping;
+      fixed on branch `claude/bary-test-skip-8f4ace` (`Host::has_barycentrics`,
+      the test skips with a message); not yet on `main`
+
 - [ ] Find the pass that should put lit people and ground into the scene's
       colour before tonemap (`scene-blocker`). Traced on the newest build:
       most surfaces have no base colour in the main pass, the earliest wrong
@@ -142,6 +173,10 @@ and branch on this machine. Ids and ranks change only when the owner re-ranks, o
 splits or closes a problem; `cargo xtask problem` reads this table, so keep its
 first two columns and number the rows from 1.
 
+Picture before speed: speed problems (`compile-backlog`,
+`frame-preparing-cost`, `texture-refresh-menus`) wait until one world frame is
+correct, unless they keep runs from reaching the world at all.
+
 **No rank below 1 is proven.** Nothing yet shows which loss keeps the 3D scene
 from showing; the order is a guess from dropped-work counts, which do not
 measure what the picture loses.
@@ -151,16 +186,20 @@ measure what the picture loses.
 | 1 | `scene-blocker` | which loss keeps the 3D scene from showing is unknown; the answer ranks the rest | unknown |
 | 2 | `placed-texture-slots` | heap-indexing shaders read an empty slot where the title placed a texture: most 3D surfaces have no base colour | causal by white substitution (main-pass black 65% to 39%, 49% to 10%); real textures not tried |
 | 3 | `wave64-refusals` | compute needing waves of 64 is refused: most refused pipelines in world runs | counts measured; picture effect a guess |
-| 4 | `descriptor-slots` | draws and dispatches dropped for lack of descriptor slots; a large share of drops | counts measured (some mislabelled as pipeline losses); picture effect a guess |
+| 4 | `descriptor-slots` | draws and dispatches dropped for lack of descriptor slots; a large share of drops | fixed in `main`, confirmed on the GTX 1070 (capped heap); an uncapped host (AMD) not run; picture effect a guess |
 | 5 | `mesh-pipeline-invalid` | a mesh pipeline the host rejects loses many indirect draws in some runs, almost none in others | cause unknown |
-| 6 | `gpu-long-dispatch` | long dispatches remove the GPU; held off by loop limits, a skip switch, and by leaving a fix for indirect dispatches reverted | skip proven to avoid one removal; the second link strongly suggested by one run; loop limits' effect not recorded |
-| 7 | `untranslated-shaders` | some programs do not translate or are refused by the validator (several reasons); one reason may need data only the descriptor heap has | refusals counted; picture effect a guess |
-| 8 | `title-crash-breakpoint` | the title stopped itself on a failed internal check once, during a long world run | seen once, not reproduced since |
-| 9 | `compile-backlog` | on a cold shader cache, work is dropped for a long stretch while pipelines are made | measured on cold cache only; warm effect small |
-| 10 | `frame-preparing-cost` | CPU preparation is a large share of each world frame | measured, some runs not on a quiet machine |
-| 11 | `texture-refresh-menus` | on the GTX 1070 slow texture refresh stalls the menus, so unattended runs miss the world | measured on that adapter, older build |
-| 12 | `gpu-tests-hang` | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
-| 13 | `device-methods-missing` | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
+| 6 | `gpu-long-dispatch` | evicting idle host textures that bindless shaders still write hung the GPU seconds into most world runs (fixed on main by fdc72fc: idle textures are lowered in priority, not evicted) | shown by 600 s runs: no such hang in 11 fix runs; main 0 of 2 past 11 s |
+| 7 | `gpu-long-lists` | emulated mesh draws and the ray-tracing BVH builder's compute run for seconds in one list and trip the GPU timeout, in about half the world runs once the eviction hang is gone | GPU times and pixel counts measured; lead: loops cut at the 64-iteration limit make layered full-screen draws (one run without the cap had none) |
+| 8 | `untranslated-shaders` | some programs do not translate or are refused by the validator (several reasons); one reason may need data only the descriptor heap has | refusals counted; picture effect a guess |
+| 9 | `title-crash-breakpoint` | the title stopped itself on a failed internal check once, during a long world run | seen once, not reproduced since |
+| 10 | `compile-backlog` | on a cold shader cache, work is dropped for a long stretch while pipelines are made | measured on cold cache only; warm effect small |
+| 11 | `frame-preparing-cost` | CPU preparation is a large share of each world frame | measured, some runs not on a quiet machine |
+| 12 | `texture-refresh-menus` | on the GTX 1070 slow texture refresh stalls the menus, so unattended runs miss the world | measured on that adapter, older build |
+| 13 | `gpu-tests-hang` | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
+| 14 | `device-methods-missing` | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
+| 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charges the rest of the list to its last timed command, so slow-command lines mislead on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list |
+| 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay (rank not confirmed by the owner) | seen twice on 2026-11-27 on the GTX 1070; both dumps: `dxgmms2!VIDMM_GLOBAL::EnsureLockedPages` after a failed lock of our process's pages, during an eviction from a system-memory segment; which pages, not known |
+| 17 | `image-uncommitted-write` | the title's code wrote to an address reserved but never committed and the run stopped with an access violation (rank not confirmed by the owner) | seen once on 2026-11-27, in a quiet run of `main`; a wild index in the title's interpreter, its source unknown; crash report extended to catch it |
 
 ## Finding what keeps the 3D scene from showing
 
@@ -171,7 +210,9 @@ the owner accepts, not a visible scene.
    run reaches it. Say whether it is the intro or the playable world: geometry
    in one does not prove the other.
 2. Capture it with all its render targets (`VICTORY_CAPTURE_FRAMES`,
-   `VICTORY_DUMP_TARGETS=1`; dumps stay outside the repository).
+   `VICTORY_DUMP_TARGETS=1`; dumps stay outside the repository). Once the
+   frame replay exists (`docs/frame-replay.md`), record it once and do steps
+   3 to 5 on the replay.
 3. Walk back from the presented image to the earliest target that is flat or
    wrong although the title writes it. Whether the log can say which draws and
    dispatches write each target is not verified; adding that is part of the work.

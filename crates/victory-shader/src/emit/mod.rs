@@ -1887,8 +1887,14 @@ mod tests {
         ];
         let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let mut ran = 0;
+        let mut lacking = 0;
         for warp in [false, true] {
             let Ok(host) = Host::new(warp) else { continue };
+            if !host.has_barycentrics() {
+                eprintln!("no SV_Barycentrics on the device, warp {warp}; skipped");
+                lacking += 1;
+                continue;
+            }
             let root = host.root_signature_for(&[]).unwrap();
             let pso = host.pipeline_with(&root, &vs, &ps.dxil).unwrap();
             let draw = Draw {
@@ -1909,7 +1915,7 @@ mod tests {
             eprintln!("barycentrics weighed as expected, warp {warp}");
             ran += 1;
         }
-        assert!(ran > 0, "no device ran the draw");
+        assert!(ran > 0 || lacking > 0, "no device ran the draw");
     }
 
     /// A pixel export before the `done` one, both under a lane guard (EXEC
