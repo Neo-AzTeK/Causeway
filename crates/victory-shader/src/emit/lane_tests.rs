@@ -1268,9 +1268,16 @@ const TRIPS: [u32; 9] = [
 /// different trip counts, the last with its lower half only): v8 of each lane
 /// is `want` of its wave's trip count.
 fn waves_of_different_trips(body: &[u32], want: impl Fn(u32) -> u32) {
+    waves_of_different_trips_in(body, 1, want);
+}
+
+/// [`waves_of_different_trips`] with `blocks` blocks of 128 dwords of LDS.
+fn waves_of_different_trips_in(body: &[u32], blocks: u32, want: impl Fn(u32) -> u32) {
     for threads in [96u32, 160] {
-        let words = [&TRIPS[..], body].concat();
-        if let Some(got) = two_halves_with_lds(&words, threads) {
+        let words = [&STORE_SETUP[..], &TRIPS[..], body, &STORE[..]].concat();
+        let shader =
+            translate_group(&words, (ResourceType::Srv, 8, 0), true, threads, blocks).unwrap();
+        if let Some(got) = stored_by_halves(&shader, threads) {
             let want: Vec<u32> = (0..threads).map(|l| want(l / 64 + 1)).collect();
             assert_eq!(got, want, "{threads} threads");
         }
@@ -1313,6 +1320,45 @@ fn a_wave_of_a_wider_group_breaks_out_of_a_loop() {
         0x4A10_100F, // v_add_nc_u32 v8, s15, v8
     ];
     waves_of_different_trips(&body, |n| n + 5 * (n - 1) + 64 * (n - 1) * n);
+}
+
+/// [`a_wave_of_a_wider_group_breaks_out_of_a_loop`] where the program's LDS
+/// takes all of the host's 32 KiB: the group's vote and the lane reads
+/// borrow its top, and the 7 each lane keeps in two dwords there (which
+/// hold every slot) outlives the loop.
+#[test]
+fn a_wave_of_a_wider_group_breaks_out_of_a_loop_with_full_shared_memory() {
+    let body = [
+        0x7E02_0287, // v_mov_b32 v1, 7
+        0x3422_0081, // v_lshlrev_b32 v17, 1, v0
+        0x4C22_22FF,
+        0x0000_1FFE, // v_sub_nc_u32 v17, 8190, v17 (two top dwords a lane)
+        0x3422_2282, // v_lshlrev_b32 v17, 2, v17
+        0xD834_0000,
+        0x0000_0111, // ds_write_b32 v17, v1
+        0xD834_0004,
+        0x0000_0111, // ds_write_b32 v17, v1 offset:4
+        0xD760_0012,
+        0x0001_0100, // v_readlane_b32 s18, v0, 0 (an exchange in the loop)
+        LANE_SUM,
+        0x8114_8114, // s_add_i32 s20, s20, 1
+        0x4A10_1081, // v_add_nc_u32 v8, 1, v8
+        0xBF06_0E14, // s_cmp_eq_u32 s20, s14
+        0xBF85_0003, // s_cbranch_scc1 -> out
+        0x810F_850F, // s_add_i32 s15, s15, 5
+        0xBF0A_8814, // s_cmp_lt_u32 s20, 8
+        0xBF85_FFF6, // s_cbranch_scc1 -> the pass
+        ADD_LANE_SUM,
+        0x4A10_100F, // v_add_nc_u32 v8, s15, v8
+        0xD8D8_0000,
+        0x0200_0011, // ds_read_b32 v2, v17
+        0xD8D8_0004,
+        0x0300_0011, // ds_read_b32 v3, v17 offset:4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A10_1102, // v_add_nc_u32 v8, v2, v8
+        0x4A10_1103, // v_add_nc_u32 v8, v3, v8
+    ];
+    waves_of_different_trips_in(&body, 64, |n| n + 5 * (n - 1) + 64 * (n - 1) * n + 14);
 }
 
 /// Three passes of an outer loop, an inner one of each wave's own length in
@@ -1375,32 +1421,61 @@ fn a_wave_of_a_wider_group_writes_no_shared_memory_where_it_is_off() {
     }
 }
 
-/// A program whose shared memory leaves no room for the two halves'
-/// exchanges asks for waves of 64: a larger one would not be created.
+/// The two halves' slots take 132 dwords for 128 threads with a lane read:
+/// past the program's own with 62 blocks of 128, in its top where it takes
+/// all 64 (the host's 32 KiB). Each lane writes its id + 1 to two dwords of
+/// the program's top 256, which hold every slot; reads its wave's lane mask
+/// of `id < 64` as a number (the halves exchange their parts) and lane 0's
+/// id (a lane read across them); then reads both dwords back: the program's
+/// values outlive both either way. With 65 blocks the program's own is over
+/// the host's 32 KiB: it is not run as two halves.
 #[test]
-fn a_wave64_program_with_full_shared_memory_asks_for_waves_of_64() {
-    let body = [
-        0xD760_000E,
-        0x0001_0100, // v_readlane_b32 s14, v0, 0
-        0x4A10_100E, // v_add_nc_u32 v8, s14, v8
-    ];
-    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
-    // 96 threads take 134 dwords: 62 blocks of 128 leave room, 63 do not.
-    for (blocks, waves) in [(62, (32, 32)), (63, (64, 64))] {
-        let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 96, blocks).unwrap();
-        check(&shader);
-        assert_eq!(
-            crate::emit::required_waves(&shader.dxil),
-            Some(waves),
-            "{blocks} blocks: {:?}",
-            shader.wave64_why
-        );
-        assert_eq!(
-            shader.wave64_why.is_some(),
-            waves == (64, 64),
-            "{blocks} blocks: {:?}",
-            shader.wave64_why
-        );
+fn a_wave64_program_keeps_its_shared_memory_across_exchanges() {
+    let threads = 128;
+    for blocks in [62, 64, 65] {
+        let body = [
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0x3422_0081, // v_lshlrev_b32 v17, 1, v0
+            0x4C22_22FF,
+            blocks * 128 - 2, // v_sub_nc_u32 v17, top - 1, v17 (two dwords a lane)
+            0x3422_2282,      // v_lshlrev_b32 v17, 2, v17
+            0xD834_0000,
+            0x0000_0111, // ds_write_b32 v17, v1
+            0xD834_0004,
+            0x0000_0111, // ds_write_b32 v17, v1 offset:4
+            0x7D88_00C0, // v_cmp_gt_u32 vcc, 64, v0
+            0xBE8F_106A, // s_bcnt1_i32_b64 s15, vcc (the mask as a number)
+            0xD760_000E,
+            0x0001_0100, // v_readlane_b32 s14, v0, 0 (the console wave's first id)
+            0xD8D8_0000,
+            0x0800_0011, // ds_read_b32 v8, v17
+            0xD8D8_0004,
+            0x0200_0011, // ds_read_b32 v2, v17 offset:4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A10_1102, // v_add_nc_u32 v8, v2, v8
+            0x4A10_100E, // v_add_nc_u32 v8, s14, v8
+            0x4A10_100F, // v_add_nc_u32 v8, s15, v8
+        ];
+        let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+        let shader =
+            translate_group(&words, (ResourceType::Srv, 8, 0), true, threads, blocks).unwrap();
+        if blocks > 64 {
+            // (The validator refuses that size whatever the halves do.)
+            assert_eq!(
+                crate::emit::required_waves(&shader.dxil),
+                Some((64, 64)),
+                "{:?}",
+                shader.wave64_why
+            );
+            assert!(shader.wave64_why.is_some());
+            continue;
+        }
+        if let Some(got) = stored_by_halves(&shader, threads) {
+            let want: Vec<u32> = (0..threads)
+                .map(|l| 2 * (l + 1) + l / 64 * 64 + if l < 64 { 64 } else { 0 })
+                .collect();
+            assert_eq!(got, want, "{blocks} blocks");
+        }
     }
 }
 

@@ -295,6 +295,9 @@ struct Lower<'a> {
     has_upper: Option<V>,
     /// Where the exchange slots start in the group-shared memory.
     xbase: u32,
+    /// Whether the exchange slots are the top of the program's own
+    /// group-shared memory, kept and put back by each exchange.
+    borrowed: bool,
     /// Depth of code only some lanes run (`begin_guarded`).
     guarded: u32,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
@@ -627,6 +630,7 @@ impl<'a> Lower<'a> {
         let mut virt = false;
         let mut wave64_why = None;
         let mut xbase = 0;
+        let mut borrowed = false;
         let mut lockstep = HashSet::new();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -703,13 +707,20 @@ impl<'a> Lower<'a> {
                     } else {
                         apart_steps()
                     };
-                    // Per console wave: 2 pair slots, then 64 lane slots.
-                    // Several waves also vote: a slot each. All of it comes
-                    // after the program's own, in the host's 32 KiB.
+                    // Per console wave: 2 pair slots, then, where a lane is
+                    // read across the halves (`share_lane`), 64 lane slots.
+                    // A group vote uses the pair slots. All of it comes
+                    // after the program's own, in the host's 32 KiB; where
+                    // that leaves too little, in the top of the program's
+                    // own, which each exchange keeps and puts back
+                    // (`borrow_slot`). A program whose own is larger than
+                    // the host's would not be created.
                     let waves = threads.div_ceil(64);
-                    let extra = waves * if waves > 1 { 67 } else { 66 };
+                    let lane_reads = insts().any(|i| i.name() == "v_readlane_b32");
+                    let extra = waves * if lane_reads { 66 } else { 2 };
+                    let borrow = s.lds_dwords + extra > HOST_LDS_DWORDS;
                     let steps = steps.and_then(|at| {
-                        if s.lds_dwords + extra > HOST_LDS_DWORDS {
+                        if s.lds_dwords > HOST_LDS_DWORDS {
                             Err("no room in shared memory for two halves to exchange")
                         } else {
                             Ok(at)
@@ -720,8 +731,13 @@ impl<'a> Lower<'a> {
                         lockstep.extend(at);
                         virt = true;
                         s.wave_size = Some(32);
-                        xbase = s.lds_dwords;
-                        s.lds_extra = extra;
+                        if borrow {
+                            borrowed = true;
+                            xbase = s.lds_dwords - extra;
+                        } else {
+                            xbase = s.lds_dwords;
+                            s.lds_extra = extra;
+                        }
                     }
                 } else if !enough && wave == 64 && threads > 1024 {
                     wave64_why = Some("a group of more than 1024 threads");
@@ -844,6 +860,7 @@ impl<'a> Lower<'a> {
             halves: None,
             has_upper: None,
             xbase,
+            borrowed,
             guarded: 0,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
@@ -3340,6 +3357,7 @@ impl<'a> Lower<'a> {
         }
         let lds = self.s.lds();
         let mine = self.s.m.bin(at, Bin::Add, slot0, half);
+        let kept = self.borrow_slot(at, mine);
         let p = self.s.m.element(at, lds, mine);
         self.s.m.store(at, p, x);
         let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
@@ -3358,7 +3376,42 @@ impl<'a> Lower<'a> {
         // Reads done before the next exchange writes.
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.return_slot(at, mine, kept);
         Ok((a, b))
+    }
+
+    /// With `borrowed`: what the program holds in `slot`, which this thread
+    /// is about to write for an exchange; read once every thread's earlier
+    /// accesses are done, and before any thread writes. Every thread runs
+    /// it. Give it back with [`Self::return_slot`] after the exchange's last
+    /// barrier.
+    pub(super) fn borrow_slot(&mut self, at: usize, slot: V) -> Option<V> {
+        if !self.borrowed {
+            return None;
+        }
+        let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let lds = self.s.lds();
+        let p = self.s.m.element(at, lds, slot);
+        let kept = self.s.m.load(at, p);
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        Some(kept)
+    }
+
+    /// What [`Self::borrow_slot`] kept, back in `slot` before the program
+    /// goes on. (Two threads that wrote one slot put back the same value.)
+    pub(super) fn return_slot(&mut self, at: usize, slot: V, kept: Option<V>) {
+        let Some(kept) = kept else {
+            return;
+        };
+        let lds = self.s.lds();
+        let p = self.s.m.element(at, lds, slot);
+        self.s.m.store(at, p, kept);
+        let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// Whether the two host waves must decide the branch on `when` together:
@@ -3448,6 +3501,7 @@ impl<'a> Lower<'a> {
         let me = self.s.m.bin(c, Bin::Add, me, up);
         let lds = self.s.lds();
         let mine = self.s.m.bin(c, Bin::Add, first, me);
+        let kept = self.borrow_slot(c, mine);
         let p = self.s.m.element(c, lds, mine);
         self.s.m.store(c, p, x);
         let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
@@ -3459,6 +3513,7 @@ impl<'a> Lower<'a> {
         let r = self.s.m.load(c, p);
         self.s
             .op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.return_slot(c, mine, kept);
         Ok(r)
     }
 
