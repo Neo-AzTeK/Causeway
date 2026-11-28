@@ -426,7 +426,7 @@ pub fn title_memory_lazy(load: &Arc<crate::lazy::Load>, at: usize, offset: usize
     if g.lazy.remove(&page).is_some() {
         crate::ledger::add(crate::ledger::Owner::LazyPages, -(PAGE as i64));
     }
-    changed_here(&mut g, page, page + 1, true);
+    changed_here(&mut g, page, page + 1, true, true);
     // What the page held goes back to the system; the protection below
     // keeps it from being read before it is filled.
     // SAFETY: a committed title page whose bytes are replaced.
@@ -854,7 +854,15 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
+    changed_in(g, first, last, save, true)
+}
+
+/// [`changed`]; with `open_guarded` false, guarded pages stay guarded: a
+/// write that has landed already (GPU work in place) needs no access, and
+/// the title's next write faults and marks them again, so the guard and
+/// the tracker's next take need no protection change.
+fn changed_in(g: &mut Guards, first: usize, last: usize, save: bool, open_guarded: bool) -> bool {
+    let guarded = changed_here(g, first, last, save, open_guarded);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
@@ -862,17 +870,19 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
     for page in others {
-        changed_here(g, page, page + 1, save);
+        changed_here(g, page, page + 1, save, open_guarded);
     }
     guarded
 }
 
-/// [`changed`] of `[first, last)` alone. With `save`, before the write
+/// [`changed_in`] of `[first, last)` alone. With `save`, before the write
 /// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool, open_guarded: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
-        open(g, page);
+    if open_guarded {
+        for &page in &guarded {
+            open(g, page);
+        }
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
@@ -987,7 +997,10 @@ pub(crate) fn gpu_wrote(at: usize, len: usize) {
         crate::trail::step_if_seen(first, last, "written by GPU work in place");
         crate::trail::wrote(at, len, "written by GPU work in place", None);
     }
-    changed(&mut guards(), first, last, false);
+    // The ranges are what lists declare (up to a whole copy), most of it
+    // not written: opening their guarded pages cost ~6000 protection
+    // changes a world frame (rb-h12-1).
+    changed_in(&mut guards(), first, last, false, false);
     // Scanned as far as a root view declares (1 MiB): bigger ranges are
     // whole buffers the shaders write a part of.
     #[cfg(feature = "diagnostics")]
