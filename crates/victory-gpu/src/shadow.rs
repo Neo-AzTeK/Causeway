@@ -2003,6 +2003,37 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// A page a copy's shaders marked goes back even when another list of
+    /// the submission declares an in-place write over it: the declared
+    /// ranges reach whole copies, and the copy-back would read the page as
+    /// the title's write if they were marked first.
+    #[test]
+    fn a_marked_page_goes_back_beside_an_in_place_write_declared_over_it() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap()) else {
+            unregister(p, p as u64);
+            return;
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        let list = host.new_list().unwrap();
+        list.declare_in_place_write(p as u64, PAGE as u64);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a byte of our pool.
+        assert_eq!(unsafe { ((p + 10) as *const u8).read_volatile() }, 0xaa, "the shader's byte went back");
+        unregister(p, p as u64);
+    }
+
     /// Mark bits are handed out in runs and come back joined.
     #[test]
     fn mark_runs_are_reused_and_joined() {

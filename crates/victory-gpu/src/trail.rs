@@ -153,11 +153,13 @@ fn infinities(q: u64) -> bool {
     halves || floats
 }
 
-/// Whether ranges GPU work may have written in place are scanned too
-/// (`VICTORY_PROBE_EMPTY_BOUNDS=1`): each declared range is read before
-/// and after every submission; bounds found only after appeared while the
-/// lists ran (written by the GPU, or by a title thread meanwhile).
-pub(crate) fn scan_in_place() -> bool {
+/// Whether writes the guards do not see ([`crate::watch::Writing`]) and
+/// ranges GPU work may have written in place are scanned for empty bounds
+/// (`VICTORY_PROBE_EMPTY_BOUNDS=1`; a scan reads up to 64 MiB a write).
+/// Each in-place range is read before and after every submission; bounds
+/// found only after appeared while the lists ran (written by the GPU, or
+/// by a title thread meanwhile).
+pub(crate) fn probe_empty_bounds() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_PROBE_EMPTY_BOUNDS").is_ok_and(|v| v == "1"))
 }

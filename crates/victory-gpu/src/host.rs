@@ -1369,7 +1369,7 @@ impl Host {
         // ranges hold before the lists run; those found after and not
         // before appeared while they ran.
         #[cfg(feature = "diagnostics")]
-        let bounds_before: Vec<Vec<usize>> = if crate::trail::scan_in_place() {
+        let bounds_before: Vec<Vec<usize>> = if crate::trail::probe_empty_bounds() {
             written_in_place.iter().map(|&(at, len)| crate::trail::empty_bounds(at as usize, (len as usize).min(1 << 20))).collect()
         } else {
             Vec::new()
@@ -1517,24 +1517,6 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         lending.give_back();
-        // What shaders wrote in place is written for trackers too, at the
-        // addresses and wherever else the title shows those pages (a host
-        // copy or a texture over another mapping of them): a copy-back
-        // marks its writes so, and the console's caches see the memory.
-        // Each range once, outside the list locks.
-        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-        for (i, &(at, len)) in written_in_place.iter().enumerate() {
-            crate::watch::gpu_wrote(at as usize, len as usize);
-            #[cfg(feature = "diagnostics")]
-            if let Some(before) = bounds_before.get(i) {
-                crate::trail::scan_new_empty_bounds(
-                    at as usize,
-                    (len as usize).min(1 << 20),
-                    before,
-                    "-1 beside infinities (empty bounds) appeared while GPU work wrote in place",
-                );
-            }
-        }
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
@@ -1584,6 +1566,26 @@ impl Host {
         for list in runs {
             for work in &list.deferred().read_back {
                 work();
+            }
+        }
+        // What shaders wrote in place is written for trackers too, at the
+        // addresses and wherever else the title shows those pages (a host
+        // copy or a texture over another mapping of them). After the
+        // copy-backs: they read a changed page as the title's write and keep
+        // its bytes over the shaders', and the declared ranges (up to a whole
+        // copy) cover pages the copies' shaders wrote. Each range once,
+        // outside the list locks.
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+        for (i, &(at, len)) in written_in_place.iter().enumerate() {
+            crate::watch::gpu_wrote(at as usize, len as usize);
+            #[cfg(feature = "diagnostics")]
+            if let Some(before) = bounds_before.get(i) {
+                crate::trail::scan_new_empty_bounds(
+                    at as usize,
+                    (len as usize).min(1 << 20),
+                    before,
+                    "-1 beside infinities (empty bounds) appeared while GPU work wrote in place",
+                );
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2209,6 +2211,13 @@ impl HostList {
     pub(crate) fn keep_in_place_write(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) {
         self.keep_in_place(shadow, address, len);
         self.deferred().in_place_written.insert((address, len.min(shadow.left(address))));
+    }
+
+    /// Tests: the list's shaders write `[address, address + len)` in place,
+    /// as [`HostList::keep_in_place_write`] declares, without a copy.
+    #[cfg(test)]
+    pub(crate) fn declare_in_place_write(&self, address: u64, len: u64) {
+        self.deferred().in_place_written.insert((address, len));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date

@@ -939,7 +939,9 @@ impl Drop for Writing {
             changed(&mut g, self.first, self.last, false);
         }
         #[cfg(feature = "diagnostics")]
-        crate::trail::scan_empty_bounds(self.scan.0, self.scan.1, self.scan.2);
+        if crate::trail::probe_empty_bounds() {
+            crate::trail::scan_empty_bounds(self.scan.0, self.scan.1, self.scan.2);
+        }
     }
 }
 
@@ -983,9 +985,11 @@ pub(crate) fn gpu_writing(at: usize, len: usize) -> Writing {
 
 /// After GPU work wrote `[at, at + len)` where it lies (copies used in
 /// place, `crate::inplace`): trackers of those pages and of the other
-/// addresses showing them (`alias_of`) see a write, as [`gpu_writing`]
-/// shows them a copy-back's. Without it a host copy or a texture over
-/// another mapping of the pages keeps the bytes from before the GPU's.
+/// addresses showing them (`alias_of`) see a write. Unlike [`gpu_writing`]
+/// it saves nothing and opens no guard: the write has landed. Without it a
+/// host copy or a texture over another mapping of the pages keeps the
+/// bytes from before the GPU's. Called after the submission's copy-backs,
+/// which read a changed page as the title's write.
 pub(crate) fn gpu_wrote(at: usize, len: usize) {
     if len == 0 {
         return;
