@@ -350,7 +350,7 @@ pub(crate) fn lend<'a>(
     uses: impl Iterator<Item = (&'a crate::shadow::Shadow, &'a std::collections::HashSet<(u64, u64)>)>,
 ) -> Lending {
     let mut lending = Lending::default();
-    let wanted: Vec<(u64, usize)> = {
+    let wanted: Vec<(u64, usize, bool)> = {
         let s = sections();
         let mut wanted = Vec::new();
         let mut taken: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
@@ -375,19 +375,16 @@ pub(crate) fn lend<'a>(
             }
             for page in pages {
                 let page_offset = offset + (page - start);
-                // Lent only where the address shows another section page:
-                // none is an address unmapped since (the console's GPU would
-                // fault there), or one the runtime is mapping right now
-                // (between `forget` and `title_memory_section`), which may
-                // show this very page again.
-                match shown_now(&s.views, page) {
-                    Some(now) if now != (section, page_offset) => {}
-                    Some(_) => continue,
-                    None => {
-                        count(&COUNTS.unmapped);
-                        continue;
-                    }
-                }
+                // Not lent where the address shows this very page. With no
+                // view known there (memory mapped otherwise, or one the
+                // runtime is mapping right now, between `forget` and
+                // `title_memory_section`, which may show this page again)
+                // it is lent only if the address shows other bytes (below).
+                let known = match shown_now(&s.views, page) {
+                    Some(now) if now == (section, page_offset) => continue,
+                    Some(_) => true,
+                    None => false,
+                };
                 let old = view + page_offset as usize;
                 // Two buffers lending one page different bytes: the first
                 // keeps it.
@@ -398,7 +395,7 @@ pub(crate) fn lend<'a>(
                     continue;
                 }
                 taken.insert(old, page);
-                wanted.push((page, old, section, page_offset));
+                wanted.push((page, old, section, page_offset, known));
             }
         }
         // `page` shows another page now, so a view holding the old one is
@@ -409,7 +406,7 @@ pub(crate) fn lend<'a>(
             .flat_map(|v| wanted.iter().filter(move |w| w.2 == v.section && v.offset <= w.3 && w.3 < v.offset + v.len))
             .count();
         COUNTS.elsewhere.fetch_add(elsewhere as u64, std::sync::atomic::Ordering::Relaxed);
-        wanted.into_iter().map(|(page, old, _, _)| (page, old)).collect()
+        wanted.into_iter().map(|(page, old, _, _, known)| (page, old, known)).collect()
     };
     // Every page's bytes are read before any old page is written: an
     // address may show another lent page now (pages swapped or moved along
@@ -417,7 +414,7 @@ pub(crate) fn lend<'a>(
     // refuses a page the title decommitted instead of faulting.
     let read: Vec<Lent> = wanted
         .into_iter()
-        .filter_map(|(at, old)| {
+        .filter_map(|(at, old, known)| {
             let old = old as *mut u8;
             let mut saved = vec![0u8; PAGE as usize];
             let mut put = vec![0u8; PAGE as usize];
@@ -425,8 +422,19 @@ pub(crate) fn lend<'a>(
                 && crate::host::read_into(at as *const u8, &mut put);
             if !ok {
                 count(&COUNTS.unmapped);
+                return None;
             }
-            ok.then_some(Lent { at, old, saved, put })
+            // The same bytes with no view known: maybe this very page, whose
+            // GPU writes the give-back would undo; lending equal bytes would
+            // change nothing the GPU reads anyway.
+            if !known && put == saved {
+                count(&COUNTS.same);
+                return None;
+            }
+            if !known {
+                count(&COUNTS.unknown);
+            }
+            Some(Lent { at, old, saved, put })
         })
         .collect();
     for page in read {
@@ -448,6 +456,8 @@ pub(crate) fn lend<'a>(
                 lent = get(&COUNTS.lent),
                 elsewhere = get(&COUNTS.elsewhere),
                 unmapped = get(&COUNTS.unmapped),
+                unknown = get(&COUNTS.unknown),
+                same = get(&COUNTS.same),
                 conflicts = get(&COUNTS.conflicts),
                 "a submission reaches remapped title pages through in-place buffers recorded before the remap: their old pages lent the new bytes"
             );
@@ -521,6 +531,10 @@ struct Counts {
     lent: std::sync::atomic::AtomicU64,
     elsewhere: std::sync::atomic::AtomicU64,
     unmapped: std::sync::atomic::AtomicU64,
+    /// Lent with no section view known at the address.
+    unknown: std::sync::atomic::AtomicU64,
+    /// Not lent: no view known and the same bytes.
+    same: std::sync::atomic::AtomicU64,
     conflicts: std::sync::atomic::AtomicU64,
 }
 
@@ -528,6 +542,8 @@ static COUNTS: Counts = Counts {
     lent: std::sync::atomic::AtomicU64::new(0),
     elsewhere: std::sync::atomic::AtomicU64::new(0),
     unmapped: std::sync::atomic::AtomicU64::new(0),
+    unknown: std::sync::atomic::AtomicU64::new(0),
+    same: std::sync::atomic::AtomicU64::new(0),
     conflicts: std::sync::atomic::AtomicU64::new(0),
 };
 
