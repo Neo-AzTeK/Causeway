@@ -79,13 +79,13 @@ Each item names its problem in the ranked table below.
 - [ ] Remaining shader refusals with a lead (`untranslated-shaders`): lane mask
       read as data (the AMD fork's `d1f883e`; its switch must be in the shader
       cache key, or go), `v_permlanex16_b32` (`fxceless/victory-fork`)
-- [ ] Waves of 64 (`wave64-refusals`): 39 compute programs still require
-      them (22 an exchange in a block a branch skips, 13 in a loop, 2 a
-      barrier under a lane-derived branch, 2 no shared memory room). The 25
-      refused in world runs are 19 skipped-block, 5 loop, 1 shared memory:
-      start with those. The census reason should name the exchanging
-      instruction. Also the unmerged branch with several console waves per
-      group (needs the owner's OK to take it over)
+- [ ] Waves of 64 (`wave64-refusals`): 2 compute programs still require
+      them (the triangle clipper's `CollectTriangles`: a group vote, with
+      both halves together; one is refused in world runs). Not shown by a
+      test: that a wave that is on gets a load's result after the code
+      guarded for off waves (the new test's load is unused). The unmerged
+      branch with several console waves per group is superseded by
+      `linear` on `main` (owner's call to drop it)
 - [ ] Refusals with no fix found yet (`untranslated-shaders`): structured
       buffer of unknown stride; a descriptor read as data (may need the
       descriptor heap's contents; that work is ours too)
@@ -229,7 +229,7 @@ measure what the picture loses.
 |------|----|--------|----------|
 | 1 | `scene-blocker` | which loss keeps the 3D scene from showing is unknown; the answer ranks the rest | unknown |
 | 2 | `placed-texture-slots` | heap-indexing shaders read an empty slot where the title placed a texture: most 3D surfaces have no base colour | causal by white substitution (main-pass black 65% to 39%, 49% to 10%); real textures not tried |
-| 3 | `wave64-refusals` | compute needing waves of 64 is refused: most refused pipelines in world runs | census: 42 programs before, 39 on `main` since first-lane reads of console-wave-alike values (from the avatarmanz fork); the 3 gained (ray-tracing structure builder) are not refused in the usual world scene, which still refuses the same 25 pipelines; picture effect a guess |
+| 3 | `wave64-refusals` | compute needing waves of 64 is refused: most refused pipelines in world runs | census 42 -> 2 programs (first-lane reads of console-wave-alike values; groups of several console waves run memory accesses where a wave is off); world run: 25 refused pipelines -> 1, no dispatch dropped as refused (was 24 per frame), most of them the tiled shadow renderer; picture effect not seen (3D scene not shown yet) |
 | 4 | `descriptor-slots` | draws and dispatches dropped for lack of descriptor slots; a large share of drops | fixed in `main`, confirmed on the GTX 1070 (capped heap); an uncapped host (AMD) not run; picture effect a guess |
 | 5 | `mesh-pipeline-invalid` | a mesh pipeline the host rejects loses many indirect draws in some runs, almost none in others | cause unknown |
 | 6 | `gpu-long-dispatch` | evicting idle host textures that bindless shaders still write hung the GPU seconds into most world runs (fixed on main by fdc72fc: idle textures are lowered in priority, not evicted) | shown by 600 s runs: no such hang in 11 fix runs; main 0 of 2 past 11 s |

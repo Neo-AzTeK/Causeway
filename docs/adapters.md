@@ -48,6 +48,7 @@ written down.
 | compute shaders with implicit derivatives ask for validator 1.8 | tests, validator; part of that run | effect in the title; whether an older Windows D3D12 runtime accepts such a module |
 | lane mask joined with data keeps its number | tests, one of them on the GPU (RTX 2060 SUPER); validator; part of the same full title run | effect in the title |
 | first-lane reads of values alike in a console wave take each host wave's own lane | tests, three of them on the GPU (GTX 1070); validator and census (3 programs gained, none lost); a 300 s title run on the GTX 1070, 2026-11-28 (`wave64-gate-2`): no regression | effect in the title: the 3 programs gained were not refused in that run's scene on `main` either; the RTX 2060 SUPER |
+| groups of several console waves run memory accesses where a wave is off (only where it is on) | tests, one on the GPU (GTX 1070); validator and census (37 programs gained, none lost); a 300 s title run on the GTX 1070, 2026-11-28 (`wave64-linear-1`): 24 more pipelines made, no regression, no device removal | effect on the picture (the 3D scene does not show yet); the RTX 2060 SUPER |
 
 The validator in these rows is the Windows SDK's `dxil.dll` (10.0.26100.0).
 
