@@ -167,13 +167,12 @@ fn writes(at: usize) -> Option<String> {
 }
 
 /// For the crash report: [`loaded`] and [`writes`] of the page holding
-/// `at`. `None` if it has neither, or another thread holds them (a crash on
-/// several threads at once).
+/// `at`, and the GPU copies holding it (`crate::shadow::holding`). `None`
+/// if it has none, or another thread holds them (a crash on several threads
+/// at once).
 pub fn note(at: u64) -> Option<String> {
-    match (loaded(at), writes(at as usize)) {
-        (Some(l), Some(w)) => Some(format!("{l}\n    {w}")),
-        (l, w) => l.or(w),
-    }
+    let parts: Vec<String> = [loaded(at), writes(at as usize), crate::shadow::holding(at)].into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join("\n    "))
 }
 
 /// The trail of the page holding `at`, and, for the newest step naming a

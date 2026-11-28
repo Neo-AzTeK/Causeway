@@ -1204,6 +1204,40 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Diagnostics, for the crash report: the copies that hold title address
+/// `at` now (title buffers', loose memory's, in-place ones): whether the
+/// GPU could have written there. None where no copy holds it, or another
+/// thread holds the copies (a crash on several threads at once).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn holding(at: u64) -> Option<String> {
+    let describe = |s: &Shadow| {
+        let kind = match (&s.in_place, s.place) {
+            (None, _) => "host copy",
+            (Some(_), Some(_)) => "in place on its section",
+            (Some(_), None) => "in place by address",
+        };
+        let gone = if s.is_let_go() { ", let go" } else { "" };
+        format!("{kind} of {:#x}+{:#x}{gone}", s.start, s.len)
+    };
+    let holds = |s: &Shadow| s.start <= at && at < s.start + s.len;
+    let mut out = Vec::new();
+    if let Ok(map) = BUFFERS.try_lock() {
+        for ((start, _), e) in map.range(..=(at, usize::MAX)).rev().take(64) {
+            if at < e.end {
+                let copy = e.shadow.as_deref().map_or("no copy".to_string(), describe);
+                out.push(format!("buffer {start:#x}..{:#x}: {copy}", e.end));
+            }
+        }
+    }
+    if let Ok(map) = OPEN.try_lock() {
+        out.extend(map.values().filter(|s| holds(s)).map(|s| describe(s)));
+    }
+    if let Ok(map) = LOOSE.try_lock() {
+        out.extend(map.values().filter(|s| holds(s)).map(|s| describe(s)));
+    }
+    (!out.is_empty()).then(|| format!("held by: {}", out.join("; ")))
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
