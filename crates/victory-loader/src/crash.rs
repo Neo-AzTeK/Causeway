@@ -742,7 +742,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
 
 /// A line for each register but `rsp` pointing at readable data: up to its
 /// first eight quadwords, as far as they can be read. Image pages (code,
-/// constants, globals) are left out.
+/// constants, globals) are left out. Then, where the runtime knows
+/// something of the memory a register or one of those quadwords points at
+/// ([`note_memory_on_crash`]), its line.
 #[cfg(any(feature = "diagnostics", test))]
 fn register_memory(c: &CONTEXT) -> Vec<String> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;

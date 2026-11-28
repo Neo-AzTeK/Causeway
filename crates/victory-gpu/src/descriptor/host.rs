@@ -1040,27 +1040,58 @@ impl HostHeap {
     /// since the last call (`crate::shadow::let_go`, before it remaps that
     /// memory): their buffer shows the section's old pages, so a shader
     /// writing through the slot would write memory now mapped elsewhere.
-    /// Made again, the view takes the copy of what the address shows now.
-    /// Returns how many were made again. A scan of the slots viewing title
-    /// memory, only after a remap let a copy go.
+    /// Made again, the view takes the copy of what the address shows now;
+    /// a slot whose record is no longer a view (or no longer readable) goes
+    /// null. Returns how many were made again or null. A scan of the slots
+    /// viewing title memory, only after a remap let a copy go.
+    ///
+    /// shortcut: a slot made while its copy is let go on another thread
+    /// may be listed (`crate::bindless`) with the copy found after, which
+    /// is not let go: `seen` looks the copy up again. It takes one title
+    /// thread writing a view of a section view another one unmaps.
     pub(crate) fn remake_let_go(&self, handle: impl Fn(u32) -> u64) -> usize {
         use std::sync::atomic::Ordering::AcqRel;
         let now = crate::shadow::let_go_count();
         if self.let_go_seen.swap(now, AcqRel) == now {
             return 0;
         }
-        let mut indices = self.viewed.let_go_slots();
-        indices.retain(|&index| index < self.title_count);
-        for &index in &indices {
-            let at = handle(index);
-            // A heap page the title unmapped holds no record.
-            if !crate::host::read_into(at as *const u8, &mut [0u8; 12]) {
+        let mut made = 0;
+        for index in self.viewed.let_go_slots() {
+            if index >= self.title_count {
                 continue;
             }
-            self.made.lock().unwrap_or_else(|e| e.into_inner()).keys[index as usize] = 0;
-            self.make_slot(index, at, false, false);
+            let at = handle(index);
+            // A heap page the title unmapped holds no record: the slot goes
+            // null, as one whose record is no longer a view ([`make_slot`]
+            // makes it null when its key names a record).
+            let mut record = [0u32; 3];
+            // SAFETY: room for the 12 bytes asked for.
+            let readable = crate::host::read_into(at as *const u8, unsafe { std::slice::from_raw_parts_mut(record.as_mut_ptr().cast(), 12) });
+            let live = readable && record[0] == VIEW_TAG && view_at(record[1], record[2]).is_some();
+            if live {
+                // The same record: made again only with its key forgotten.
+                self.made.lock().unwrap_or_else(|e| e.into_inner()).keys[index as usize] = 0;
+                self.make_slot(index, at, false, false);
+            } else {
+                // The host resource goes with the view (`keep`), before a
+                // pool slot is given back.
+                if let Some(slot) = self.slot_of(index, false) {
+                    self.keep(slot, None);
+                }
+                if readable {
+                    self.make_slot(index, at, false, false);
+                } else if let Some(slot) = self.slot_of(index, false) {
+                    self.made.lock().unwrap_or_else(|e| e.into_inner()).keys[index as usize] = 0;
+                    self.make_null(slot);
+                    self.note_address(slot, None);
+                    self.unmap(index);
+                }
+                // No longer viewing the copy let go.
+                self.viewed.set(index, None, false);
+            }
+            made += 1;
         }
-        indices.len()
+        made
     }
 
     /// [`HostHeap::mirror`] of title slots `[first, last)` (their records at
@@ -3024,21 +3055,32 @@ mod tests {
         // The host resource the slot views, and the copy holding the view.
         let viewed = |heap: &HostHeap| heap.kept.lock().unwrap()[1].as_ref().map(|k| windows::core::Interface::as_raw(&k.0) as usize);
         let (copy, _) = crate::shadow::for_view(address + 16, 64, 16).expect("a copy");
-        assert!(copy.in_place(), "the GPU uses the view in place");
+        if !copy.in_place() {
+            crate::inplace::FORM.set(None);
+            eprintln!("skipped: the device does not open title memory in place");
+            return;
+        }
         assert_eq!(viewed(&heap), Some(windows::core::Interface::as_raw(&copy.buffer) as usize), "the slot views it");
         assert_eq!(heap.remake_let_go(handle), 0, "nothing let go yet");
         // The runtime is about to remap the view.
         crate::shadow::let_go(at as u64, len as u64);
         assert_eq!(heap.remake_let_go(handle), 1, "the slot over it is made again");
-        crate::inplace::FORM.set(None);
         let (now, _) = crate::shadow::for_view(address + 16, 64, 16).expect("a copy");
+        crate::inplace::FORM.set(None);
         assert!(!std::sync::Arc::ptr_eq(&copy, &now) && !now.is_let_go());
         assert_eq!(viewed(&heap), Some(windows::core::Interface::as_raw(&now.buffer) as usize), "the slot views what the address shows now");
         assert!(heap.viewed.let_go_slots().is_empty());
         assert_eq!(heap.remake_let_go(handle), 0, "nothing new let go");
+        // Remade over the view in place again. The title clears the slot
+        // (its record is no longer a view), then the view is let go: the
+        // slot goes null, not left over the old pages.
+        assert!(now.in_place(), "remade in place: the view is still mapped");
         slots[1] = [0; 8];
-        heap.sync(0, 4, handle);
         crate::shadow::let_go(at as u64, len as u64);
+        assert_eq!(heap.remake_let_go(handle), 1, "the slot is made null");
+        assert_eq!(viewed(&heap), None, "views nothing");
+        assert!(heap.viewed.let_go_slots().is_empty(), "no longer listed");
+        assert_eq!(heap.made.lock().unwrap().keys[1], 0);
         drop((copy, now, heap));
         // Slot resources given up are retired until the GPU's next quiet
         // point, and an opened heap pins the view until then: the unmap may

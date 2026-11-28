@@ -303,7 +303,7 @@ fn open(g: &mut Guards, page: usize) -> bool {
     // A write is coming: the page takes its load's bytes first.
     if let Some(entry) = g.lazy.remove(&page) {
         #[cfg(feature = "diagnostics")]
-        crate::trail::step(page, "filled before a write", Some((&entry.0, entry.1)));
+        crate::trail::step(page, "filled before a write or an unmap", Some((&entry.0, entry.1)));
         fill(g, page, entry);
     }
     if !g.protected.remove(&page) {
