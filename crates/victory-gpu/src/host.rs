@@ -439,6 +439,21 @@ fn create_hardware_device() -> windows::core::Result<ID3D12Device> {
 
 #[cfg(test)]
 mod tests {
+    /// Groups put before the runs' own (the probe's video-memory copy)
+    /// shift every run by one: group 0 is no run, and the last run's group
+    /// comes before the read-back of the marks, which is no run either.
+    #[test]
+    fn groups_name_their_runs() {
+        use super::run_of_group;
+        // No group before the runs: group i is run i; the marks' group after.
+        assert_eq!((0..4).map(|g| run_of_group(g, 0, 3)).collect::<Vec<_>>(), [Some(0), Some(1), Some(2), None]);
+        // The probe's copy first: group i is run i - 1.
+        assert_eq!(
+            (0..5).map(|g| run_of_group(g, 1, 3)).collect::<Vec<_>>(),
+            [None, Some(0), Some(1), Some(2), None]
+        );
+    }
+
     /// A list noting more commands than one chunk has slots: each command
     /// is timed from its own stamp to the next, and where a slot is
     /// missing the end stamp is not put on an earlier slot, which would
@@ -1333,7 +1348,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let to_video = [crate::vramcopy::list(&self.device)];
         #[cfg(feature = "diagnostics")]
-        if to_video[0].is_some() {
+        let lead = usize::from(to_video[0].is_some());
+        #[cfg(not(feature = "diagnostics"))]
+        let lead = 0;
+        #[cfg(feature = "diagnostics")]
+        if lead > 0 {
             groups.insert(0, &to_video);
         }
         // Last: the written-pages bitmaps the lists marked, read back.
@@ -1385,13 +1404,14 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            let run = run_of_group(i, lead, runs.len());
             #[cfg(feature = "diagnostics")]
-            if each && i < runs.len() && started.elapsed() > std::time::Duration::from_millis(50) {
+            if let Some(r) = run.filter(|_| each && started.elapsed() > std::time::Duration::from_millis(50)) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let commands = runs[r].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                let (slowest, untimed) = runs[i].slowest(frequency, 6);
+                let (slowest, untimed) = runs[r].slowest(frequency, 6);
                 for (ms, op) in slowest {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
@@ -1400,8 +1420,8 @@ impl Host {
                 }
             }
             // SAFETY: a plain query.
-            if groups.len() > 1 && i < runs.len() && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                removed_in = Some(i);
+            if groups.len() > 1 && run.is_some() && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                removed_in = run;
             }
             let _ = (i, started);
         }
@@ -3477,6 +3497,13 @@ fn traced(what: &str) {
     if hashes.iter().any(|h| what.contains(h.as_str())) && LOGGED.fetch_add(1, Ordering::Relaxed) < 500 {
         tracing::info!("traced command: {what}");
     }
+}
+
+/// The run whose lists submission group `group` holds, when `lead` groups
+/// that are no run go before the runs' own (the probe's video-memory copy)
+/// and others may follow them (the read-back of the marks).
+fn run_of_group(group: usize, lead: usize, runs: usize) -> Option<usize> {
+    group.checked_sub(lead).filter(|&run| run < runs)
 }
 
 /// Diagnostics, `VICTORY_GPU_TIMING`: every command of the list during
