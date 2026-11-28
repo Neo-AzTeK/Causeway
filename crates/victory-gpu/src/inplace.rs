@@ -1231,12 +1231,14 @@ mod tests {
         pages.map(0, 0);
         // The first half of the unmap's notice (`watch::title_memory_remapped`).
         crate::shadow::let_go(pages.slot(0), super::PAGE);
-        let copy = crate::shadow::find(pages.slot(0), 512);
+        // Opened directly: through `shadow::find`, memory with no view gets a
+        // host copy of its 4 MiB window, which guards other tests' memory.
+        let opened = super::open(pages.slot(0), 512);
         assert!(
-            copy.as_ref().is_none_or(|c| c.placed_run().is_none()),
+            opened.as_ref().is_none_or(|o| o.place.is_none()),
             "opened on the section page the address stops showing"
         );
-        drop(copy);
+        drop(opened);
     }
 
     /// Two pages of one in-place buffer swapped by the runtime, a third left
