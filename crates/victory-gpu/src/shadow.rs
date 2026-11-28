@@ -1100,11 +1100,16 @@ pub(crate) fn let_go_count() -> u64 {
 /// copies over it go: what those addresses show changes. A heap opened from
 /// the view's address also pins its pages (Windows refuses the unmap while
 /// one lives); one opened from its section does not. Buffers there are
-/// opened or copied again on their next use.
+/// opened or copied again on their next use. The section views there are
+/// forgotten under the same lock as the copies go ([`in_place`] opens under
+/// it): a buffer first used meanwhile on another thread found the view
+/// still known and was placed on the page the address stops showing, in a
+/// copy no later call let go.
 pub(crate) fn let_go(at: u64, len: u64) {
     let end = at.saturating_add(len);
     let gone: Vec<Arc<Shadow>> = {
         let mut map = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        crate::inplace::forget(at, len);
         let hit: Vec<u64> = map.range(..end).filter(|(_, s)| s.start + s.len > at).map(|(&k, _)| k).collect();
         hit.iter().filter_map(|k| map.remove(k)).collect()
     };

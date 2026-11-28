@@ -1180,6 +1180,28 @@ mod tests {
         assert_eq!(pages.page_byte(0, 256), 0x11, "the old page keeps its bytes");
     }
 
+    /// A buffer first used while the runtime unmaps its view, between the
+    /// copies over it letting go and the view being forgotten (another
+    /// thread records while one unmaps): it is not placed on the section
+    /// page the address stops showing, which nothing would let go again.
+    #[test]
+    fn a_copy_opened_during_an_unmap_is_not_placed_on_the_old_page() {
+        if crate::host::host().is_none() {
+            eprintln!("skipped: no host GPU");
+            return;
+        }
+        let pages = Pages::new(1);
+        pages.map(0, 0);
+        // The first half of the unmap's notice (`watch::title_memory_remapped`).
+        crate::shadow::let_go(pages.slot(0), super::PAGE);
+        let copy = crate::shadow::find(pages.slot(0), 512);
+        assert!(
+            copy.as_ref().is_none_or(|c| c.placed_run().is_none()),
+            "opened on the section page the address stops showing"
+        );
+        drop(copy);
+    }
+
     /// Two pages of one in-place buffer swapped by the runtime, a third left
     /// alone, before a list recorded over all three is submitted: each read
     /// and write follows its address, though each address now shows the

@@ -957,9 +957,8 @@ fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     // Copies the GPU uses in place go first, before the runtime unmaps:
     // those opened by address pin the pages, and the addresses will show
-    // other memory.
+    // other memory. Their section views are forgotten with them.
     crate::shadow::let_go(at as u64, len as u64);
-    crate::inplace::forget(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     crate::trail::step_if_seen(first, last, "mapped or unmapped");
