@@ -1115,8 +1115,9 @@ pub(crate) fn let_go(at: u64, len: u64) {
     // address through the page tables when it runs.
     // Lists recorded before the remap keep the copy (their root views and
     // the in-place copies they hold name its buffer): when one is submitted,
-    // the old pages it reaches lend it what the addresses show then
-    // (`crate::inplace::lend`).
+    // the old section pages it reaches lend it what the addresses show then
+    // (`crate::inplace::lend`). A copy opened by address is not lent: it
+    // pins the view (the warning below).
     for shadow in &gone {
         shadow.let_go.store(true, std::sync::atomic::Ordering::Release);
     }

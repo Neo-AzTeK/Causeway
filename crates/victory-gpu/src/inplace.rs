@@ -341,13 +341,16 @@ pub(crate) struct Lending {
 ///
 /// shortcut: the old page is the title's memory too. Where another title
 /// address shows it, the title's threads and the submission's other lists
-/// reaching it there see the lent bytes during the run, and what they write
-/// there meanwhile is lost (counted as `elsewhere` in the log line).
+/// reaching it there see the lent bytes during the run; what lists write
+/// there meanwhile goes to the lending address instead, and what the title
+/// writes there is lost (counted as `elsewhere` in the log line). Copies
+/// opened by address (`Opened::place` none) are not lent: they pin the
+/// view, so the runtime's unmap fails while lists hold them.
 pub(crate) fn lend<'a>(
     uses: impl Iterator<Item = (&'a crate::shadow::Shadow, &'a std::collections::HashSet<(u64, u64)>)>,
 ) -> Lending {
     let mut lending = Lending::default();
-    let wanted: Vec<(u64, usize, bool)> = {
+    let wanted: Vec<(u64, usize)> = {
         let s = sections();
         let mut wanted = Vec::new();
         let mut taken: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
@@ -372,8 +375,18 @@ pub(crate) fn lend<'a>(
             }
             for page in pages {
                 let page_offset = offset + (page - start);
-                if shown_now(&s.views, page) == Some((section, page_offset)) {
-                    continue;
+                // Lent only where the address shows another section page:
+                // none is an address unmapped since (the console's GPU would
+                // fault there), or one the runtime is mapping right now
+                // (between `forget` and `title_memory_section`), which may
+                // show this very page again.
+                match shown_now(&s.views, page) {
+                    Some(now) if now != (section, page_offset) => {}
+                    Some(_) => continue,
+                    None => {
+                        count(&COUNTS.unmapped);
+                        continue;
+                    }
                 }
                 let old = view + page_offset as usize;
                 // Two buffers lending one page different bytes: the first
@@ -385,36 +398,46 @@ pub(crate) fn lend<'a>(
                     continue;
                 }
                 taken.insert(old, page);
-                // `page` shows another page now, so a view holding the old
-                // one is at another address.
-                let elsewhere = s
-                    .views
-                    .values()
-                    .any(|v| v.section == section && v.offset <= page_offset && page_offset < v.offset + v.len);
-                wanted.push((page, old, elsewhere));
+                wanted.push((page, old, section, page_offset));
             }
         }
-        wanted
+        // `page` shows another page now, so a view holding the old one is
+        // at another address: one pass over the views for all of them.
+        let elsewhere = s
+            .views
+            .values()
+            .flat_map(|v| wanted.iter().filter(move |w| w.2 == v.section && v.offset <= w.3 && w.3 < v.offset + v.len))
+            .count();
+        COUNTS.elsewhere.fetch_add(elsewhere as u64, std::sync::atomic::Ordering::Relaxed);
+        wanted.into_iter().map(|(page, old, _, _)| (page, old)).collect()
     };
-    for (at, old, elsewhere) in wanted {
-        let old = old as *mut u8;
-        let mut saved = vec![0u8; PAGE as usize];
-        let mut put = vec![0u8; PAGE as usize];
-        // The address may show nothing now (the GPU would fault on the
-        // console): the old page is left as it is then. Through the kernel,
-        // which refuses a page the title decommitted instead of faulting.
-        if !crate::host::read_kernel(old, saved.as_mut_ptr(), saved.len())
-            || !crate::host::read_into(at as *const u8, &mut put)
-            || !crate::host::read_kernel(put.as_ptr(), old, put.len())
-        {
+    // Every page's bytes are read before any old page is written: an
+    // address may show another lent page now (pages swapped or moved along
+    // a chain), whose own bytes it must lend. Through the kernel, which
+    // refuses a page the title decommitted instead of faulting.
+    let read: Vec<Lent> = wanted
+        .into_iter()
+        .filter_map(|(at, old)| {
+            let old = old as *mut u8;
+            let mut saved = vec![0u8; PAGE as usize];
+            let mut put = vec![0u8; PAGE as usize];
+            let ok = crate::host::read_kernel(old, saved.as_mut_ptr(), saved.len())
+                && crate::host::read_into(at as *const u8, &mut put);
+            if !ok {
+                count(&COUNTS.unmapped);
+            }
+            ok.then_some(Lent { at, old, saved, put })
+        })
+        .collect();
+    for page in read {
+        if crate::host::read_kernel(page.put.as_ptr(), page.old, page.put.len()) {
+            count(&COUNTS.lent);
+            lending.pages.push(page);
+        } else {
+            // Partly written at most: its own bytes go back.
+            crate::host::read_kernel(page.saved.as_ptr(), page.old, page.saved.len());
             count(&COUNTS.unmapped);
-            continue;
         }
-        if elsewhere {
-            count(&COUNTS.elsewhere);
-        }
-        count(&COUNTS.lent);
-        lending.pages.push(Lent { at, old, saved, put });
     }
     if !lending.pages.is_empty() {
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -441,19 +464,28 @@ impl Lending {
         self.undo(true);
     }
 
+    /// What the GPU wrote is read from every lent page, then every page gets
+    /// its bytes back, then the writes go to the addresses: an address may
+    /// show another lent page, which must hold its own bytes by then.
     fn undo(&mut self, gpu_ran: bool) {
-        for page in self.pages.drain(..) {
-            if gpu_ran {
+        let pages = std::mem::take(&mut self.pages);
+        let written: Vec<Option<Vec<u8>>> = pages
+            .iter()
+            .map(|page| {
                 let mut now = vec![0u8; PAGE as usize];
-                if crate::host::read_kernel(page.old, now.as_mut_ptr(), now.len()) {
-                    for (from, to) in differing(&page.put, &now) {
-                        let at = page.at as usize + from;
-                        let _writing = crate::watch::gpu_writing(at, to - from);
-                        crate::host::write_mapped(at as *mut u8, now[from..].as_ptr(), to - from);
-                    }
-                }
-            }
+                (gpu_ran && crate::host::read_kernel(page.old, now.as_mut_ptr(), now.len())).then_some(now)
+            })
+            .collect();
+        for page in &pages {
             crate::host::read_kernel(page.saved.as_ptr(), page.old, page.saved.len());
+        }
+        for (page, now) in pages.iter().zip(written) {
+            let Some(now) = now else { continue };
+            for (from, to) in differing(&page.put, &now) {
+                let at = page.at as usize + from;
+                let _writing = crate::watch::gpu_writing(at, to - from);
+                crate::host::write_mapped(at as *mut u8, now[from..].as_ptr(), to - from);
+            }
         }
     }
 }
@@ -819,6 +851,159 @@ mod tests {
         }
     }
 
+    /// Title memory as the runtime makes physical pages (`victory_hle`
+    /// xmem): a section of `n` 64 KiB pages, page `k` filled with
+    /// `0x11 * (k + 1)`, and `n` title addresses in one placeholder, each
+    /// mapped and unmapped page by page in xmem's order of notices.
+    struct Pages {
+        section: windows_sys::Win32::Foundation::HANDLE,
+        own: *mut u8,
+        at: *mut core::ffi::c_void,
+        n: usize,
+    }
+
+    impl Pages {
+        const P: usize = super::PAGE as usize;
+
+        fn new(n: usize) -> Pages {
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_WRITE, MEM_RESERVE_PLACEHOLDER, MapViewOfFile, VirtualAlloc2,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let len = n * Self::P;
+            // SAFETY: plain section creation (committed whole), closed on drop.
+            let section =
+                unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null()) };
+            assert!(!section.is_null());
+            // SAFETY: our own view of the section, to fill and inspect it.
+            let own = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len) }.Value.cast::<u8>();
+            assert!(!own.is_null());
+            for k in 0..n {
+                // SAFETY: inside our view.
+                unsafe { std::ptr::write_bytes(own.add(k * Self::P), 0x11 * (k as u8 + 1), Self::P) };
+            }
+            // SAFETY: a placeholder of our own, split and replaced by views.
+            let at = unsafe {
+                VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), len, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0)
+            };
+            assert!(!at.is_null());
+            Pages { section, own, at, n }
+        }
+
+        /// The title address of slot `k`.
+        fn slot(&self, k: usize) -> u64 {
+            self.at as u64 + (k * Self::P) as u64
+        }
+
+        /// Maps section page `page` at slot `k`, then gives the notices of
+        /// xmem's `map` (remapped, then the section view).
+        fn map(&self, k: usize, page: usize) {
+            use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let base = self.slot(k) as *mut core::ffi::c_void;
+            // SAFETY: splits our placeholder around the slot (failing
+            // harmlessly when it is the whole placeholder), then maps one
+            // section page there.
+            let v = unsafe {
+                VirtualFree(base, Self::P, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                MapViewOfFile3(
+                    self.section,
+                    GetCurrentProcess(),
+                    base,
+                    (page * Self::P) as u64,
+                    Self::P,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(v.Value, base);
+            crate::watch::title_memory_remapped(base as usize, Self::P);
+            let size = (self.n * Self::P) as u64;
+            super::title_memory_section(base as usize, Self::P, self.section as usize, self.section as isize, size, (page * Self::P) as u64);
+        }
+
+        /// Unmaps slot `k`, with the notice of xmem's `unmap` first.
+        fn unmap(&self, k: usize) {
+            use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile2};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let base = self.slot(k) as *mut core::ffi::c_void;
+            crate::watch::title_memory_remapped(base as usize, Self::P);
+            // SAFETY: our view over the slot, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: base }, MEM_PRESERVE_PLACEHOLDER) };
+        }
+
+        /// Byte `i` of section page `page`, through our own view.
+        fn page_byte(&self, page: usize, i: usize) -> u8 {
+            // SAFETY: inside our view.
+            unsafe { *self.own.add(page * Self::P + i) }
+        }
+
+        /// Byte `i` at slot `k`'s title address.
+        fn slot_byte(&self, k: usize, i: usize) -> u8 {
+            // SAFETY: a mapped slot.
+            unsafe { *(self.slot(k) as *const u8).add(i) }
+        }
+    }
+
+    impl Drop for Pages {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            for k in 0..self.n {
+                self.unmap(k);
+            }
+            // SAFETY: ours; the section's heap keeps a view of its own.
+            unsafe {
+                VirtualFree(self.at, 0, MEM_RELEASE);
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.own.cast() });
+                CloseHandle(self.section);
+            }
+        }
+    }
+
+    /// What [`record_over`] made: the list, the copy it holds, and the host
+    /// buffers it reads into (with its bytes) and writes from.
+    type Recorded = (crate::host::HostList, std::sync::Arc<crate::shadow::Shadow>, ID3D12Resource, *mut u8, ID3D12Resource);
+
+    /// A list recorded over `pages` used in place: it reads 256 bytes at the
+    /// start of each slot in `reads` (into the output at 256 per read) and
+    /// writes `0x33 + j` at offset 256 of the `j`th slot in `writes`. None
+    /// where the device opens no section in place.
+    fn record_over(host: &crate::host::Host, pages: &Pages, reads: &[usize], writes: &[usize]) -> Option<Recorded> {
+        let p = Pages::P;
+        // The run grows over the consecutive views mapped (`run`); asked
+        // for more than is mapped, a host copy of the 4 MiB window would be
+        // made and kept for later tests there.
+        let copy = crate::shadow::find(pages.slot(0), 512).expect("a copy");
+        let (start, _, _, offset) = copy.placed_run()?;
+        assert_eq!((start, offset), (pages.slot(0), 0), "placed on the first page");
+        let (out, out_data) = host.shared_buffer(p as u64).expect("a host buffer");
+        let (src, src_data) = host.shared_buffer(p as u64).expect("a host buffer");
+        // SAFETY: inside the host buffers.
+        unsafe {
+            std::ptr::write_bytes(out_data, 0, p);
+            for j in 0..writes.len() {
+                std::ptr::write_bytes(src_data.add(256 * j), 0x33 + j as u8, 256);
+            }
+        }
+        let list = host.new_list().unwrap();
+        for (j, &k) in reads.iter().enumerate() {
+            copy.refresh(&list, pages.slot(k), 256);
+            // SAFETY: an open list; ranges inside the buffers.
+            unsafe { list.list.CopyBufferRegion(&out, (256 * j) as u64, &copy.buffer, (k * p) as u64, 256) };
+        }
+        for (j, &k) in writes.iter().enumerate() {
+            copy.gpu_writes(&list, pages.slot(k) + 256, 256, false);
+            // SAFETY: as above.
+            unsafe { list.list.CopyBufferRegion(&copy.buffer, (k * p + 256) as u64, &src, (256 * j) as u64, 256) };
+        }
+        list.close();
+        Some((list, copy, out, out_data, src))
+    }
+
     /// A list recorded over a title page used in place from its section,
     /// submitted after the runtime mapped another page of the section there:
     /// it reads and writes what the address shows then (the console's GPU
@@ -826,93 +1011,56 @@ mod tests {
     /// page keeps its bytes.
     #[test]
     fn a_list_recorded_before_a_remap_sees_the_new_page() {
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
-            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2,
-        };
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        const P: usize = super::PAGE as usize;
         let Some(host) = crate::host::host() else {
             eprintln!("skipped: no host GPU");
             return;
         };
-        // Two physical pages, 0x11s and 0x22s, as the runtime makes them.
-        // SAFETY: plain section creation (committed whole), kept by the views.
-        let section =
-            unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 2 * P as u32, std::ptr::null()) };
-        assert!(!section.is_null());
-        // SAFETY: our own view of the section, to fill and inspect it.
-        let own = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * P) }.Value.cast::<u8>();
-        assert!(!own.is_null());
-        // SAFETY: inside our view.
-        unsafe {
-            std::ptr::write_bytes(own, 0x11, P);
-            std::ptr::write_bytes(own.add(P), 0x22, P);
-        }
-        // The title's address: a placeholder the first page is mapped over.
-        // SAFETY: a placeholder of our own, replaced by the view.
-        let at = unsafe {
-            VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), P, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0)
-        };
-        assert!(!at.is_null());
-        let map_page = |offset: usize| {
-            // SAFETY: one section page over our placeholder.
-            let v = unsafe {
-                MapViewOfFile3(section, GetCurrentProcess(), at, offset as u64, P, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0)
-            };
-            assert_eq!(v.Value, at);
-            super::title_memory_section(at as usize, P, section as usize, section as isize, 2 * P as u64, offset as u64);
-        };
-        map_page(0);
-        let address = at as u64;
-        let Some(copy) = crate::shadow::find(address, 512) else {
-            panic!("no copy");
-        };
-        if copy.placed_run().is_none() {
+        let pages = Pages::new(2);
+        pages.map(0, 0);
+        let Some((list, copy, _out, out_data, _src)) = record_over(host, &pages, &[0], &[0]) else {
             eprintln!("skipped: the device does not open sections in place");
             return;
-        }
-        assert_eq!(copy.placed_run().map(|r| (r.0, r.3)), Some((address, 0)), "placed on the first page");
-        let (out, out_data) = host.shared_buffer(P as u64).expect("a host buffer");
-        let (src, src_data) = host.shared_buffer(P as u64).expect("a host buffer");
-        // SAFETY: inside the host buffers.
-        unsafe {
-            std::ptr::write_bytes(out_data, 0, P);
-            std::ptr::write_bytes(src_data, 0x33, P);
-        }
-        // Recorded now: the list reads bytes 0..256 and writes 256..512.
-        let list = host.new_list().unwrap();
-        copy.refresh(&list, address, 256);
-        copy.gpu_writes(&list, address + 256, 256, false);
-        // SAFETY: an open list; ranges inside the buffers.
-        unsafe {
-            list.list.CopyBufferRegion(&out, 0, &copy.buffer, 0, 256);
-            list.list.CopyBufferRegion(&copy.buffer, 256, &src, 0, 256);
-        }
-        list.close();
-        // The runtime maps the second page there, as xmem does.
-        crate::watch::title_memory_remapped(at as usize, P);
-        // SAFETY: the view over our placeholder, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: at }, MEM_PRESERVE_PLACEHOLDER) };
-        map_page(P);
-        crate::watch::title_memory_remapped(at as usize, P);
+        };
+        pages.unmap(0);
+        pages.map(0, 1);
         assert!(copy.is_let_go());
         host.execute(&[&list]);
-        // SAFETY: inside the buffers and views; the GPU finished.
-        let (read, wrote, old_read, old_wrote) = unsafe { (*out_data, *at.cast::<u8>().add(256), *own, *own.add(256)) };
-        assert_eq!(read, 0x22, "read what the address shows now");
-        assert_eq!(wrote, 0x33, "wrote where the address shows now");
-        assert_eq!((old_read, old_wrote), (0x11, 0x11), "the old page keeps its bytes");
-        drop((list, copy, out, src));
-        crate::shadow::let_go(at as u64, P as u64);
-        // SAFETY: ours; the section's heap keeps its own view.
-        unsafe {
-            UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: at }, MEM_PRESERVE_PLACEHOLDER);
-            VirtualFree(at, 0, MEM_RELEASE);
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: own.cast() });
-            CloseHandle(section);
+        // SAFETY: inside the host buffer; the GPU finished.
+        assert_eq!(unsafe { *out_data }, 0x22, "read what the address shows now");
+        assert_eq!(pages.slot_byte(0, 256), 0x33, "wrote where the address shows now");
+        assert_eq!((pages.page_byte(0, 0), pages.page_byte(0, 256)), (0x11, 0x11), "the old page keeps its bytes");
+    }
+
+    /// Two pages of one in-place buffer swapped by the runtime, a third left
+    /// alone, before a list recorded over all three is submitted: each read
+    /// and write follows its address, though each address now shows the
+    /// other's old page (all lent bytes are read before any is written).
+    #[test]
+    fn a_list_recorded_before_pages_swap_sees_each_new_page() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let pages = Pages::new(3);
+        for k in 0..3 {
+            pages.map(k, k);
         }
+        let Some((list, copy, _out, out_data, _src)) = record_over(host, &pages, &[0, 1, 2], &[0, 1]) else {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        };
+        pages.unmap(0);
+        pages.unmap(1);
+        pages.map(0, 1);
+        pages.map(1, 0);
+        assert!(copy.is_let_go());
+        host.execute(&[&list]);
+        // SAFETY: inside the host buffer; the GPU finished.
+        let read = unsafe { [*out_data, *out_data.add(256), *out_data.add(512)] };
+        assert_eq!(read, [0x22, 0x11, 0x33], "each read follows its address; the third page is unchanged");
+        assert_eq!((pages.slot_byte(0, 256), pages.slot_byte(1, 256)), (0x33, 0x34), "each write follows its address");
+        assert_eq!((pages.page_byte(1, 256), pages.page_byte(0, 256)), (0x33, 0x34), "in the pages the addresses show");
+        assert_eq!((pages.page_byte(0, 0), pages.page_byte(1, 0), pages.page_byte(2, 256)), (0x11, 0x22, 0x33), "untouched bytes stay");
     }
 
     /// The title unmaps a view while a heap opened over it pins its pages,
