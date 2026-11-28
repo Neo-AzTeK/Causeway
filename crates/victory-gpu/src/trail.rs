@@ -130,7 +130,7 @@ pub(crate) fn wrote(at: usize, len: usize, what: &'static str, copy: Option<(u64
     let written = written.get_or_insert_with(HashMap::new);
     for page in first..last {
         let from = at.max(page * PAGE);
-        let to = end.min((page + 1) * PAGE);
+        let to = end.min((page + 1).saturating_mul(PAGE));
         let writes = written.entry(page).or_default();
         if writes.len() == WRITES {
             writes.remove(0);
@@ -142,6 +142,39 @@ pub(crate) fn wrote(at: usize, len: usize, what: &'static str, copy: Option<(u64
             len: (to - from) as u32,
             copy,
         });
+    }
+}
+
+/// Whether quadword `q` holds only infinities: four halves or two floats,
+/// each `+inf` or `-inf` (an empty box's corners).
+fn infinities(q: u64) -> bool {
+    let halves = (0..4).all(|k| matches!((q >> (16 * k)) as u16, 0x7c00 | 0xfc00));
+    let floats = (0..2).all(|k| matches!((q >> (32 * k)) as u32, 0x7f80_0000 | 0xff80_0000));
+    halves || floats
+}
+
+/// After a write that `what` names into `[at, at + len)` (pages [`wrote`]
+/// keeps at most): the first quadword of -1 beside one of infinities in
+/// each page, the empty bounds the title faulted on reading as a pointer,
+/// becomes a write of the page's trail, so that a crash report tells
+/// whether that write brought them.
+pub(crate) fn scan_empty_bounds(at: usize, len: usize, what: &'static str) {
+    let end = at.saturating_add(len).min((at / PAGE * PAGE).saturating_add(WRITE_PAGES * PAGE));
+    let mut page = at / PAGE * PAGE;
+    while page < end {
+        let (from, to) = (at.max(page) & !7, end.min(page.saturating_add(PAGE)));
+        let n = to.saturating_sub(from) / 8;
+        let mut q = vec![0u64; n];
+        if n >= 2 && crate::host::read_kernel(from as *const u8, q.as_mut_ptr().cast(), 8 * n) {
+            let hit = (0..n).find(|&i| {
+                q[i] == u64::MAX && (q.get(i + 1).is_some_and(|&b| infinities(b)) || (i > 0 && infinities(q[i - 1])))
+            });
+            if let Some(i) = hit {
+                wrote(from + 8 * i, 16, what, None);
+            }
+        }
+        let Some(next) = page.checked_add(PAGE) else { break };
+        page = next;
     }
 }
 
@@ -171,7 +204,8 @@ fn writes(at: usize) -> Option<String> {
 /// if it has none, or another thread holds them (a crash on several threads
 /// at once).
 pub fn note(at: u64) -> Option<String> {
-    let parts: Vec<String> = [loaded(at), writes(at as usize), crate::shadow::holding(at)].into_iter().flatten().collect();
+    let parts: Vec<String> =
+        [loaded(at), writes(at as usize), crate::shadow::holding(at), crate::inplace::physical(at)].into_iter().flatten().collect();
     (!parts.is_empty()).then(|| parts.join("\n    "))
 }
 
@@ -289,6 +323,27 @@ mod tests {
         );
         assert!(note((page + PAGE) as u64).is_none());
         drop(memory);
+    }
+
+    #[test]
+    fn a_write_of_empty_bounds_is_noted() {
+        // Only read: plain host memory will do.
+        let mut mem = vec![0u64; 3 * PAGE / 8];
+        let base = mem.as_ptr() as usize;
+        let page = base.next_multiple_of(PAGE);
+        let at = |offset: usize| (page + offset - base) / 8;
+        mem[at(0x50)] = u64::MAX;
+        mem[at(0x58)] = 0x7f80_0000_ff80_0000;
+        mem[at(PAGE + 0x100)] = 0xfc00_fc00_7c00_7c00;
+        mem[at(PAGE + 0x108)] = u64::MAX;
+        mem[at(PAGE + 0x200)] = u64::MAX;
+        scan_empty_bounds(page + 8, 2 * PAGE - 64, "test: empty bounds");
+        let n = note((page + 0x50) as u64).expect("a note");
+        assert!(n.contains("test: empty bounds +0x50..+0x60"), "floats after -1: {n}");
+        let n = note((page + PAGE) as u64).expect("a note");
+        assert!(n.contains("test: empty bounds +0x108..+0x118"), "halves before -1: {n}");
+        assert!(!n.contains("+0x200"), "-1 alone is not one: {n}");
+        drop(mem);
     }
 
     #[test]

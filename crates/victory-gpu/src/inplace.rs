@@ -140,9 +140,22 @@ struct Sections {
 // SAFETY: a handle and a COM heap (agile), used under the lock.
 unsafe impl Send for Sections {}
 
+static SECTIONS: std::sync::LazyLock<std::sync::Mutex<Sections>> = std::sync::LazyLock::new(Default::default);
+
 fn sections() -> std::sync::MutexGuard<'static, Sections> {
-    static SECTIONS: std::sync::LazyLock<std::sync::Mutex<Sections>> = std::sync::LazyLock::new(Default::default);
     SECTIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) mod history;
+
+/// Diagnostics, for the crash report: the section page title address `at`
+/// shows, the pages it showed before, where else they were mapped and the
+/// in-place buffers placed over them ([`history`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn physical(at: u64) -> Option<String> {
+    let now = SECTIONS.try_lock().ok().map(|s| shown_now(&s.views, at));
+    history::note(at, now, PAGE)
 }
 
 /// The runtime mapped `[at, at + len)` of title memory from `offset` of a
@@ -175,6 +188,8 @@ pub fn title_memory_section(at: usize, len: usize, section: usize, handle: isize
         entry.insert(Section { handle: own, size, heap: None, view: 0 });
     }
     s.views.insert(at as u64, SectionView { len: len as u64, section, offset });
+    #[cfg(feature = "diagnostics")]
+    history::mapped(at as u64, len as u64, section, offset);
 }
 
 /// The runtime unmaps or remaps `[at, at + len)`: the section views there

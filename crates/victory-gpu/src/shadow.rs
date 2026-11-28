@@ -1092,6 +1092,8 @@ fn in_place(at: u64, n: u64) -> Option<Arc<Shadow>> {
         return Some(s.clone());
     }
     let shadow = Shadow::opened(crate::inplace::open(at, n)?);
+    #[cfg(feature = "diagnostics")]
+    crate::inplace::history::placed(&shadow);
     tracing::info!(
         start = format_args!("{:#x}", shadow.start),
         len = shadow.len,

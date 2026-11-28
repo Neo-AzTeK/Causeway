@@ -913,15 +913,23 @@ pub(crate) fn frame_done() {
 pub struct Writing {
     first: usize,
     last: usize,
+    /// Diagnostics: the bytes written, scanned once written for the empty
+    /// bounds the title faulted on, and what to call a hit in the trail.
+    #[cfg(feature = "diagnostics")]
+    scan: (usize, usize, &'static str),
 }
 
 impl Drop for Writing {
     fn drop(&mut self) {
-        let mut g = guards();
-        if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
-            g.busy.swap_remove(i);
+        {
+            let mut g = guards();
+            if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
+                g.busy.swap_remove(i);
+            }
+            changed(&mut g, self.first, self.last, false);
         }
-        changed(&mut g, self.first, self.last, false);
+        #[cfg(feature = "diagnostics")]
+        crate::trail::scan_empty_bounds(self.scan.0, self.scan.1, self.scan.2);
     }
 }
 
@@ -938,7 +946,13 @@ pub fn kernel_will_write(at: usize, len: usize) -> Writing {
     crate::trail::step_if_seen(at / PAGE, at.saturating_add(len).div_ceil(PAGE), "written by the runtime or the kernel");
     #[cfg(feature = "diagnostics")]
     crate::trail::wrote(at, len, "written by the runtime or the kernel", None);
-    writing(at, len)
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+    let mut w = writing(at, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        w.scan = (at, len, "the runtime or the kernel wrote -1 beside infinities (empty bounds)");
+    }
+    w
 }
 
 /// [`writing`] for what GPU work wrote: write-backs of host copies, and
@@ -948,7 +962,13 @@ pub(crate) fn gpu_writing(at: usize, len: usize) -> Writing {
     crate::memclass::wrote(crate::memclass::Writer::Gpu, at, len);
     #[cfg(feature = "diagnostics")]
     crate::trail::step_if_seen(at / PAGE, at.saturating_add(len).div_ceil(PAGE), "written by GPU work");
-    writing(at, len)
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+    let mut w = writing(at, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        w.scan = (at, len, "GPU work wrote -1 beside infinities (empty bounds)");
+    }
+    w
 }
 
 /// What [`kernel_will_write`] and [`gpu_writing`] do.
@@ -958,7 +978,12 @@ fn writing(at: usize, len: usize) -> Writing {
     let mut g = guards();
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
-    Writing { first, last }
+    Writing {
+        first,
+        last,
+        #[cfg(feature = "diagnostics")]
+        scan: (at, 0, ""),
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
