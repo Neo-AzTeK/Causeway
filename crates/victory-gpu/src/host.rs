@@ -2159,6 +2159,16 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // A list recorded before a remap reads the old pages through the
+        // in-place copies it holds (`crate::shadow::let_go`): how often.
+        #[cfg(feature = "diagnostics")]
+        {
+            let stale = self.deferred().in_place.values().filter(|s| s.is_let_go()).count();
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if stale > 0 && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                tracing::info!(stale, "a list submitted holds in-place copies let go since it was recorded");
+            }
+        }
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
