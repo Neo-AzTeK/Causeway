@@ -439,6 +439,75 @@ fn create_hardware_device() -> windows::core::Result<ID3D12Device> {
 
 #[cfg(test)]
 mod tests {
+    /// Groups put before the runs' own (the probe's video-memory copy)
+    /// shift every run by one: group 0 is no run, and the last run's group
+    /// comes before the read-back of the marks, which is no run either.
+    #[test]
+    fn groups_name_their_runs() {
+        use super::run_of_group;
+        // No group before the runs: group i is run i; the marks' group after.
+        assert_eq!((0..4).map(|g| run_of_group(g, 0, 3)).collect::<Vec<_>>(), [Some(0), Some(1), Some(2), None]);
+        // The probe's copy first: group i is run i - 1.
+        assert_eq!(
+            (0..5).map(|g| run_of_group(g, 1, 3)).collect::<Vec<_>>(),
+            [None, Some(0), Some(1), Some(2), None]
+        );
+    }
+
+    /// A list noting more commands than one chunk has slots: each command
+    /// is timed from its own stamp to the next, and where a slot is
+    /// missing the end stamp is not put on an earlier slot, which would
+    /// charge the rest of the list to the command there.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_long_list_times_each_command_and_charges_none_with_the_rest() {
+        use super::{STAMPS, command_ticks, end_stamp};
+        let (one, commands) = (STAMPS as usize, STAMPS as usize + 904);
+        let stamps: Vec<u64> = (0..=commands as u64).map(|i| 1000 + i * 10 + i % 7).collect();
+        // Every chunk made: the end stamp follows the last command's start.
+        assert_eq!(end_stamp(commands, 2 * one), Some(commands));
+        let ticks = command_ticks(&stamps, commands);
+        assert_eq!(ticks.len(), commands);
+        assert!(ticks.iter().all(|&(i, t)| t == stamps[i + 1] - stamps[i]));
+        // Only one chunk made: stamp `one - 1` is a command's start, not
+        // the end; that command and the later ones are not timed.
+        assert_eq!(end_stamp(commands, one), None);
+        let ticks = command_ticks(&stamps[..one], commands);
+        assert_eq!(ticks.len(), one - 1);
+        assert_eq!(ticks.last(), Some(&(one - 2, stamps[one - 1] - stamps[one - 2])));
+        // Lists that fit one chunk end as before.
+        assert_eq!(end_stamp(10, one), Some(10));
+        assert_eq!(end_stamp(one - 1, one), Some(one - 1));
+        assert_eq!(command_ticks(&stamps[..11], 10).len(), 10);
+    }
+
+    /// Stamps past one chunk land in the next one and every one is read
+    /// back, in order.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_list_stamps_past_one_chunk_and_reads_each_stamp_back() {
+        use super::{STAMPS, Stamps, host};
+        let Some(host) = host() else {
+            println!("skipped: no host GPU");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let n = STAMPS as usize + 904;
+        let mut stamps = Stamps::default();
+        for k in 0..n {
+            stamps.stamp(&host.device, &list.list, k);
+        }
+        assert_eq!(stamps.chunks.len(), 2);
+        stamps.resolve(&list.list, n);
+        list.close();
+        host.execute(&[&list]);
+        let read = stamps.read(n).unwrap();
+        assert_eq!(read.len(), n);
+        assert!(read[0] > 0, "the first stamp was resolved");
+        let back = read.windows(2).position(|w| w[0] > w[1]);
+        assert_eq!(back, None, "stamps go back at that index (chunk boundary at {})", STAMPS - 1);
+    }
+
     #[test]
     fn the_switch_echo_lists_only_ours_sorted_upper_case_and_cut() {
         let vars = [
@@ -728,12 +797,156 @@ pub(crate) struct HostList {
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
-    stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    stamps: Mutex<Stamps>,
 }
 
-/// Timestamps per list (diagnostics); commands past them are not timed.
+/// Timestamps per chunk of a list's [`Stamps`] (diagnostics).
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+
+/// A list's GPU timestamps (diagnostics, `VICTORY_GPU_TIMING`): stamp `k`
+/// is slot `k % STAMPS` of chunk `k / STAMPS`. Chunks are made as the list
+/// notes more commands and kept for its next recordings, so a list of any
+/// length times every command. Stamps are written in order from 0; once a
+/// chunk cannot be made, no later stamp is written, and a command whose end
+/// stamp is missing is not timed rather than charged with the rest of the
+/// list ([`command_ticks`]).
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Stamps {
+    /// Each chunk's query heap and its read-back buffer.
+    chunks: Vec<(ID3D12QueryHeap, ID3D12Resource)>,
+    /// A chunk could not be made: no more are tried.
+    failed: bool,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Stamps {
+    /// How many stamps have slots.
+    fn capacity(&self) -> usize {
+        self.chunks.len() * STAMPS as usize
+    }
+
+    /// Makes chunks until stamp `k` has a slot; whether it has one.
+    fn reach(&mut self, device: &ID3D12Device, k: usize) -> bool {
+        while k >= self.capacity() && !self.failed {
+            match stamp_chunk(device) {
+                Some(chunk) => self.chunks.push(chunk),
+                None => self.failed = true,
+            }
+        }
+        k < self.capacity()
+    }
+
+    /// Records stamp `k` into `list` (stamps `0..k` written before it).
+    fn stamp(&mut self, device: &ID3D12Device, list: &ID3D12GraphicsCommandList, k: usize) {
+        if self.reach(device, k) {
+            let (heap, _) = &self.chunks[k / STAMPS as usize];
+            // SAFETY: an open list and our query heap; the slot is in it.
+            unsafe { list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, (k % STAMPS as usize) as u32) };
+        }
+    }
+
+    /// Stamps `0..written` of chunk `c`, as a range of its slots.
+    fn in_chunk(c: usize, written: usize) -> usize {
+        written.saturating_sub(c * STAMPS as usize).min(STAMPS as usize)
+    }
+
+    /// Records the copy of the first `written` stamps into the read-back
+    /// buffers, at the end of `list`.
+    fn resolve(&self, list: &ID3D12GraphicsCommandList, written: usize) {
+        for (c, (heap, back)) in self.chunks.iter().enumerate() {
+            let n = Self::in_chunk(c, written);
+            if n > 0 {
+                // SAFETY: an open list, our heap and read-back buffer;
+                // slots `0..n` of this chunk were written.
+                unsafe { list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, n as u32, back, 0) };
+            }
+        }
+    }
+
+    /// The first `written` stamps, after the list that resolved them ran.
+    fn read(&self, written: usize) -> Option<Vec<u64>> {
+        let mut stamps = Vec::with_capacity(written);
+        for (c, (_, back)) in self.chunks.iter().enumerate() {
+            let n = Self::in_chunk(c, written);
+            if n == 0 {
+                break;
+            }
+            let mut data = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: n * 8 };
+            // SAFETY: a read-back buffer the finished list resolved `n`
+            // stamps into.
+            unsafe {
+                back.Map(0, Some(&range), Some(&mut data)).ok()?;
+                stamps.extend_from_slice(std::slice::from_raw_parts(data.cast::<u64>(), n));
+                back.Unmap(0, None);
+            }
+        }
+        Some(stamps)
+    }
+}
+
+/// One chunk of [`Stamps`]: a timestamp query heap of `STAMPS` slots and a
+/// read-back buffer for them.
+#[cfg(feature = "diagnostics")]
+fn stamp_chunk(device: &ID3D12Device) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(STAMPS) * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
+                &mut heap,
+            )
+            .ok()?;
+        device
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
+            .ok()?;
+    }
+    Some((heap?, back?))
+}
+
+/// Where a list of `commands` noted commands puts its end stamp, given
+/// slots for `capacity` stamps (stamp `i` is written before command `i`):
+/// right after the last command's start stamp, or nowhere when that slot
+/// is missing. Never on an earlier slot, which would end a command where
+/// it did not end.
+#[cfg(feature = "diagnostics")]
+fn end_stamp(commands: usize, capacity: usize) -> Option<usize> {
+    (commands < capacity).then_some(commands)
+}
+
+/// Each timed command's index and GPU ticks, from the stamps written for a
+/// list of `commands` noted commands: command `i` runs from stamp `i` to
+/// stamp `i + 1` (the next command's start, or the end stamp). A command
+/// whose end stamp was not written is not timed.
+#[cfg(feature = "diagnostics")]
+fn command_ticks(stamps: &[u64], commands: usize) -> Vec<(usize, u64)> {
+    (0..commands)
+        .take_while(|&i| i + 1 < stamps.len())
+        .map(|i| (i, stamps[i + 1].saturating_sub(stamps[i])))
+        .collect()
+}
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -991,7 +1204,7 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
-                stamps: OnceLock::new(),
+                stamps: Mutex::default(),
             })
         }
     }
@@ -1151,7 +1364,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let to_video = [crate::vramcopy::list(&self.device)];
         #[cfg(feature = "diagnostics")]
-        if to_video[0].is_some() {
+        let lead = usize::from(to_video[0].is_some());
+        #[cfg(not(feature = "diagnostics"))]
+        let lead = 0;
+        #[cfg(feature = "diagnostics")]
+        if lead > 0 {
             groups.insert(0, &to_video);
         }
         // Last: the written-pages bitmaps the lists marked, read back.
@@ -1203,19 +1420,24 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            let run = run_of_group(i, lead, runs.len());
             #[cfg(feature = "diagnostics")]
-            if each && i < runs.len() && started.elapsed() > std::time::Duration::from_millis(50) {
+            if let Some(r) = run.filter(|_| each && started.elapsed() > std::time::Duration::from_millis(50)) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let commands = runs[r].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
+                let (slowest, untimed) = runs[r].slowest(frequency, 6);
+                for (ms, op) in slowest {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                }
+                if untimed > 0 {
+                    tracing::warn!(untimed, "slow list: commands not timed (no timestamp slot could be made)");
                 }
             }
             // SAFETY: a plain query.
-            if groups.len() > 1 && i < runs.len() && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                removed_in = Some(i);
+            if groups.len() > 1 && run.is_some() && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                removed_in = run;
             }
             let _ = (i, started);
         }
@@ -1578,80 +1800,26 @@ impl Host {
 }
 
 impl HostList {
-    /// The timestamp heap and its read-back buffer (diagnostics, timing on).
-    #[cfg(feature = "diagnostics")]
-    fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
-            return None;
-        }
-        self.stamps
-            .get_or_init(|| {
-                let device = &host()?.device;
-                let mut heap: Option<ID3D12QueryHeap> = None;
-                let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                };
-                // SAFETY: plain object creation.
-                unsafe {
-                    device
-                        .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
-                            &mut heap,
-                        )
-                        .ok()?;
-                    device
-                        .CreateCommittedResource(
-                            &readback,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            None,
-                            &mut back,
-                        )
-                        .ok()?;
-                }
-                Some((heap?, back?))
-            })
-            .as_ref()
-    }
-
     /// The noted commands that took longest on the GPU, longest first, as
-    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    /// (milliseconds, text), and how many noted commands were not timed
+    /// (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
-    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+    fn slowest(&self, frequency: u64, n: usize) -> (Vec<(f64, String)>, usize) {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
-            return Vec::new();
+        let stamps = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
+        let written = (notes.len() + 1).min(stamps.capacity());
+        let Some(read) = stamps.read(written) else {
+            return (Vec::new(), notes.len());
         };
-        let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
-        // SAFETY: a read-back buffer the finished list resolved into.
-        let stamps: Vec<u64> = unsafe {
-            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
-                return Vec::new();
-            }
-            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
-            back.Unmap(0, None);
-            s
-        };
-        let mut times: Vec<(f64, String)> = (0..count)
-            .map(|i| {
-                let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
-            })
+        let ticks = command_ticks(&read, notes.len());
+        let untimed = notes.len() - ticks.len();
+        let mut times: Vec<(f64, String)> = ticks
+            .into_iter()
+            .map(|(i, t)| (t as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect()))
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
         times.truncate(n);
-        times
+        (times, untimed)
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
@@ -1678,13 +1846,15 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
-        if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
-            // SAFETY: an open list, our heap and read-back buffer.
-            unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+        if timing() && let Some(host) = host() {
+            let commands = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let mut stamps = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
+            stamps.reach(&host.device, commands);
+            if let Some(end) = end_stamp(commands, stamps.capacity()) {
+                stamps.stamp(&host.device, &self.list, end);
             }
+            let written = (commands + 1).min(stamps.capacity());
+            stamps.resolve(&self.list, written);
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -1915,10 +2085,9 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            if timing() && let Some(host) = host() {
+                self.stamps.lock().unwrap_or_else(|e| e.into_inner()).stamp(&host.device, &self.list, at);
             }
             let what = what();
             traced(&what);
@@ -3356,6 +3525,13 @@ fn traced(what: &str) {
     if hashes.iter().any(|h| what.contains(h.as_str())) && LOGGED.fetch_add(1, Ordering::Relaxed) < 500 {
         tracing::info!("traced command: {what}");
     }
+}
+
+/// The run whose lists submission group `group` holds, when `lead` groups
+/// that are no run go before the runs' own (the probe's video-memory copy)
+/// and others may follow them (the read-back of the marks).
+fn run_of_group(group: usize, lead: usize, runs: usize) -> Option<usize> {
+    group.checked_sub(lead).filter(|&run| run < runs)
 }
 
 /// Diagnostics, `VICTORY_GPU_TIMING`: every command of the list during
