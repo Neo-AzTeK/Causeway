@@ -129,6 +129,18 @@ impl Viewed {
         }
     }
 
+    /// The title slots viewing a copy the runtime let go before remapping
+    /// its memory (`crate::shadow::let_go`).
+    pub(crate) fn let_go_slots(&self) -> Vec<u32> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .slots
+            .iter()
+            .filter(|(_, seen)| matches!(seen, Seen::Buffer(copy, ..) if copy.is_let_go()))
+            .map(|(&index, _)| index)
+            .collect()
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     fn ranges(&self) -> Vec<Hull> {
