@@ -3918,6 +3918,7 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        let off = self.linear_memory(b, &inst.fields);
         if matches!(inst.fields, Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }) {
             self.mark_reads((b, i));
         }
@@ -3948,15 +3949,16 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } => Err("flat memory"),
         };
         match r {
-            Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Ok(()) => {}
+            Err(why) if effect => return Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
-                Ok(())
             }
         }
+        self.linear_memory_end(off, inst);
+        Ok(())
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {

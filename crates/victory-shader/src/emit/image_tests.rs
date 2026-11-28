@@ -70,7 +70,25 @@ pub(super) fn translate_host(
     group: (bool, u32, u32),
     host: (bool, bool),
 ) -> Result<HostShader, ShaderError> {
-    translate_form(body, view, group, host, false)
+    translate_form(body, view, group, host, Form::Any)
+}
+
+/// The forms [`translate_form`] may make: the first that runs on waves of
+/// 32, as `emit` chooses; the halves on their own conditions only; the
+/// halves following the console's wave only.
+#[derive(Clone, Copy, PartialEq)]
+enum Form {
+    Any,
+    Halves,
+    Together,
+}
+
+/// A wave64 compute program of `threads` threads made only with its two
+/// host waves on their own conditions, never following the console's wave
+/// together: what the halves alone make of it.
+pub(super) fn translate_halves(body: &[u32], threads: u32) -> Result<HostShader, ShaderError> {
+    let view = (ResourceType::Srv, 8, 0);
+    translate_form(body, view, (true, threads, 1), (true, false), Form::Halves)
 }
 
 /// A wave64 compute program of `threads` threads in the form whose two host
@@ -78,7 +96,7 @@ pub(super) fn translate_host(
 /// whatever the other forms make of it.
 pub(super) fn translate_together(body: &[u32], threads: u32) -> Result<HostShader, ShaderError> {
     let view = (ResourceType::Srv, 8, 0);
-    translate_form(body, view, (true, threads, 0), (true, false), true)
+    translate_form(body, view, (true, threads, 0), (true, false), Form::Together)
 }
 
 fn translate_form(
@@ -86,7 +104,7 @@ fn translate_form(
     view: (ResourceType, u8, u32),
     group: (bool, u32, u32),
     (min_lod_clamp, wave64_native): (bool, bool),
-    only_together: bool,
+    form: Form,
 ) -> Result<HostShader, ShaderError> {
     let (wave64, threads, lds) = group;
     let (image, dwords, stride) = view;
@@ -151,14 +169,15 @@ fn translate_form(
             wave64_native,
         })
     };
-    let mut lowered = if only_together {
+    let mut lowered = if form == Form::Together {
         lower_as(&super::together(&native, &p).expect("one wave per group")?)?
     } else {
         lower_as(&st)?
     };
     // The last retry of `emit_with` (its skip retry has its own tests).
     let needs64 = |dxil: &[u8]| super::required_waves(dxil).is_some_and(|(least, _)| least > 32);
-    if !wave64_native
+    if form == Form::Any
+        && !wave64_native
         && needs64(&lowered.dxil)
         && let Some(Ok(together)) = super::together(&native, &p)
     {

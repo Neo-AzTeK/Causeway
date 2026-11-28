@@ -3,7 +3,8 @@
 
 use super::host::{Host, Stride, View};
 use super::image_tests::{
-    build, check, run, run_on, translate, translate_group, translate_together, translate_with,
+    build, check, run, run_on, translate, translate_group, translate_halves, translate_together,
+    translate_with,
 };
 use crate::native::ResourceType;
 
@@ -846,7 +847,21 @@ fn a_mask_set_to_a_constant_then_a_compare_joins_in_wave64() {
 fn two_halves_with_lds(body: &[u32], threads: u32) -> Option<Vec<u32>> {
     let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
     let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, threads, 1).unwrap();
-    check(&shader);
+    stored_by_halves(&shader, threads)
+}
+
+/// [`two_halves_with_lds`] with the halves on their own conditions only
+/// (never following the console's wave together).
+fn halves_alone_with_lds(body: &[u32], threads: u32) -> Option<Vec<u32>> {
+    let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
+    let shader = translate_halves(&words, threads).unwrap();
+    stored_by_halves(&shader, threads)
+}
+
+/// What each of `threads` threads of `shader` stored, which must ask the
+/// host for waves of 32, on hardware with such waves.
+fn stored_by_halves(shader: &super::HostShader, threads: u32) -> Option<Vec<u32>> {
+    check(shader);
     assert_eq!(
         crate::emit::required_waves(&shader.dxil),
         Some((32, 32)),
@@ -859,7 +874,7 @@ fn two_halves_with_lds(body: &[u32], threads: u32) -> Option<Vec<u32>> {
     }
     let dummy = [[0.0f32; 4]];
     let views = [View::Texture(1, 1, &dummy), View::RawUav(threads.max(64))];
-    let mut out = run_on(&shader, &views, &[("hardware", false)]);
+    let mut out = run_on(shader, &views, &[("hardware", false)]);
     Some(out.remove(0).1.remove(0)[..threads as usize].to_vec())
 }
 
@@ -1457,24 +1472,21 @@ fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
     }
 }
 
-/// [`a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop`] with a
-/// scalar load where only some waves go, which keeps the halves from
-/// following the console's wave (module `linear`), as in the console's
-/// structure builder: each lane on its own conditions.
+/// [`a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop`] with
+/// the halves on their own conditions (not following the console's wave), as
+/// in the console's structure builder when it took that form: each lane on
+/// its own conditions.
 #[test]
 fn a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own() {
-    let (body, want) = wave_prefix(&[
-        0xF408_0B02,
-        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20 (unused)
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    ]);
-    if let Some(got) = two_halves_with_lds(&body, 256) {
+    let (body, want) = wave_prefix(&[]);
+    if let Some(got) = halves_alone_with_lds(&body, 256) {
         assert_eq!(got, want);
     }
 }
 
 /// [`a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own`]
-/// with the sum kept in v11 (no first-lane read in the loop) and odd lanes
+/// (the halves on their own) with the sum kept in v11 (no first-lane read in
+/// the loop) and odd lanes
 /// going round once more (to their own wave's total), then a first-lane read
 /// of the sum after the loop: the halves exchange there, and the console's
 /// first lane (an even one) gives every lane the sum of the waves before its
@@ -1482,9 +1494,6 @@ fn a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own() {
 #[test]
 fn a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane() {
     let (mut body, want) = wave_prefix(&[
-        0xF408_0B02,
-        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20 (unused)
-        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         0x3614_0081, // v_and_b32 v10, 1, v0
         0x4A14_0F0A, // v_add_nc_u32 v10, v10, v7
     ]);
@@ -1501,17 +1510,43 @@ fn a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane() {
         0x7E3C_050B, // v_readfirstlane_b32 s30, v11
         0x7E10_021E, // v_mov_b32 v8, s30
     ]);
-    if let Some(got) = two_halves_with_lds(&body, 256) {
+    if let Some(got) = halves_alone_with_lds(&body, 256) {
         assert_eq!(got, want);
     }
 }
 
 /// The loop of [`a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane`]
-/// alone: its first-lane read is not taken per host wave, since each half
-/// would carry its own last result out of a loop its lanes leave apart; the
-/// exchange it needs cannot be in a loop, so the program asks for waves of 64.
+/// alone, the halves on their own: its first-lane read is not taken per host
+/// wave, since each half would carry its own last result out of a loop its
+/// lanes leave apart; the exchange it needs cannot be in a loop there, so
+/// that form asks for waves of 64.
 #[test]
 fn a_first_lane_read_in_a_loop_lanes_leave_apart_is_not_taken_per_half() {
+    let (mut body, _) = wave_prefix(&[
+        0x3614_0081, // v_and_b32 v10, 1, v0
+        0x4A14_0F0A, // v_add_nc_u32 v10, v10, v7
+    ]);
+    let exit = body.iter().position(|&w| w == 0x7DA4_0E12).unwrap();
+    body[exit] = 0x7DA4_1412; // v_cmpx_eq_u32 s18, v10
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_halves(&words, 256).unwrap();
+    assert_eq!(
+        crate::emit::required_waves(&shader.dxil),
+        Some((64, 64)),
+        "{:?}",
+        shader.wave64_why
+    );
+}
+
+/// The loop of [`a_first_lane_read_in_a_loop_lanes_leave_apart_is_not_taken_per_half`]
+/// with a scalar load in the block the first console wave skips: the halves
+/// on their own refuse it, so the group runs every block, the first wave off
+/// in that one (module `linear`), its load not made. Each lane's first-lane
+/// read is the console's; even lanes leave with the sum of the waves before
+/// their own, odd lanes, a round later, with their own wave's total added;
+/// the first wave stores 0.
+#[test]
+fn a_first_lane_read_in_a_loop_lanes_leave_apart_and_a_load_take_both_halves_together() {
     let (mut body, _) = wave_prefix(&[
         0xF408_0B02,
         0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20 (unused)
@@ -1522,13 +1557,20 @@ fn a_first_lane_read_in_a_loop_lanes_leave_apart_is_not_taken_per_half() {
     let exit = body.iter().position(|&w| w == 0x7DA4_0E12).unwrap();
     body[exit] = 0x7DA4_1412; // v_cmpx_eq_u32 s18, v10
     let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
-    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 256, 1).unwrap();
     assert_eq!(
-        crate::emit::required_waves(&shader.dxil),
+        crate::emit::required_waves(&translate_halves(&words, 256).unwrap().dxil),
         Some((64, 64)),
-        "{:?}",
-        shader.wave64_why
+        "the halves on their own"
     );
+    let want: Vec<u32> = (0..256u32)
+        .map(|t| match t / 64 {
+            0 => 0,
+            w => (0..w + t % 2).map(|j| 10 + j).sum(),
+        })
+        .collect();
+    if let Some(got) = two_halves_with_lds(&body, 256) {
+        assert_eq!(got, want);
+    }
 }
 
 /// A value a loop's head writes from its counter, with the upper 32 lanes
