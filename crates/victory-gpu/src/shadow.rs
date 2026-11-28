@@ -663,25 +663,37 @@ impl Shadow {
 
     /// Whether [`Shadow::update`] of `[address, address + len)` has anything
     /// to copy: a page there changed since it was taken, or the memory is not
-    /// tracked (copied whole each time).
+    /// tracked (copied whole each time). Used in place: a page there that a
+    /// disk load left without bytes (the GPU would read what the page held).
     pub(crate) fn stale(&self, address: usize, len: usize) -> bool {
-        if self.in_place.is_some() {
-            return false;
-        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
+        if self.in_place.is_some() {
+            return from < to && crate::watch::lazy_within(from, to - from);
+        }
         from < to && self.tracked.as_ref().is_none_or(|t| t.any_changed(from, to))
     }
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
+    ///
+    /// Used in place, nothing is copied: the pages there that disk loads
+    /// left without bytes take them, as a host copy's update reads them
+    /// from their loads (`host::read`). The GPU reads such a page through
+    /// the section without faulting, so it would see what the page held
+    /// before the load, and a later fill would cover what it wrote. The
+    /// ranges heap-indexed views and the page table reach come this way
+    /// only, at submission.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        if self.in_place.is_some() {
-            return 0;
-        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
+        if self.in_place.is_some() {
+            if from < to {
+                crate::watch::fill_lazy(from, to - from);
+            }
+            return 0;
+        }
         if from >= to {
             return 0;
         }

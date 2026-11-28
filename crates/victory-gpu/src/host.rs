@@ -1335,9 +1335,21 @@ impl Host {
         // list's lock at a time: a submission may name a list twice.
         let lending = {
             let mut let_go: Vec<InPlaceUse> = Vec::new();
+            let mut used: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 let deferred = list.deferred();
                 let_go.extend(deferred.in_place.values().filter(|(s, _)| s.is_let_go()).cloned());
+                used.extend(deferred.in_place.values().flat_map(|(s, ranges)| {
+                    ranges.iter().map(|&(at, n)| (at as usize, n.min(s.left(at)) as usize))
+                }));
+            }
+            // Pages of the in-place ranges the lists use that disk loads
+            // left without bytes since the lists were recorded (filled then,
+            // `Shadow::refresh`) take their bytes, as host copies read them
+            // at submission: the GPU reads such a page without faulting.
+            // Outside the list locks: a fill may read the disk.
+            for (at, n) in used {
+                crate::watch::fill_lazy(at, n);
             }
             crate::inplace::lend(let_go.iter().map(|(s, r)| (&**s, r)))
         };

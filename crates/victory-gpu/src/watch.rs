@@ -508,6 +508,15 @@ pub(crate) fn read_lazy(src: usize, dst: *mut u8, len: usize) -> bool {
     true
 }
 
+/// Whether a page of `[at, at + len)` is one a disk load left without
+/// bytes (not filled yet).
+pub(crate) fn lazy_within(at: usize, len: usize) -> bool {
+    if crate::ledger::bytes(crate::ledger::Owner::LazyPages) <= 0 {
+        return false;
+    }
+    guards().lazy.range(at / PAGE..at.saturating_add(len).div_ceil(PAGE)).next().is_some()
+}
+
 /// Fills the pages of `[at, at + len)` disk loads left without bytes: the
 /// GPU is about to read that memory where it lies (copies used in place,
 /// `crate::inplace`).

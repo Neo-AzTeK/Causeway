@@ -1241,6 +1241,72 @@ mod tests {
         assert_eq!(pages.page_byte(1, 256), 0x22, "the old page keeps its bytes");
     }
 
+    /// A disk load's bytes, all `0x77`.
+    struct Loaded;
+
+    impl crate::lazy::Source for Loaded {
+        fn size(&self) -> usize {
+            Pages::P
+        }
+        fn whole(&self) -> bool {
+            false
+        }
+        fn read(&self, _: usize, out: &mut [u8]) -> bool {
+            out.fill(0x77);
+            true
+        }
+    }
+
+    /// A list recorded over a title page used in place, submitted after a
+    /// disk load left that page without bytes (filled on access): the GPU,
+    /// which reads the page without faulting, reads the load's bytes, as a
+    /// host copy's refresh at submission would.
+    #[test]
+    fn a_page_loaded_after_the_list_was_recorded_is_filled_before_it_runs() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let pages = Pages::new(1);
+        pages.map(0, 0);
+        let Some((list, _copy, _out, out_data, _src)) = record_over(host, &pages, &[0], &[]) else {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        };
+        let load = crate::lazy::Load::new(Box::new(Loaded));
+        assert!(crate::watch::title_memory_lazy(&load, pages.slot(0) as usize, 0), "left without bytes");
+        host.execute(&[&list]);
+        // SAFETY: inside the host buffer; the GPU finished.
+        assert_eq!(unsafe { *out_data }, 0x77, "read the load's bytes");
+        assert_eq!(pages.page_byte(0, 0), 0x77, "the page holds them");
+    }
+
+    /// A range a submission brings up to date (heap-indexed views, the page
+    /// table) over a copy used in place, where a disk load left a page
+    /// without bytes: stale, and its update fills the page.
+    #[test]
+    fn an_update_in_place_fills_a_page_left_without_bytes() {
+        if crate::host::host().is_none() {
+            eprintln!("skipped: no host GPU");
+            return;
+        }
+        let pages = Pages::new(1);
+        pages.map(0, 0);
+        let copy = crate::shadow::find(pages.slot(0), 512).expect("a copy");
+        if copy.placed_run().is_none() {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        }
+        let at = pages.slot(0) as usize;
+        assert!(!copy.stale(at, 256), "nothing to bring up to date");
+        let load = crate::lazy::Load::new(Box::new(Loaded));
+        assert!(crate::watch::title_memory_lazy(&load, at, 0), "left without bytes");
+        assert!(copy.stale(at + 16, 256), "a page left without bytes");
+        assert_eq!(copy.update(at + 16, 256), 0, "nothing copied");
+        assert!(!copy.stale(at, 256), "filled");
+        assert_eq!(pages.page_byte(0, 0), 0x77, "the page holds the load's bytes");
+    }
+
     /// One section page used in place at two addresses by one list, the
     /// first unmapped and the second mapped to another page before the
     /// submission: the read at the second address sees the new page, in
