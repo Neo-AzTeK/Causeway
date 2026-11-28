@@ -1001,9 +1001,6 @@ pub(crate) fn gpu_wrote(at: usize, len: usize) {
         crate::memclass::wrote(crate::memclass::Writer::Gpu, at, len);
         crate::trail::step_if_seen(first, last, "written by GPU work in place");
         crate::trail::wrote(at, kept, "written by GPU work in place", None);
-        if crate::trail::scan_in_place() {
-            crate::trail::scan_empty_bounds(at, kept, "GPU work in place left -1 beside infinities (empty bounds)");
-        }
     }
     // Opening their guarded pages cost ~6000 protection changes a world
     // frame (rb-h12-1).

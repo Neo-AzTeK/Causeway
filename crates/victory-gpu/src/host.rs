@@ -1357,6 +1357,23 @@ impl Host {
             }
             crate::inplace::lend(let_go.iter().map(|(s, r)| (&**s, r)))
         };
+        // The ranges the lists' shaders write in place, each once
+        // (marked written once they have run).
+        let written_in_place: Vec<(u64, u64)> = runs
+            .iter()
+            .flat_map(|l| l.deferred().in_place_written.iter().copied().collect::<Vec<_>>())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // Diagnostics (`VICTORY_PROBE_EMPTY_BOUNDS`): the empty bounds those
+        // ranges hold before the lists run; those found after and not
+        // before appeared while they ran.
+        #[cfg(feature = "diagnostics")]
+        let bounds_before: Vec<Vec<usize>> = if crate::trail::scan_in_place() {
+            written_in_place.iter().map(|&(at, len)| crate::trail::empty_bounds(at as usize, (len as usize).min(1 << 20))).collect()
+        } else {
+            Vec::new()
+        };
         // Last before the lists run: every texture they reach is raised by
         // now (`resource::residency`).
         #[cfg(feature = "diagnostics")]
@@ -1505,10 +1522,18 @@ impl Host {
         // copy or a texture over another mapping of them): a copy-back
         // marks its writes so, and the console's caches see the memory.
         // Each range once, outside the list locks.
-        let written_in_place: std::collections::BTreeSet<(u64, u64)> =
-            runs.iter().flat_map(|l| l.deferred().in_place_written.iter().copied().collect::<Vec<_>>()).collect();
-        for (at, len) in written_in_place {
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+        for (i, &(at, len)) in written_in_place.iter().enumerate() {
             crate::watch::gpu_wrote(at as usize, len as usize);
+            #[cfg(feature = "diagnostics")]
+            if let Some(before) = bounds_before.get(i) {
+                crate::trail::scan_new_empty_bounds(
+                    at as usize,
+                    (len as usize).min(1 << 20),
+                    before,
+                    "-1 beside infinities (empty bounds) appeared while GPU work wrote in place",
+                );
+            }
         }
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
