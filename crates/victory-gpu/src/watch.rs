@@ -991,20 +991,23 @@ pub(crate) fn gpu_wrote(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // The ranges are what lists declare (up to a whole copy), most of it
+    // not written; diagnostics keep as much as a root view declares
+    // (1 MiB): whole ranges cost ~80 ms of copying back a world frame
+    // (rb-h12b-3).
     #[cfg(feature = "diagnostics")]
     {
+        let kept = len.min(1 << 20);
         crate::memclass::wrote(crate::memclass::Writer::Gpu, at, len);
         crate::trail::step_if_seen(first, last, "written by GPU work in place");
-        crate::trail::wrote(at, len, "written by GPU work in place", None);
+        crate::trail::wrote(at, kept, "written by GPU work in place", None);
+        if crate::trail::scan_in_place() {
+            crate::trail::scan_empty_bounds(at, kept, "GPU work in place left -1 beside infinities (empty bounds)");
+        }
     }
-    // The ranges are what lists declare (up to a whole copy), most of it
-    // not written: opening their guarded pages cost ~6000 protection
-    // changes a world frame (rb-h12-1).
+    // Opening their guarded pages cost ~6000 protection changes a world
+    // frame (rb-h12-1).
     changed_in(&mut guards(), first, last, false, false);
-    // Scanned as far as a root view declares (1 MiB): bigger ranges are
-    // whole buffers the shaders write a part of.
-    #[cfg(feature = "diagnostics")]
-    crate::trail::scan_empty_bounds(at, len.min(1 << 20), "GPU work in place wrote -1 beside infinities (empty bounds)");
 }
 
 /// Diagnostics: the other addresses (page starts) the title shows the page

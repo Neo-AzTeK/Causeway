@@ -153,6 +153,15 @@ fn infinities(q: u64) -> bool {
     halves || floats
 }
 
+/// Whether ranges GPU work may have written in place are scanned too
+/// (`VICTORY_PROBE_EMPTY_BOUNDS=1`): the scan reads each declared range
+/// after every submission, and a hit says the bounds lie in the range, not
+/// that this work wrote them.
+pub(crate) fn scan_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PROBE_EMPTY_BOUNDS").is_ok_and(|v| v == "1"))
+}
+
 /// After a write that `what` names into `[at, at + len)` (pages [`wrote`]
 /// keeps at most): the first quadword of -1 beside one of infinities in
 /// each page, the empty bounds the title faulted on reading as a pointer,
