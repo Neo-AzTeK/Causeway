@@ -165,14 +165,12 @@ pub(crate) fn sync_heaps() {
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
             continue;
         };
         let step = u64::from(step);
         // Slots over in-place copies a remap let go: made again, wherever
-        // their page lies.
+        // their page lies, also in heaps whose writes are not tracked.
         let remade = host.remake_let_go(|index| start + u64::from(index) * step);
         #[cfg(feature = "diagnostics")]
         if remade > 0 {
@@ -183,6 +181,9 @@ pub(crate) fn sync_heaps() {
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = remade;
+        let Some(written) = &heap.written else {
+            continue;
+        };
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.

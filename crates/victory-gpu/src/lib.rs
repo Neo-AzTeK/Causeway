@@ -90,6 +90,14 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::title_memory_section;
+
+/// Reads title memory at `src` into `dst` without faulting: false if a page
+/// of it is not readable (pages disk loads left without bytes are read from
+/// their loads).
+#[cfg(windows)]
+pub fn read_title_memory(src: *const u8, dst: &mut [u8]) -> bool {
+    host::read_into(src, dst)
+}
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, memory_kind, title_memory_aliased, title_memory_freed, title_memory_lazy, title_memory_remapped,

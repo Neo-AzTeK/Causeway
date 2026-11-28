@@ -218,7 +218,8 @@ fn run(views: &std::collections::BTreeMap<u64, SectionView>, at: u64, n: u64) ->
 }
 
 /// The heap of section `id`, opened on first use. Devices open committed
-/// sections under 4 GiB (probe `sections_the_device_opens`); the runtime
+/// sections under 4 GiB, by handle and by address alike (probe
+/// `sections_the_device_opens`); the runtime
 /// makes physical-page sections so where the host can commit them.
 ///
 /// Opened by address over a view of the whole section that we map and keep,
@@ -868,8 +869,18 @@ mod tests {
             assert!(!h.is_null(), "{what}: no section");
             // SAFETY: a live section handle.
             let heap: windows::core::Result<ID3D12Heap> = unsafe { device.OpenExistingHeapFromFileMapping(windows::Win32::Foundation::HANDLE(h)) };
-            eprintln!("{what}: {:?}", heap.as_ref().map(|_| "opened").map_err(|e| e.message()));
+            eprintln!("{what}, by handle: {:?}", heap.as_ref().map(|_| "opened").map_err(|e| e.message()));
             drop(heap);
+            // The runtime's path: a view of ours, opened by address.
+            let mut s = super::Section { handle: windows::Win32::Foundation::HANDLE(h), size, heap: None, view: 0 };
+            let heap = super::section_view_heap(&device, &mut s);
+            eprintln!("{what}, by address: {:?}", heap.as_ref().map(|_| "opened").map_err(|e| e.message()));
+            drop(heap);
+            if s.view != 0 {
+                use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+                // SAFETY: the probe's own view, its heap released.
+                unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: s.view as *mut _ }) };
+            }
             // SAFETY: our handle.
             unsafe { CloseHandle(h) };
         }

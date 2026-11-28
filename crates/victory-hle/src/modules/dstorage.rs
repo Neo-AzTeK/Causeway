@@ -1281,16 +1281,21 @@ fn into_destination(
     Err(E_INVALIDARG)
 }
 
-/// A page destination's list of page numbers as it is now.
+/// A page destination's list of page numbers as it is now; None where a
+/// page of it cannot be read.
 fn page_list(request: &Request) -> Option<Vec<usize>> {
     if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
         return None;
     }
     // The destination's size, as the title gives it: read before `execute`
-    // checks the request, a source size could reach past the list.
-    let count = ((request.page_offset & 0xffff) as usize + request.destination_size as usize).div_ceil(PAGE);
-    // SAFETY: the title passes a page number per 64 KiB of destination.
-    Some(unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), count) }.to_vec())
+    // checks the request, a source size could reach past the list. Read
+    // without faulting: a list sized to less than that ends the read here,
+    // not the worker.
+    let count = ((request.page_offset & 0xffff) as usize).checked_add(request.destination_size as usize)?.div_ceil(PAGE);
+    let mut list = vec![0usize; count];
+    // SAFETY: the bytes of our own vector, `count` page numbers long.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(list.as_mut_ptr().cast::<u8>(), count * size_of::<usize>()) };
+    victory_gpu::read_title_memory(request.destination.cast(), bytes).then_some(list)
 }
 
 /// The title wrote a request's page list while the request ran: the bytes
