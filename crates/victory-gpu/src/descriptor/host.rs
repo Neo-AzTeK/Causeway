@@ -49,6 +49,9 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
+    /// [`crate::shadow::let_go_count`] when the slots over copies let go were
+    /// last made again ([`HostHeap::remake_let_go`]).
+    let_go_seen: std::sync::atomic::AtomicU64,
     /// Where the search for free dynamic slots starts, which are taken (by
     /// lists not yet reset, pairs, pool slots), and where the search from
     /// the range's top end down starts.
@@ -376,6 +379,7 @@ impl HostHeap {
                 from_queue: Default::default(),
             }),
             kept: Mutex::new(vec![None; total as usize]),
+            let_go_seen: std::sync::atomic::AtomicU64::new(0),
             next: Mutex::new((0, vec![false; extra as usize], extra.saturating_sub(1))),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: if sampler { total } else { total - NULL_VIEWS },
@@ -1029,6 +1033,65 @@ impl HostHeap {
             crate::copystat::made(making.1, making.0.elapsed().as_micros() as u64);
         }
         Some(view)
+    }
+
+    /// Makes again, from their records at `handle(index)`, the title slots
+    /// whose view was made over an in-place copy the runtime has let go
+    /// since the last call (`crate::shadow::let_go`, before it remaps that
+    /// memory): their buffer shows the section's old pages, so a shader
+    /// writing through the slot would write memory now mapped elsewhere.
+    /// Made again, the view takes the copy of what the address shows now;
+    /// a slot whose record is no longer a view (or no longer readable) goes
+    /// null. Returns how many were made again or null. A scan of the slots
+    /// viewing title memory, only after a remap let a copy go.
+    ///
+    /// shortcut: a slot made while its copy is let go on another thread
+    /// may be listed (`crate::bindless`) with the copy found after, which
+    /// is not let go: `seen` looks the copy up again. It takes one title
+    /// thread writing a view of a section view another one unmaps.
+    pub(crate) fn remake_let_go(&self, handle: impl Fn(u32) -> u64) -> usize {
+        use std::sync::atomic::Ordering::AcqRel;
+        let now = crate::shadow::let_go_count();
+        if self.let_go_seen.swap(now, AcqRel) == now {
+            return 0;
+        }
+        let mut made = 0;
+        for index in self.viewed.let_go_slots() {
+            if index >= self.title_count {
+                continue;
+            }
+            let at = handle(index);
+            // A heap page the title unmapped holds no record: the slot goes
+            // null, as one whose record is no longer a view ([`make_slot`]
+            // makes it null when its key names a record).
+            let mut record = [0u32; 3];
+            // SAFETY: room for the 12 bytes asked for.
+            let readable = crate::host::read_into(at as *const u8, unsafe { std::slice::from_raw_parts_mut(record.as_mut_ptr().cast(), 12) });
+            let live = readable && record[0] == VIEW_TAG && view_at(record[1], record[2]).is_some();
+            if live {
+                // The same record: made again only with its key forgotten.
+                self.made.lock().unwrap_or_else(|e| e.into_inner()).keys[index as usize] = 0;
+                self.make_slot(index, at, false, false);
+            } else {
+                // The host resource goes with the view (`keep`), before a
+                // pool slot is given back.
+                if let Some(slot) = self.slot_of(index, false) {
+                    self.keep(slot, None);
+                }
+                if readable {
+                    self.make_slot(index, at, false, false);
+                } else if let Some(slot) = self.slot_of(index, false) {
+                    self.made.lock().unwrap_or_else(|e| e.into_inner()).keys[index as usize] = 0;
+                    self.make_null(slot);
+                    self.note_address(slot, None);
+                    self.unmap(index);
+                }
+                // No longer viewing the copy let go.
+                self.viewed.set(index, None, false);
+            }
+            made += 1;
+        }
+        made
     }
 
     /// [`HostHeap::mirror`] of title slots `[first, last)` (their records at
@@ -2942,5 +3005,87 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A slot made over memory the GPU uses in place, which the runtime then
+    /// remaps (it lets the copy go first): made again before the next
+    /// submission, over a copy of what the address shows now, not the
+    /// section's old pages (a shader writing through the old one wrote
+    /// memory mapped elsewhere since).
+    #[test]
+    fn a_slot_over_memory_remapped_is_made_again() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
+            UnmapViewOfFile,
+        };
+        if host().is_none() {
+            eprintln!("skipped: no host GPU");
+            return;
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // A committed pagefile view, as the runtime maps physical pages.
+        let len = 2usize << 20;
+        // SAFETY: a pagefile section mapped once; the view keeps it.
+        let at = unsafe {
+            let section =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let at = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            CloseHandle(section);
+            assert_ne!(at, 0);
+            at
+        };
+        let mut slots = vec![[0u32; 8]; 4];
+        let base = slots.as_mut_ptr() as u64;
+        let handle = |i: u32| base + u64::from(i) * 32;
+        // Four 16-byte elements in the view.
+        let address = (at + 0x1000) as u64;
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, 64);
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2]) = (1, 0x1688);
+        (desc[4], desc[6], desc[7]) = (1, 4, 16);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        crate::inplace::FORM.set(Some(crate::caps::ExistingHeaps::Part));
+        super::super::record(handle(1), View::Placed(false, resource, desc));
+        heap.sync(0, 4, handle);
+        // The host resource the slot views, and the copy holding the view.
+        let viewed = |heap: &HostHeap| heap.kept.lock().unwrap()[1].as_ref().map(|k| windows::core::Interface::as_raw(&k.0) as usize);
+        let (copy, _) = crate::shadow::for_view(address + 16, 64, 16).expect("a copy");
+        if !copy.in_place() {
+            crate::inplace::FORM.set(None);
+            eprintln!("skipped: the device does not open title memory in place");
+            return;
+        }
+        assert_eq!(viewed(&heap), Some(windows::core::Interface::as_raw(&copy.buffer) as usize), "the slot views it");
+        assert_eq!(heap.remake_let_go(handle), 0, "nothing let go yet");
+        // The runtime is about to remap the view.
+        crate::shadow::let_go(at as u64, len as u64);
+        assert_eq!(heap.remake_let_go(handle), 1, "the slot over it is made again");
+        let (now, _) = crate::shadow::for_view(address + 16, 64, 16).expect("a copy");
+        crate::inplace::FORM.set(None);
+        assert!(!std::sync::Arc::ptr_eq(&copy, &now) && !now.is_let_go());
+        assert_eq!(viewed(&heap), Some(windows::core::Interface::as_raw(&now.buffer) as usize), "the slot views what the address shows now");
+        assert!(heap.viewed.let_go_slots().is_empty());
+        assert_eq!(heap.remake_let_go(handle), 0, "nothing new let go");
+        // Remade over the view in place again. The title clears the slot
+        // (its record is no longer a view), then the view is let go: the
+        // slot goes null, not left over the old pages.
+        assert!(now.in_place(), "remade in place: the view is still mapped");
+        slots[1] = [0; 8];
+        crate::shadow::let_go(at as u64, len as u64);
+        assert_eq!(heap.remake_let_go(handle), 1, "the slot is made null");
+        assert_eq!(viewed(&heap), None, "views nothing");
+        assert!(heap.viewed.let_go_slots().is_empty(), "no longer listed");
+        assert_eq!(heap.made.lock().unwrap().keys[1], 0);
+        drop((copy, now, heap));
+        // Slot resources given up are retired until the GPU's next quiet
+        // point, and an opened heap pins the view until then: the unmap may
+        // fail, leaving the view (test memory).
+        // SAFETY: our view; nothing of ours reads it after.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
     }
 }

@@ -55,6 +55,10 @@ pub(crate) struct Shadow {
     in_place: Option<ID3D12Heap>,
     /// Whether that heap pins the title's view (`crate::inplace::Opened::pins`).
     pins: bool,
+    /// An in-place copy the runtime let go before remapping its memory
+    /// ([`let_go`]): its buffer shows the section's old pages, no longer
+    /// what the title addresses show.
+    let_go: std::sync::atomic::AtomicBool,
     /// The system-memory buffer `data` maps, when shaders use `buffer` in
     /// video memory instead (diagnostics probe, `crate::vramcopy`).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
@@ -281,6 +285,7 @@ impl Shadow {
             block,
             in_place: None,
             pins: false,
+            let_go: Default::default(),
             home,
         });
         if let Some(base) = marks {
@@ -306,8 +311,16 @@ impl Shadow {
             block: None,
             in_place: Some(o.heap),
             pins: o.pins,
+            let_go: Default::default(),
             home: None,
         })
+    }
+
+    /// Whether the runtime let it go before remapping its memory
+    /// ([`let_go`]): views made over it show memory the title no longer
+    /// addresses there.
+    pub(crate) fn is_let_go(&self) -> bool {
+        self.let_go.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether the GPU uses its title memory in place (tests).
@@ -1053,6 +1066,15 @@ fn in_place(at: u64, n: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// Counts calls of [`let_go`] that let a copy go: holders of copies check
+/// theirs again when it changed.
+static LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The count of [`let_go`] calls that let a copy go.
+pub(crate) fn let_go_count() -> u64 {
+    LET_GO.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Before the runtime unmaps title memory `[at, at + len)`: the in-place
 /// copies over it go: what those addresses show changes. A heap opened from
 /// the view's address also pins its pages (Windows refuses the unmap while
@@ -1074,6 +1096,17 @@ pub(crate) fn let_go(at: u64, len: u64) {
         }
     }
     changed();
+    // Heap slots made over these copies view the section's old pages: they
+    // are made again from their records before the next submission
+    // (`descriptor::sync_heaps`), as the console's GPU reads a view's
+    // address through the page tables when it runs.
+    // shortcut: lists recorded before the remap keep the copy (their root
+    // views and the in-place copies they hold): one submitted after it
+    // reads and writes the old pages.
+    for shadow in &gone {
+        shadow.let_go.store(true, std::sync::atomic::Ordering::Release);
+    }
+    LET_GO.fetch_add(1, std::sync::atomic::Ordering::Release);
     for shadow in gone {
         let held = Arc::strong_count(&shadow) - 1;
         if held > 0 && shadow.pins {

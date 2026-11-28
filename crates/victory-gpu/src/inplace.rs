@@ -86,7 +86,7 @@ pub(crate) struct Opened {
     pub(crate) len: u64,
     /// Whether the heap pins the title's view (opened from its address):
     /// Windows then refuses the title's unmap while the heap lives. A
-    /// section opened whole pins no address.
+    /// section opened whole pins only a view of our own, no title address.
     pub(crate) pins: bool,
 }
 
@@ -107,13 +107,15 @@ fn sections_wanted() -> bool {
 }
 
 /// A section the runtime maps title memory from: our own handle to it, its
-/// size, and its heap once asked for (`Some(None)`: the device refused).
+/// size, and its heap once asked for (`Some(None)`: the device refused),
+/// opened over a view of the whole section we map (`view`, 0 for none).
 /// Kept for the process's life: the heap holds the section's memory, and a
 /// list may still use it after the title frees its pages.
 struct Section {
     handle: windows::Win32::Foundation::HANDLE,
     size: u64,
     heap: Option<Option<ID3D12Heap>>,
+    view: usize,
 }
 
 /// A title view of a section: its length and its offset in the section.
@@ -167,7 +169,7 @@ pub fn title_memory_section(at: usize, len: usize, section: usize, handle: isize
         if ok.is_err() {
             return;
         }
-        entry.insert(Section { handle: own, size, heap: None });
+        entry.insert(Section { handle: own, size, heap: None, view: 0 });
     }
     s.views.insert(at as u64, SectionView { len: len as u64, section, offset });
 }
@@ -218,12 +220,18 @@ fn run(views: &std::collections::BTreeMap<u64, SectionView>, at: u64, n: u64) ->
 /// The heap of section `id`, opened on first use. Devices open committed
 /// sections under 4 GiB (probe `sections_the_device_opens`); the runtime
 /// makes physical-page sections so where the host can commit them.
+///
+/// Opened by address over a view of the whole section that we map and keep,
+/// not by the section's handle (`OpenExistingHeapFromFileMapping`): a
+/// driver was seen to keep a section opened by handle charged to system
+/// commit after the process ended, heap released or not, until the machine
+/// restarts; a view opened by address left nothing (probe
+/// `section_commit_after_exit`). The heap pins our view, never a title one.
 fn section_heap(device: &ID3D12Device3, s: &mut Section) -> Option<ID3D12Heap> {
     if let Some(heap) = &s.heap {
         return heap.clone();
     }
-    // SAFETY: our own handle to a live section.
-    let heap: windows::core::Result<ID3D12Heap> = unsafe { device.OpenExistingHeapFromFileMapping(s.handle) };
+    let heap = section_view_heap(device, s);
     let heap = match heap {
         Ok(heap) => {
             tracing::info!(size = s.size, "title memory section opened for the GPU in place");
@@ -236,6 +244,38 @@ fn section_heap(device: &ID3D12Device3, s: &mut Section) -> Option<ID3D12Heap> {
     };
     s.heap = Some(heap.clone());
     heap
+}
+
+/// Maps section `s` whole into a view of ours (kept, recorded in `s.view`)
+/// and opens the heap over it; a view not committed throughout is refused.
+fn section_view_heap(device: &ID3D12Device3, s: &mut Section) -> windows::core::Result<ID3D12Heap> {
+    use windows::Win32::Foundation::E_INVALIDARG;
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile};
+    let len = usize::try_from(s.size).map_err(|_| windows::core::Error::from(E_INVALIDARG))?;
+    // SAFETY: maps our own handle to a live section, whole.
+    let view = unsafe { MapViewOfFile(s.handle.0 as _, FILE_MAP_WRITE, 0, 0, len) }.Value as usize;
+    if view == 0 {
+        return Err(windows::core::Error::from_thread());
+    }
+    let unmap = || {
+        // SAFETY: our view, which nothing else uses.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    };
+    if window(ExistingHeaps::Whole, view as u64, s.size, &regions(view as u64)) != Some((view as u64, s.size)) {
+        unmap();
+        return Err(windows::core::Error::new(E_INVALIDARG, "section not committed throughout"));
+    }
+    // SAFETY: the start of our committed view, kept for the process's life.
+    match unsafe { device.OpenExistingHeapFromAddress(view as *const _) } {
+        Ok(heap) => {
+            s.view = view;
+            Ok(heap)
+        }
+        Err(e) => {
+            unmap();
+            Err(e)
+        }
+    }
 }
 
 /// Title memory around `[at, at + n)` used in place from its section: a
@@ -833,5 +873,105 @@ mod tests {
             // SAFETY: our handle.
             unsafe { CloseHandle(h) };
         }
+    }
+
+    /// System commit in use and physical memory available, in MiB.
+    fn memory_mib() -> (u64, u64) {
+        use windows_sys::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
+        // SAFETY: plain integers, all-zero valid.
+        let mut info: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a sized out struct.
+        assert!(unsafe { GetPerformanceInfo(&mut info, std::mem::size_of_val(&info) as u32) } != 0);
+        ((info.CommitTotal * info.PageSize) as u64 >> 20, (info.PhysicalAvailable * info.PageSize) as u64 >> 20)
+    }
+
+    fn commit_mib() -> u64 {
+        memory_mib().0
+    }
+
+    fn phys_free_mib() -> u64 {
+        memory_mib().1
+    }
+
+    const LEAK_CHILD: &str = "VICTORY_TEST_SECTION_LEAK_CHILD";
+
+    /// How much of a 1 GiB committed section a process leaves charged to
+    /// system commit after it ends, for each way it opens the section for
+    /// the GPU and ends (a probe, run by hand with `--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn section_commit_after_exit() {
+        use windows_sys::Win32::Foundation::{HANDLE as RAW, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, SEC_COMMIT};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        const SIZE: usize = 1 << 30;
+        if let Ok(how) = std::env::var(LEAK_CHILD) {
+            let Some(host) = crate::host::host() else { std::process::exit(3) };
+            let device = host.device.cast::<ID3D12Device3>().unwrap();
+            // SAFETY: a plain pagefile-backed section.
+            let h: RAW = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, SIZE as u32, std::ptr::null()) };
+            assert!(!h.is_null());
+            let mut heap: Option<ID3D12Heap> = None;
+            if how != "runtime" {
+                eprintln!("{how}: physical memory free before the open {} MiB", phys_free_mib());
+            }
+            if how == "runtime" {
+                // The runtime's path: a title view of the section, then a buffer in it.
+                // SAFETY: maps our section whole.
+                let at = unsafe { MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, SIZE) }.Value as usize;
+                assert_ne!(at, 0);
+                let free = || phys_free_mib();
+                let before = free();
+                super::title_memory_section(at, SIZE, 0x5ec7, h as isize, SIZE as u64, 0);
+                let opened = super::open(at as u64, 0x1_0000).expect("opened in place");
+                assert!(!opened.pins, "a section heap pins no title view");
+                eprintln!("runtime: physical memory taken by the open {} MiB", before as i64 - free() as i64);
+                std::mem::forget(opened);
+            } else if how.starts_with("file") {
+                // SAFETY: a live section handle.
+                heap = Some(unsafe { device.OpenExistingHeapFromFileMapping(windows::Win32::Foundation::HANDLE(h)) }.unwrap());
+            } else if how.starts_with("address") {
+                // SAFETY: maps our section whole.
+                let at = unsafe { MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, SIZE) }.Value;
+                assert!(!at.is_null());
+                // SAFETY: the start of a live view.
+                heap = Some(unsafe { device.OpenExistingHeapFromAddress(at) }.unwrap());
+            }
+            let buffer = heap.as_ref().map(|heap| buffer_over(&host.device, heap, SIZE).unwrap());
+            if !how.ends_with("released") && how != "none" && how != "runtime" {
+                eprintln!("{how}: physical memory free after the open {} MiB", phys_free_mib());
+            }
+            if how.ends_with("released") {
+                drop(buffer);
+                drop(heap);
+            } else {
+                std::mem::forget((buffer, heap));
+            }
+            // SAFETY: ends this process as the runtime's `end` does.
+            unsafe { TerminateProcess(GetCurrentProcess(), 0) };
+            unreachable!();
+        }
+        let name = "inplace::tests::section_commit_after_exit";
+        let mut left_by_runtime = 0;
+        for how in ["none", "file", "file-released", "address", "address-released", "runtime"] {
+            let before = commit_mib();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--ignored", "--nocapture"])
+                .env(LEAK_CHILD, how)
+                .status()
+                .unwrap();
+            if status.code() == Some(3) {
+                eprintln!("skipped: no host GPU");
+                return;
+            }
+            assert_eq!(status.code(), Some(0), "{how}: the child failed");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let left = commit_mib() as i64 - before as i64;
+            eprintln!("{how}: commit left {left} MiB");
+            if how == "runtime" {
+                left_by_runtime = left;
+            }
+        }
+        assert!(left_by_runtime < 256, "the runtime's section heap left {left_by_runtime} MiB of commit after exit");
     }
 }

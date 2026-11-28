@@ -171,6 +171,18 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // Slots over in-place copies a remap let go: made again, wherever
+        // their page lies.
+        let remade = host.remake_let_go(|index| start + u64::from(index) * step);
+        #[cfg(feature = "diagnostics")]
+        if remade > 0 {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                tracing::info!(remade, heap = format_args!("{start:#x}"), "slots made again: their in-place copy was let go before a remap");
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = remade;
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
