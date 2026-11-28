@@ -210,6 +210,9 @@ Not seen to change the picture yet. Where each ran: `docs/adapters.md`.
       timestamps in chunks of 4,096 made as a list notes more commands; a
       command left without an end stamp is counted as not timed, never
       charged with the rest of the list
+- [x] With `VICTORY_PROBE_VRAM_COPIES=1`, slow-list warnings and "removed
+      while list N ran alone" named the list before the one that ran: the
+      probe's copy is submission group 0 (`host::run_of_group`, unit test)
 - [x] Loop limits by shader stage (`gpu-long-dispatch`)
 - [x] Shader flag for UAVs outside pixel and compute (validator refusals)
 - [x] Compute shaders with implicit derivatives pass the validator
