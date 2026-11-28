@@ -45,9 +45,13 @@ Each item names its problem in the ranked table below.
       read past its stack, as in `image-uncommitted-write`), two runs lost
       to the machine running out of memory (next item). After a restart on
       2026-11-28: 3 of 3 default runs of 300 s clean (trmo-h7-5,
-      trmo-leakfix-1, trmo-leakfix-2); merged into main. Open: lists
-      recorded before a remap still use the old pages (16 per run in the
-      log, none crashed); the reviewer has not seen the last diff
+      trmo-leakfix-1, trmo-leakfix-2); merged into main. Not fixed: the
+      same code crashed later the same day (d36da21, same code as
+      e28cfd7: 1 of 2 runs; 58a42c9: 3 of 3, plus the frame-record branch
+      on it), reads of -1 at the image sites seen before the fixes
+      (+0x52ecfd9, +0x52ec9f5, +0x8f92a). The 3 clean runs were luck or a
+      machine fresh from a restart. Open: lists recorded before a remap
+      still use the old pages (16 per run in the log, clean runs too)
 - [ ] Every run with in-place sections left about the size of the title's
       sections (7.5 GB) charged to system commit after the process exited,
       held by no process until a restart (`inplace-commit-leak`): over a
@@ -201,6 +205,10 @@ Each item names its problem in the ranked table below.
 
 Not seen to change the picture yet. Where each ran: `docs/adapters.md`.
 
+- [x] GPU timing times every command of long lists (`gpu-timing-stamps`):
+      timestamps in chunks of 4,096 made as a list notes more commands; a
+      command left without an end stamp is counted as not timed, never
+      charged with the rest of the list
 - [x] Loop limits by shader stage (`gpu-long-dispatch`)
 - [x] Shader flag for UAVs outside pixel and compute (validator refusals)
 - [x] Compute shaders with implicit derivatives pass the validator
@@ -243,10 +251,10 @@ measure what the picture loses.
 | 12 | `texture-refresh-menus` | on the GTX 1070 slow texture refresh stalls the menus, so unattended runs miss the world | measured on that adapter, older build |
 | 13 | `gpu-tests-hang` | `victory-gpu` tests can hang or read zeros on a real GPU, which weakens every proof | may be mostly fixed (guess) |
 | 14 | `device-methods-missing` | the title calls device methods that are not implemented; what it loses is unknown (rank not confirmed by the owner) | seen in run reports, effect unknown |
-| 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charges the rest of the list to its last timed command, so slow-command lines mislead on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list |
+| 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charged the rest of the list to its last timed command, so slow-command lines misled on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list; fixed in `main` (timestamps in chunks made on demand, each command timed; tests), not yet seen in a title run |
 | 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay (rank not confirmed by the owner) | seen three times on 2026-11-27 on the GTX 1070, each right after a GPU reset or stall; dumps: `dxgmms2!VIDMM_GLOBAL::EnsureLockedPages` after a failed lock of our process's pages, during an eviction from a system-memory segment; which pages, not known; no reset and no stop in 56 runs since 2026-11-27 17:50 (on watch) |
 | 17 | `image-uncommitted-write` | the title's code wrote to an address reserved but never committed and the run stopped with an access violation (rank not confirmed by the owner) | seen once on 2026-11-27, in a quiet run of `main`; a wild index in the title's interpreter, its source unknown; crash report extended to catch it |
-| 18 | `title-read-minus-one` | the title's code reads a pointer of all ones (or zero) from a loaded resource's memory and the run stops; most world runs on `main` since lazy disk loads (rank not confirmed by the owner) | three holes fixed on the problem's branch (lazy fill order, stale page lists, slots over in-place memory after a remap); after a restart, 3 of 3 default 300 s runs clean on the fixes (2026-11-28), merged into main; reviewer and `confirm` on main still to do |
+| 18 | `title-read-minus-one` | the title's code reads a pointer of all ones (or zero) from a loaded resource's memory and the run stops; most world runs on `main` since lazy disk loads (rank not confirmed by the owner) | three holes fixed on the problem's branch (lazy fill order, stale page lists, slots over in-place memory after a remap); after a restart, 3 of 3 default 300 s runs clean on the fixes (2026-11-28), merged into main; later the same code crashed again (4 of 5 runs on main, 2026-11-28 03:17-03:38Z): not fixed |
 | 19 | `inplace-commit-leak` | each run with in-place sections leaves the sections' size charged to system commit after it exits, so a session's later runs fail to allocate (rank not confirmed by the owner) | cause shown by a probe (a section opened for the GPU by handle stays charged after exit); fixed by opening a view of it by address (e28cfd7, merged); two title runs left commit flat |
 
 ## Finding what keeps the 3D scene from showing
