@@ -250,8 +250,11 @@ impl Shadow {
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.in_place.is_some() {
             // The GPU reads it where it lies: pages of this range disk
-            // loads left without bytes take them first (the rest of the
-            // view, textures read through `host::read`, stays without).
+            // loads left without bytes take them first, and again at
+            // submission (`Host::execute`) for loads since. Other pages of
+            // the copy stay without until a submission reaches them
+            // ([`Shadow::update`]: heap-indexed views, the page table, which
+            // names every copy whole).
             crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
             list.keep_in_place(self, address, len);
             return;

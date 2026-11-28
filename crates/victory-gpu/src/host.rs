@@ -1335,7 +1335,8 @@ impl Host {
         // list's lock at a time: a submission may name a list twice.
         let lending = {
             let mut let_go: Vec<InPlaceUse> = Vec::new();
-            let mut used: Vec<(usize, usize)> = Vec::new();
+            // Each range once: lists declare overlapping views many times.
+            let mut used: std::collections::BTreeSet<(usize, usize)> = std::collections::BTreeSet::new();
             for list in runs {
                 let deferred = list.deferred();
                 let_go.extend(deferred.in_place.values().filter(|(s, _)| s.is_let_go()).cloned());
