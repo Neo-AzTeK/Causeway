@@ -55,6 +55,9 @@ pub(crate) struct Shadow {
     in_place: Option<ID3D12Heap>,
     /// Whether that heap pins the title's view (`crate::inplace::Opened::pins`).
     pins: bool,
+    /// Where the in-place buffer lies in its section
+    /// (`crate::inplace::Opened::place`).
+    place: Option<(usize, u64)>,
     /// An in-place copy the runtime let go before remapping its memory
     /// ([`let_go`]): its buffer shows the section's old pages, no longer
     /// what the title addresses show.
@@ -248,7 +251,7 @@ impl Shadow {
             // loads left without bytes take them first (the rest of the
             // view, textures read through `host::read`, stays without).
             crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
-            list.keep_in_place(self);
+            list.keep_in_place(self, address, len);
             return;
         }
         let len = len.min(self.start + self.len - address);
@@ -285,6 +288,7 @@ impl Shadow {
             block,
             in_place: None,
             pins: false,
+            place: None,
             let_go: Default::default(),
             home,
         });
@@ -311,9 +315,18 @@ impl Shadow {
             block: None,
             in_place: Some(o.heap),
             pins: o.pins,
+            place: o.place,
             let_go: Default::default(),
             home: None,
         })
+    }
+
+    /// An in-place buffer placed in a section: the title addresses it
+    /// showed when placed (start, bytes) and where it lies (section,
+    /// offset).
+    pub(crate) fn placed_run(&self) -> Option<(u64, u64, usize, u64)> {
+        let (section, offset) = self.place?;
+        Some((self.start, self.len, section, offset))
     }
 
     /// Whether the runtime let it go before remapping its memory
@@ -371,7 +384,7 @@ impl Shadow {
             // A GPU write lands past the guard: the load's bytes go in
             // first, or a later fill would cover what the GPU wrote.
             crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
-            list.keep_in_place(self);
+            list.keep_in_place(self, address, len);
             return;
         }
         let len = len.min(self.left(address));
@@ -1100,9 +1113,10 @@ pub(crate) fn let_go(at: u64, len: u64) {
     // are made again from their records before the next submission
     // (`descriptor::sync_heaps`), as the console's GPU reads a view's
     // address through the page tables when it runs.
-    // shortcut: lists recorded before the remap keep the copy (their root
-    // views and the in-place copies they hold): one submitted after it
-    // reads and writes the old pages.
+    // Lists recorded before the remap keep the copy (their root views and
+    // the in-place copies they hold name its buffer): when one is submitted,
+    // the old pages it reaches lend it what the addresses show then
+    // (`crate::inplace::lend`).
     for shadow in &gone {
         shadow.let_go.store(true, std::sync::atomic::Ordering::Release);
     }

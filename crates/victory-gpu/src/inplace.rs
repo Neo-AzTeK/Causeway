@@ -88,6 +88,9 @@ pub(crate) struct Opened {
     /// Windows then refuses the title's unmap while the heap lives. A
     /// section opened whole pins only a view of our own, no title address.
     pub(crate) pins: bool,
+    /// Where the buffer's first byte lies, when it is placed in a section
+    /// opened whole: the section (the runtime's id for it) and the offset.
+    pub(crate) place: Option<(usize, u64)>,
 }
 
 /// Whether title views are opened by address: `VICTORY_IN_PLACE=1`. Off by
@@ -291,7 +294,212 @@ fn open_section(device: &ID3D12Device, at: u64, n: u64) -> Option<Opened> {
     let heap = section_heap(&device3, s.sections.get_mut(&id)?)?;
     drop(s);
     let buffer = placed(device, &heap, offset, len)?;
-    Some(Opened { buffer, heap, start, len, pins: false })
+    Some(Opened { buffer, heap, start, len, pins: false, place: Some((id, offset)) })
+}
+
+/// The section page title address `at` shows now: the section and the
+/// offset of the 64 KiB page holding `at`. None where no section view the
+/// runtime mapped holds it.
+fn shown_now(views: &std::collections::BTreeMap<u64, SectionView>, at: u64) -> Option<(usize, u64)> {
+    let (&base, v) = views.range(..=at).next_back().filter(|(b, v)| at < **b + v.len)?;
+    Some((v.section, v.offset + (at - base) / PAGE * PAGE))
+}
+
+/// The 64 KiB unit of sections, title views and remaps (the runtime's
+/// physical page).
+const PAGE: u64 = crate::watch::PAGE as u64;
+
+/// One page a submitted list reaches through an in-place buffer whose title
+/// address shows another page since the list was recorded: for the run,
+/// the buffer's page (`old`, in our view of its section) holds what the
+/// address shows (`put`), and its own bytes (`saved`) wait aside.
+struct Lent {
+    at: u64,
+    old: *mut u8,
+    saved: Vec<u8>,
+    put: Vec<u8>,
+}
+
+/// What [`lend`] did, undone by [`Lending::give_back`] once the GPU is done.
+#[derive(Default)]
+pub(crate) struct Lending {
+    pages: Vec<Lent>,
+}
+
+/// Before a submission runs, for the in-place buffers its lists hold and the
+/// ranges they use there (`uses`): the console's GPU reads a title address
+/// through the page tables when it runs, so a list recorded before the title
+/// remapped an address sees the new page. Ours hold a buffer placed on the
+/// section's old page (`crate::shadow::let_go`): for the run, that page
+/// takes the bytes the address shows now, and what the GPU writes there goes
+/// to the address afterwards ([`Lending::give_back`]).
+///
+/// Not page tables of the host's own (a reserved buffer whose 64 KiB tiles
+/// map section pages, mapped again at each remap): D3D12 refuses tiles over
+/// a heap opened from an address (`UpdateTileMappings` onto one gives
+/// `DXGI_ERROR_INVALID_CALL` and removes the device).
+///
+/// shortcut: the old page is the title's memory too. Where another title
+/// address shows it, the title's threads see the lent bytes during the run,
+/// and what they write there meanwhile is lost (counted in the log line).
+pub(crate) fn lend<'a>(
+    uses: impl Iterator<Item = (&'a crate::shadow::Shadow, &'a std::collections::HashSet<(u64, u64)>)>,
+) -> Lending {
+    let mut lending = Lending::default();
+    let wanted: Vec<(u64, usize, bool)> = {
+        let s = sections();
+        let mut wanted = Vec::new();
+        let mut taken: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        for (shadow, ranges) in uses {
+            if !shadow.is_let_go() {
+                continue;
+            }
+            let Some((start, len, section, offset)) = shadow.placed_run() else {
+                continue;
+            };
+            let Some(view) = s.sections.get(&section).map(|x| x.view).filter(|&v| v != 0) else {
+                continue;
+            };
+            let mut pages = std::collections::BTreeSet::new();
+            for &(at, n) in ranges {
+                let (from, to) = (at.max(start), at.saturating_add(n).min(start + len));
+                let mut page = from / PAGE * PAGE;
+                while page < to {
+                    pages.insert(page);
+                    page += PAGE;
+                }
+            }
+            for page in pages {
+                let page_offset = offset + (page - start);
+                if shown_now(&s.views, page) == Some((section, page_offset)) {
+                    continue;
+                }
+                let old = view + page_offset as usize;
+                // Two buffers lending one page different bytes: the first
+                // keeps it.
+                if let Some(&other) = taken.get(&old) {
+                    if other != page {
+                        count(&COUNTS.conflicts);
+                    }
+                    continue;
+                }
+                taken.insert(old, page);
+                // `page` shows another page now, so a view holding the old
+                // one is at another address.
+                let elsewhere = s
+                    .views
+                    .values()
+                    .any(|v| v.section == section && v.offset <= page_offset && page_offset < v.offset + v.len);
+                wanted.push((page, old, elsewhere));
+            }
+        }
+        wanted
+    };
+    for (at, old, elsewhere) in wanted {
+        let old = old as *mut u8;
+        let mut saved = vec![0u8; PAGE as usize];
+        let mut put = vec![0u8; PAGE as usize];
+        // The address may show nothing now (the GPU would fault on the
+        // console): the old page is left as it is then. Through the kernel,
+        // which refuses a page the title decommitted instead of faulting.
+        if !crate::host::read_kernel(old, saved.as_mut_ptr(), saved.len())
+            || !crate::host::read_into(at as *const u8, &mut put)
+            || !crate::host::read_kernel(put.as_ptr(), old, put.len())
+        {
+            count(&COUNTS.unmapped);
+            continue;
+        }
+        if elsewhere {
+            count(&COUNTS.elsewhere);
+        }
+        count(&COUNTS.lent);
+        lending.pages.push(Lent { at, old, saved, put });
+    }
+    if !lending.pages.is_empty() {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            let get = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                pages = lending.pages.len(),
+                lent = get(&COUNTS.lent),
+                elsewhere = get(&COUNTS.elsewhere),
+                unmapped = get(&COUNTS.unmapped),
+                conflicts = get(&COUNTS.conflicts),
+                "a submission reaches remapped title pages through in-place buffers recorded before the remap: their old pages lent the new bytes"
+            );
+        }
+    }
+    lending
+}
+
+impl Lending {
+    /// Once the GPU is done: what it wrote in each lent page goes to the
+    /// title address (bytes that differ from those lent), and the page gets
+    /// its own bytes back. Before the copy-backs and bottom-of-pipe writes.
+    pub(crate) fn give_back(mut self) {
+        self.undo(true);
+    }
+
+    fn undo(&mut self, gpu_ran: bool) {
+        for page in self.pages.drain(..) {
+            if gpu_ran {
+                let mut now = vec![0u8; PAGE as usize];
+                if crate::host::read_kernel(page.old, now.as_mut_ptr(), now.len()) {
+                    for (from, to) in differing(&page.put, &now) {
+                        let at = page.at as usize + from;
+                        let _writing = crate::watch::gpu_writing(at, to - from);
+                        crate::host::write_mapped(at as *mut u8, now[from..].as_ptr(), to - from);
+                    }
+                }
+            }
+            crate::host::read_kernel(page.saved.as_ptr(), page.old, page.saved.len());
+        }
+    }
+}
+
+impl Drop for Lending {
+    /// Pages still lent (a submission that never ran) get their bytes back.
+    fn drop(&mut self) {
+        self.undo(false);
+    }
+}
+
+/// The runs `[from, to)` where `a` and `b` differ.
+fn differing(a: &[u8], b: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i < n {
+        if a[i] == b[i] {
+            i += 1;
+            continue;
+        }
+        let from = i;
+        while i < n && a[i] != b[i] {
+            i += 1;
+        }
+        runs.push((from, i));
+    }
+    runs
+}
+
+/// What [`lend`] did over the run, for its log line.
+struct Counts {
+    lent: std::sync::atomic::AtomicU64,
+    elsewhere: std::sync::atomic::AtomicU64,
+    unmapped: std::sync::atomic::AtomicU64,
+    conflicts: std::sync::atomic::AtomicU64,
+}
+
+static COUNTS: Counts = Counts {
+    lent: std::sync::atomic::AtomicU64::new(0),
+    elsewhere: std::sync::atomic::AtomicU64::new(0),
+    unmapped: std::sync::atomic::AtomicU64::new(0),
+    conflicts: std::sync::atomic::AtomicU64::new(0),
+};
+
+fn count(c: &std::sync::atomic::AtomicU64) {
+    c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A buffer of `len` bytes at `offset` in an opened heap.
@@ -379,7 +587,7 @@ pub(crate) fn open(at: u64, n: u64) -> Option<Opened> {
     // SAFETY: a buffer as large as the heap, at its start.
     let placed = unsafe { host.device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer) };
     match (placed, buffer) {
-        (Ok(()), Some(buffer)) => Some(Opened { buffer, heap, start, len, pins: true }),
+        (Ok(()), Some(buffer)) => Some(Opened { buffer, heap, start, len, pins: true, place: None }),
         (r, _) => {
             refused(&r.err().unwrap_or_else(windows::core::Error::empty), start, len);
             None
@@ -606,6 +814,102 @@ mod tests {
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
             VirtualFree(place, 0, MEM_RELEASE);
+            CloseHandle(section);
+        }
+    }
+
+    /// A list recorded over a title page used in place from its section,
+    /// submitted after the runtime mapped another page of the section there:
+    /// it reads and writes what the address shows then (the console's GPU
+    /// reads addresses through the page tables when it runs), and the old
+    /// page keeps its bytes.
+    #[test]
+    fn a_list_recorded_before_a_remap_sees_the_new_page() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const P: usize = super::PAGE as usize;
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        // Two physical pages, 0x11s and 0x22s, as the runtime makes them.
+        // SAFETY: plain section creation (committed whole), kept by the views.
+        let section =
+            unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, 2 * P as u32, std::ptr::null()) };
+        assert!(!section.is_null());
+        // SAFETY: our own view of the section, to fill and inspect it.
+        let own = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * P) }.Value.cast::<u8>();
+        assert!(!own.is_null());
+        // SAFETY: inside our view.
+        unsafe {
+            std::ptr::write_bytes(own, 0x11, P);
+            std::ptr::write_bytes(own.add(P), 0x22, P);
+        }
+        // The title's address: a placeholder the first page is mapped over.
+        // SAFETY: a placeholder of our own, replaced by the view.
+        let at = unsafe {
+            VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), P, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 0x01, std::ptr::null_mut(), 0)
+        };
+        assert!(!at.is_null());
+        let map_page = |offset: usize| {
+            // SAFETY: one section page over our placeholder.
+            let v = unsafe {
+                MapViewOfFile3(section, GetCurrentProcess(), at, offset as u64, P, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0)
+            };
+            assert_eq!(v.Value, at);
+            super::title_memory_section(at as usize, P, section as usize, section as isize, 2 * P as u64, offset as u64);
+        };
+        map_page(0);
+        let address = at as u64;
+        let Some(copy) = crate::shadow::find(address, 512) else {
+            panic!("no copy");
+        };
+        if copy.placed_run().is_none() {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        }
+        assert_eq!(copy.placed_run().map(|r| (r.0, r.3)), Some((address, 0)), "placed on the first page");
+        let (out, out_data) = host.shared_buffer(P as u64).expect("a host buffer");
+        let (src, src_data) = host.shared_buffer(P as u64).expect("a host buffer");
+        // SAFETY: inside the host buffers.
+        unsafe {
+            std::ptr::write_bytes(out_data, 0, P);
+            std::ptr::write_bytes(src_data, 0x33, P);
+        }
+        // Recorded now: the list reads bytes 0..256 and writes 256..512.
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, address, 256);
+        copy.gpu_writes(&list, address + 256, 256, false);
+        // SAFETY: an open list; ranges inside the buffers.
+        unsafe {
+            list.list.CopyBufferRegion(&out, 0, &copy.buffer, 0, 256);
+            list.list.CopyBufferRegion(&copy.buffer, 256, &src, 0, 256);
+        }
+        list.close();
+        // The runtime maps the second page there, as xmem does.
+        crate::watch::title_memory_remapped(at as usize, P);
+        // SAFETY: the view over our placeholder, back to a placeholder.
+        unsafe { UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: at }, MEM_PRESERVE_PLACEHOLDER) };
+        map_page(P);
+        crate::watch::title_memory_remapped(at as usize, P);
+        assert!(copy.is_let_go());
+        host.execute(&[&list]);
+        // SAFETY: inside the buffers and views; the GPU finished.
+        let (read, wrote, old_read, old_wrote) = unsafe { (*out_data, *at.cast::<u8>().add(256), *own, *own.add(256)) };
+        assert_eq!(read, 0x22, "read what the address shows now");
+        assert_eq!(wrote, 0x33, "wrote where the address shows now");
+        assert_eq!((old_read, old_wrote), (0x11, 0x11), "the old page keeps its bytes");
+        drop((list, copy, out, src));
+        crate::shadow::let_go(at as u64, P as u64);
+        // SAFETY: ours; the section's heap keeps its own view.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: at }, MEM_PRESERVE_PLACEHOLDER);
+            VirtualFree(at, 0, MEM_RELEASE);
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: own.cast() });
             CloseHandle(section);
         }
     }
