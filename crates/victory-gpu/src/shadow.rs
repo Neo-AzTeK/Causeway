@@ -250,8 +250,11 @@ impl Shadow {
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.in_place.is_some() {
             // The GPU reads it where it lies: pages of this range disk
-            // loads left without bytes take them first (the rest of the
-            // view, textures read through `host::read`, stays without).
+            // loads left without bytes take them first, and again at
+            // submission (`Host::execute`) for loads since. Other pages of
+            // the copy stay without until a submission reaches them
+            // ([`Shadow::update`]: heap-indexed views, the page table, which
+            // names every copy whole).
             crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
             list.keep_in_place(self, address, len);
             return;
@@ -386,7 +389,7 @@ impl Shadow {
             // A GPU write lands past the guard: the load's bytes go in
             // first, or a later fill would cover what the GPU wrote.
             crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
-            list.keep_in_place(self, address, len);
+            list.keep_in_place_write(self, address, len);
             return;
         }
         let len = len.min(self.left(address));
@@ -663,25 +666,37 @@ impl Shadow {
 
     /// Whether [`Shadow::update`] of `[address, address + len)` has anything
     /// to copy: a page there changed since it was taken, or the memory is not
-    /// tracked (copied whole each time).
+    /// tracked (copied whole each time). Used in place: a page there that a
+    /// disk load left without bytes (the GPU would read what the page held).
     pub(crate) fn stale(&self, address: usize, len: usize) -> bool {
-        if self.in_place.is_some() {
-            return false;
-        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
+        if self.in_place.is_some() {
+            return from < to && crate::watch::lazy_within(from, to - from);
+        }
         from < to && self.tracked.as_ref().is_none_or(|t| t.any_changed(from, to))
     }
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
+    ///
+    /// Used in place, nothing is copied: the pages there that disk loads
+    /// left without bytes take them, as a host copy's update reads them
+    /// from their loads (`host::read`). The GPU reads such a page through
+    /// the section without faulting, so it would see what the page held
+    /// before the load, and a later fill would cover what it wrote. The
+    /// ranges heap-indexed views and the page table reach come this way
+    /// only, at submission.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        if self.in_place.is_some() {
-            return 0;
-        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
+        if self.in_place.is_some() {
+            if from < to {
+                crate::watch::fill_lazy(from, to - from);
+            }
+            return 0;
+        }
         if from >= to {
             return 0;
         }
@@ -1077,6 +1092,8 @@ fn in_place(at: u64, n: u64) -> Option<Arc<Shadow>> {
         return Some(s.clone());
     }
     let shadow = Shadow::opened(crate::inplace::open(at, n)?);
+    #[cfg(feature = "diagnostics")]
+    crate::inplace::history::placed(&shadow);
     tracing::info!(
         start = format_args!("{:#x}", shadow.start),
         len = shadow.len,
@@ -1983,6 +2000,37 @@ pub(crate) mod tests {
         let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// A page a copy's shaders marked goes back even when another list of
+    /// the submission declares an in-place write over it: the declared
+    /// ranges reach whole copies, and the copy-back would read the page as
+    /// the title's write if they were marked first.
+    #[test]
+    fn a_marked_page_goes_back_beside_an_in_place_write_declared_over_it() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap()) else {
+            unregister(p, p as u64);
+            return;
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        let list = host.new_list().unwrap();
+        list.declare_in_place_write(p as u64, PAGE as u64);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a byte of our pool.
+        assert_eq!(unsafe { ((p + 10) as *const u8).read_volatile() }, 0xaa, "the shader's byte went back");
         unregister(p, p as u64);
     }
 

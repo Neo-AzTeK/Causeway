@@ -140,9 +140,22 @@ struct Sections {
 // SAFETY: a handle and a COM heap (agile), used under the lock.
 unsafe impl Send for Sections {}
 
+static SECTIONS: std::sync::LazyLock<std::sync::Mutex<Sections>> = std::sync::LazyLock::new(Default::default);
+
 fn sections() -> std::sync::MutexGuard<'static, Sections> {
-    static SECTIONS: std::sync::LazyLock<std::sync::Mutex<Sections>> = std::sync::LazyLock::new(Default::default);
     SECTIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) mod history;
+
+/// Diagnostics, for the crash report: the section page title address `at`
+/// shows, the pages it showed before, where else they were mapped and the
+/// in-place buffers placed over them ([`history`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn physical(at: u64) -> Option<String> {
+    let now = SECTIONS.try_lock().ok().map(|s| shown_now(&s.views, at));
+    history::note(at, now, PAGE)
 }
 
 /// The runtime mapped `[at, at + len)` of title memory from `offset` of a
@@ -175,6 +188,8 @@ pub fn title_memory_section(at: usize, len: usize, section: usize, handle: isize
         entry.insert(Section { handle: own, size, heap: None, view: 0 });
     }
     s.views.insert(at as u64, SectionView { len: len as u64, section, offset });
+    #[cfg(feature = "diagnostics")]
+    history::mapped(at as u64, len as u64, section, offset);
 }
 
 /// The runtime unmaps or remaps `[at, at + len)`: the section views there
@@ -1239,6 +1254,110 @@ mod tests {
         host.execute(&[&list]);
         assert_eq!(pages.slot_byte(1, 256), 0x5a, "wrote where the address shows now");
         assert_eq!(pages.page_byte(1, 256), 0x22, "the old page keeps its bytes");
+    }
+
+    /// One section page shown at two title addresses (the title maps its
+    /// pages twice): what a list writes in place at the first is a write
+    /// for a tracker of the second (a host copy or a texture there), as a
+    /// copy-back's is.
+    #[test]
+    fn a_write_in_place_is_seen_where_else_the_page_is_shown() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let p = Pages::P;
+        let pages = Pages::new(2);
+        pages.map(0, 0);
+        pages.map(1, 0);
+        crate::watch::title_memory_aliased(pages.slot(1) as usize, &[pages.slot(0) as usize]);
+        let copy = crate::shadow::find(pages.slot(0), 512).expect("a copy");
+        if copy.placed_run().is_none() {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        }
+        let other = pages.slot(1) as usize;
+        let t = crate::watch::track(other, p, true).expect("a view is tracked");
+        t.take(other, other + p);
+        assert!(t.take(other, other + p).is_empty(), "taken");
+        let (src, src_data) = host.shared_buffer(p as u64).expect("a host buffer");
+        // SAFETY: inside the host buffer.
+        unsafe { std::ptr::write_bytes(src_data, 0x44, 256) };
+        let list = host.new_list().unwrap();
+        copy.gpu_writes(&list, pages.slot(0) + 256, 256, false);
+        // SAFETY: an open list; ranges inside the buffers.
+        unsafe { list.list.CopyBufferRegion(&copy.buffer, 256, &src, 0, 256) };
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(pages.slot_byte(1, 256), 0x44, "the other address shows the write");
+        assert_eq!(t.take(other, other + p), [(other, other + p)], "and its tracker sees it");
+        drop(t);
+    }
+
+    /// A disk load's bytes, all `0x77`.
+    struct Loaded;
+
+    impl crate::lazy::Source for Loaded {
+        fn size(&self) -> usize {
+            Pages::P
+        }
+        fn whole(&self) -> bool {
+            false
+        }
+        fn read(&self, _: usize, out: &mut [u8]) -> bool {
+            out.fill(0x77);
+            true
+        }
+    }
+
+    /// A list recorded over a title page used in place, submitted after a
+    /// disk load left that page without bytes (filled on access): the GPU,
+    /// which reads the page without faulting, reads the load's bytes, as a
+    /// host copy's refresh at submission would.
+    #[test]
+    fn a_page_loaded_after_the_list_was_recorded_is_filled_before_it_runs() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let pages = Pages::new(1);
+        pages.map(0, 0);
+        let Some((list, _copy, _out, out_data, _src)) = record_over(host, &pages, &[0], &[]) else {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        };
+        let load = crate::lazy::Load::new(Box::new(Loaded));
+        assert!(crate::watch::title_memory_lazy(&load, pages.slot(0) as usize, 0), "left without bytes");
+        host.execute(&[&list]);
+        // SAFETY: inside the host buffer; the GPU finished.
+        assert_eq!(unsafe { *out_data }, 0x77, "read the load's bytes");
+        assert_eq!(pages.page_byte(0, 0), 0x77, "the page holds them");
+    }
+
+    /// A range a submission brings up to date (heap-indexed views, the page
+    /// table) over a copy used in place, where a disk load left a page
+    /// without bytes: stale, and its update fills the page.
+    #[test]
+    fn an_update_in_place_fills_a_page_left_without_bytes() {
+        if crate::host::host().is_none() {
+            eprintln!("skipped: no host GPU");
+            return;
+        }
+        let pages = Pages::new(1);
+        pages.map(0, 0);
+        let copy = crate::shadow::find(pages.slot(0), 512).expect("a copy");
+        if copy.placed_run().is_none() {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        }
+        let at = pages.slot(0) as usize;
+        assert!(!copy.stale(at, 256), "nothing to bring up to date");
+        let load = crate::lazy::Load::new(Box::new(Loaded));
+        assert!(crate::watch::title_memory_lazy(&load, at, 0), "left without bytes");
+        assert!(copy.stale(at + 16, 256), "a page left without bytes");
+        assert_eq!(copy.update(at + 16, 256), 0, "nothing copied");
+        assert!(!copy.stale(at, 256), "filled");
+        assert_eq!(pages.page_byte(0, 0), 0x77, "the page holds the load's bytes");
     }
 
     /// One section page used in place at two addresses by one list, the

@@ -426,7 +426,7 @@ pub fn title_memory_lazy(load: &Arc<crate::lazy::Load>, at: usize, offset: usize
     if g.lazy.remove(&page).is_some() {
         crate::ledger::add(crate::ledger::Owner::LazyPages, -(PAGE as i64));
     }
-    changed_here(&mut g, page, page + 1, true);
+    changed_here(&mut g, page, page + 1, true, true);
     // What the page held goes back to the system; the protection below
     // keeps it from being read before it is filled.
     // SAFETY: a committed title page whose bytes are replaced.
@@ -506,6 +506,15 @@ pub(crate) fn read_lazy(src: usize, dst: *mut u8, len: usize) -> bool {
         at = to;
     }
     true
+}
+
+/// Whether a page of `[at, at + len)` is one a disk load left without
+/// bytes (not filled yet).
+pub(crate) fn lazy_within(at: usize, len: usize) -> bool {
+    if crate::ledger::bytes(crate::ledger::Owner::LazyPages) <= 0 {
+        return false;
+    }
+    guards().lazy.range(at / PAGE..at.saturating_add(len).div_ceil(PAGE)).next().is_some()
 }
 
 /// Fills the pages of `[at, at + len)` disk loads left without bytes: the
@@ -845,7 +854,15 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
+    changed_in(g, first, last, save, true)
+}
+
+/// [`changed`]; with `open_guarded` false, guarded pages stay guarded: a
+/// write that has landed already (GPU work in place) needs no access, and
+/// the title's next write faults and marks them again, so the guard and
+/// the tracker's next take need no protection change.
+fn changed_in(g: &mut Guards, first: usize, last: usize, save: bool, open_guarded: bool) -> bool {
+    let guarded = changed_here(g, first, last, save, open_guarded);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
@@ -853,17 +870,19 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
     for page in others {
-        changed_here(g, page, page + 1, save);
+        changed_here(g, page, page + 1, save, open_guarded);
     }
     guarded
 }
 
-/// [`changed`] of `[first, last)` alone. With `save`, before the write
+/// [`changed_in`] of `[first, last)` alone. With `save`, before the write
 /// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool, open_guarded: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &page in &guarded {
-        open(g, page);
+    if open_guarded {
+        for &page in &guarded {
+            open(g, page);
+        }
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
@@ -904,15 +923,25 @@ pub(crate) fn frame_done() {
 pub struct Writing {
     first: usize,
     last: usize,
+    /// Diagnostics: the bytes written, scanned once written for the empty
+    /// bounds the title faulted on, and what to call a hit in the trail.
+    #[cfg(feature = "diagnostics")]
+    scan: (usize, usize, &'static str),
 }
 
 impl Drop for Writing {
     fn drop(&mut self) {
-        let mut g = guards();
-        if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
-            g.busy.swap_remove(i);
+        {
+            let mut g = guards();
+            if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
+                g.busy.swap_remove(i);
+            }
+            changed(&mut g, self.first, self.last, false);
         }
-        changed(&mut g, self.first, self.last, false);
+        #[cfg(feature = "diagnostics")]
+        if crate::trail::probe_empty_bounds() {
+            crate::trail::scan_empty_bounds(self.scan.0, self.scan.1, self.scan.2);
+        }
     }
 }
 
@@ -929,7 +958,13 @@ pub fn kernel_will_write(at: usize, len: usize) -> Writing {
     crate::trail::step_if_seen(at / PAGE, at.saturating_add(len).div_ceil(PAGE), "written by the runtime or the kernel");
     #[cfg(feature = "diagnostics")]
     crate::trail::wrote(at, len, "written by the runtime or the kernel", None);
-    writing(at, len)
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+    let mut w = writing(at, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        w.scan = (at, len, "the runtime or the kernel wrote -1 beside infinities (empty bounds)");
+    }
+    w
 }
 
 /// [`writing`] for what GPU work wrote: write-backs of host copies, and
@@ -939,7 +974,48 @@ pub(crate) fn gpu_writing(at: usize, len: usize) -> Writing {
     crate::memclass::wrote(crate::memclass::Writer::Gpu, at, len);
     #[cfg(feature = "diagnostics")]
     crate::trail::step_if_seen(at / PAGE, at.saturating_add(len).div_ceil(PAGE), "written by GPU work");
-    writing(at, len)
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+    let mut w = writing(at, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        w.scan = (at, len, "GPU work wrote -1 beside infinities (empty bounds)");
+    }
+    w
+}
+
+/// After GPU work wrote `[at, at + len)` where it lies (copies used in
+/// place, `crate::inplace`): trackers of those pages and of the other
+/// addresses showing them (`alias_of`) see a write. Unlike [`gpu_writing`]
+/// it saves nothing and opens no guard: the write has landed. Without it a
+/// host copy or a texture over another mapping of the pages keeps the
+/// bytes from before the GPU's. Called after the submission's copy-backs,
+/// which read a changed page as the title's write.
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // The ranges are what lists declare (up to a whole copy), most of it
+    // not written; diagnostics keep as much as a root view declares
+    // (1 MiB): whole ranges cost ~80 ms of copying back a world frame
+    // (rb-h12b-3).
+    #[cfg(feature = "diagnostics")]
+    {
+        let kept = len.min(1 << 20);
+        crate::memclass::wrote(crate::memclass::Writer::Gpu, at, len);
+        crate::trail::step_if_seen(first, last, "written by GPU work in place");
+        crate::trail::wrote(at, kept, "written by GPU work in place", None);
+    }
+    // Opening their guarded pages cost ~6000 protection changes a world
+    // frame (rb-h12-1).
+    changed_in(&mut guards(), first, last, false, false);
+}
+
+/// Diagnostics: the other addresses (page starts) the title shows the page
+/// holding `at` at (`alias_of`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shown_elsewhere(at: usize) -> Vec<usize> {
+    guards().alias_of.get(&(at / PAGE)).map_or_else(Vec::new, |o| o.iter().map(|p| p * PAGE).collect())
 }
 
 /// What [`kernel_will_write`] and [`gpu_writing`] do.
@@ -949,7 +1025,12 @@ fn writing(at: usize, len: usize) -> Writing {
     let mut g = guards();
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
-    Writing { first, last }
+    Writing {
+        first,
+        last,
+        #[cfg(feature = "diagnostics")]
+        scan: (at, 0, ""),
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it

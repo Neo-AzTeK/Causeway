@@ -24,16 +24,13 @@ Each item names its problem in the ranked table below.
 - [ ] With in-place sections on, the title's code still writes half or f32
       infinities (empty bounding boxes, after two -1 quadwords) over its
       own objects, then reads a pointer or an index from them and faults
-      (`inplace-float-overwrite`): rb-h10-4 (c398ad7, GTX 1070, 300 s,
-      default switches) before the world, at +0x535a5f0, half floats over
-      0x50e9ac110; nothing was lent in that run, so it is not a list
-      recorded before a remap. The pages hit are held by no copy and never
-      written by the runtime (crash report trail and "held by" lines), so a
-      wrong value the GPU produced (or lost) steers the title's code. In-place
-      off: 7 of 8 runs clean, none of this family. Next: what in-place memory
-      the title reads before such a write (heap slots over in-place copies
-      used by heap-indexed shaders before they are made again, copy-queue
-      writes to section memory), compared with in-place off
+      (`inplace-float-overwrite`). Two in-place holes fixed and merged (H11,
+      H12, tests fail without), not sufficient: 4 of 6 runs crashed on them.
+      In-place off shows the family too (rb-ip0c-2, 1 of 3; 9 of 11 clean
+      off, about 5 of 11 on), so in-place is not the only source. No empty
+      bounds appeared during in-place GPU writes (`VICTORY_PROBE_EMPTY_BOUNDS`,
+      rb-eb-2). Next: who writes the title objects whose pointer fields hold
+      floats or -1 (all five faulting sites load one)
 - [ ] The title's code wrote to memory reserved but never committed and the
       run stopped (0xc0000005 in the title's image, one quiet run of `main`
       before the `descriptor-slots` merge; `image-uncommitted-write`). Not a
@@ -249,7 +246,7 @@ measure what the picture loses.
 | 17 | `image-uncommitted-write` | the title's code wrote to an address reserved but never committed and the run stopped with an access violation (rank not confirmed by the owner) | seen once on 2026-11-27, in a quiet run of `main`; a wild index in the title's interpreter, its source unknown; crash report extended to catch it |
 | 18 | `title-read-minus-one` | the title's code reads a pointer of all ones (or zero) from a loaded resource's memory and the run stops; most world runs on `main` since lazy disk loads (rank not confirmed by the owner) | seven holes fixed (lazy fill order, stale page lists, slots over in-place memory after a remap, lists recorded before a remap or an unmap, a copy opened during an unmap, undeclared writes to remapped pages); the first three merged into main, then crashes again in 7 of 8 runs; the last four merged into main (273d94d): 7 of 9 default 300 s runs clean on them (1 of 8 before), the crash left is problem 20; in-place off 7 of 8 clean |
 | 19 | `inplace-commit-leak` | each run with in-place sections leaves the sections' size charged to system commit after it exits, so a session's later runs fail to allocate (rank not confirmed by the owner) | cause shown by a probe (a section opened for the GPU by handle stays charged after exit); fixed by opening a view of it by address (e28cfd7, merged); two title runs left commit flat |
-| 20 | `inplace-float-overwrite` | with in-place sections on, the title's code writes float infinities over its own objects and faults reading them; about 1 run of 6 on the fixes of problem 18 (rank not confirmed by the owner) | split from problem 18 after seven in-place holes were fixed; one crash before the world with nothing lent; in-place off clean in 7 of 8 runs |
+| 20 | `inplace-float-overwrite` | with in-place sections on, the title's code writes float infinities over its own objects and faults reading them; about 1 run of 6 on the fixes of problem 18 (rank not confirmed by the owner) | split from problem 18 after seven in-place holes were fixed. Merged into main: H11 (pages disk loads left without bytes filled for in-place copies, 126278a, 957b59d) and H12 (what shaders write in place is a write for trackers at the page's other mappings, 8725ea7, marked after copy-backs f35fa53, cost 453f641), tests fail without; not sufficient: 4 of 6 runs crashed on them (rb-h12b-*), and in-place off crashes the same way too (rb-ip0c-2: a pointer field holding floats), 9 of 11 clean off against about 5 of 11 on. All five sites disassembled load a pointer or index from a title object that holds floats or -1. Next: who writes those objects (scope wider than in-place, owner to rank); open perf: `Shadow::stale` in place takes the guard lock per copy (+60 ms preparing, rb-merge-1 vs rb-base-main-1) |
 
 ## Finding what keeps the 3D scene from showing
 

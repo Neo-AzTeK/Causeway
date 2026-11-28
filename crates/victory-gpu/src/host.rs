@@ -1159,6 +1159,9 @@ struct Deferred {
     /// ranges it uses there (address, bytes): held until the list is reset,
     /// with nothing to refresh (`crate::inplace::lend` reads the ranges).
     in_place: std::collections::HashMap<usize, InPlaceUse>,
+    /// Of those, the ranges its shaders write (address, bytes): marked
+    /// written once it has run ([`crate::watch::gpu_wrote`]).
+    in_place_written: std::collections::BTreeSet<(u64, u64)>,
 }
 
 impl Host {
@@ -1335,11 +1338,41 @@ impl Host {
         // list's lock at a time: a submission may name a list twice.
         let lending = {
             let mut let_go: Vec<InPlaceUse> = Vec::new();
+            // Each range once: lists declare overlapping views many times.
+            let mut used: std::collections::BTreeSet<(usize, usize)> = std::collections::BTreeSet::new();
             for list in runs {
                 let deferred = list.deferred();
                 let_go.extend(deferred.in_place.values().filter(|(s, _)| s.is_let_go()).cloned());
+                used.extend(deferred.in_place.values().flat_map(|(s, ranges)| {
+                    ranges.iter().map(|&(at, n)| (at as usize, n.min(s.left(at)) as usize))
+                }));
+            }
+            // Pages of the in-place ranges the lists use that disk loads
+            // left without bytes since the lists were recorded (filled then,
+            // `Shadow::refresh`) take their bytes, as host copies read them
+            // at submission: the GPU reads such a page without faulting.
+            // Outside the list locks: a fill may read the disk.
+            for (at, n) in used {
+                crate::watch::fill_lazy(at, n);
             }
             crate::inplace::lend(let_go.iter().map(|(s, r)| (&**s, r)))
+        };
+        // The ranges the lists' shaders write in place, each once
+        // (marked written once they have run).
+        let written_in_place: Vec<(u64, u64)> = runs
+            .iter()
+            .flat_map(|l| l.deferred().in_place_written.iter().copied().collect::<Vec<_>>())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // Diagnostics (`VICTORY_PROBE_EMPTY_BOUNDS`): the empty bounds those
+        // ranges hold before the lists run; those found after and not
+        // before appeared while they ran.
+        #[cfg(feature = "diagnostics")]
+        let bounds_before: Vec<Vec<usize>> = if crate::trail::probe_empty_bounds() {
+            written_in_place.iter().map(|&(at, len)| crate::trail::empty_bounds(at as usize, (len as usize).min(1 << 20))).collect()
+        } else {
+            Vec::new()
         };
         // Last before the lists run: every texture they reach is raised by
         // now (`resource::residency`).
@@ -1533,6 +1566,26 @@ impl Host {
         for list in runs {
             for work in &list.deferred().read_back {
                 work();
+            }
+        }
+        // What shaders wrote in place is written for trackers too, at the
+        // addresses and wherever else the title shows those pages (a host
+        // copy or a texture over another mapping of them). After the
+        // copy-backs: they read a changed page as the title's write and keep
+        // its bytes over the shaders', and the declared ranges (up to a whole
+        // copy) cover pages the copies' shaders wrote. Each range once,
+        // outside the list locks.
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+        for (i, &(at, len)) in written_in_place.iter().enumerate() {
+            crate::watch::gpu_wrote(at as usize, len as usize);
+            #[cfg(feature = "diagnostics")]
+            if let Some(before) = bounds_before.get(i) {
+                crate::trail::scan_new_empty_bounds(
+                    at as usize,
+                    (len as usize).min(1 << 20),
+                    before,
+                    "-1 beside infinities (empty bounds) appeared while GPU work wrote in place",
+                );
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2151,6 +2204,20 @@ impl HostList {
             .or_insert_with(|| (shadow.clone(), Default::default()))
             .1
             .insert((address, len));
+    }
+
+    /// The list's shaders write `[address, address + len)` of a copy the
+    /// GPU uses in place ([`HostList::keep_in_place`] too).
+    pub(crate) fn keep_in_place_write(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) {
+        self.keep_in_place(shadow, address, len);
+        self.deferred().in_place_written.insert((address, len.min(shadow.left(address))));
+    }
+
+    /// Tests: the list's shaders write `[address, address + len)` in place,
+    /// as [`HostList::keep_in_place_write`] declares, without a copy.
+    #[cfg(test)]
+    pub(crate) fn declare_in_place_write(&self, address: u64, len: u64) {
+        self.deferred().in_place_written.insert((address, len));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date

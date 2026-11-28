@@ -130,7 +130,7 @@ pub(crate) fn wrote(at: usize, len: usize, what: &'static str, copy: Option<(u64
     let written = written.get_or_insert_with(HashMap::new);
     for page in first..last {
         let from = at.max(page * PAGE);
-        let to = end.min((page + 1) * PAGE);
+        let to = end.min((page + 1).saturating_mul(PAGE));
         let writes = written.entry(page).or_default();
         if writes.len() == WRITES {
             writes.remove(0);
@@ -143,6 +143,73 @@ pub(crate) fn wrote(at: usize, len: usize, what: &'static str, copy: Option<(u64
             copy,
         });
     }
+}
+
+/// Whether quadword `q` holds only infinities: four halves or two floats,
+/// each `+inf` or `-inf` (an empty box's corners).
+fn infinities(q: u64) -> bool {
+    let halves = (0..4).all(|k| matches!((q >> (16 * k)) as u16, 0x7c00 | 0xfc00));
+    let floats = (0..2).all(|k| matches!((q >> (32 * k)) as u32, 0x7f80_0000 | 0xff80_0000));
+    halves || floats
+}
+
+/// Whether writes the guards do not see ([`crate::watch::Writing`]) and
+/// ranges GPU work may have written in place are scanned for empty bounds
+/// (`VICTORY_PROBE_EMPTY_BOUNDS=1`; a scan reads up to 64 MiB a write).
+/// Each in-place range is read before and after every submission; bounds
+/// found only after appeared while the lists ran (written by the GPU, or
+/// by a title thread meanwhile).
+pub(crate) fn probe_empty_bounds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PROBE_EMPTY_BOUNDS").is_ok_and(|v| v == "1"))
+}
+
+/// After a write that `what` names into `[at, at + len)` (pages [`wrote`]
+/// keeps at most): the first quadword of -1 beside one of infinities in
+/// each page, the empty bounds the title faulted on reading as a pointer,
+/// becomes a write of the page's trail, so that a crash report tells
+/// whether that write brought them.
+pub(crate) fn scan_empty_bounds(at: usize, len: usize, what: &'static str) {
+    scan_new_empty_bounds(at, len, &[], what);
+}
+
+/// [`scan_empty_bounds`], leaving out the bounds at `before` (addresses
+/// [`empty_bounds`] gave before the write): what is left appeared since.
+pub(crate) fn scan_new_empty_bounds(at: usize, len: usize, before: &[usize], what: &'static str) {
+    let mut last_page = None;
+    for hit in empty_bounds(at, len) {
+        if last_page == Some(hit / PAGE) || before.binary_search(&hit).is_ok() {
+            continue;
+        }
+        last_page = Some(hit / PAGE);
+        wrote(hit, 16, what, None);
+        // Also where else the title shows the page: the address its code
+        // reads may be another mapping of it.
+        for other in crate::watch::shown_elsewhere(hit) {
+            wrote(other + hit % PAGE, 16, what, None);
+        }
+    }
+}
+
+/// The addresses in `[at, at + len)` (pages [`wrote`] keeps at most), in
+/// order, of each quadword of -1 beside one of infinities.
+pub(crate) fn empty_bounds(at: usize, len: usize) -> Vec<usize> {
+    let end = at.saturating_add(len).min((at / PAGE * PAGE).saturating_add(WRITE_PAGES * PAGE));
+    let mut hits = Vec::new();
+    let mut page = at / PAGE * PAGE;
+    while page < end {
+        let (from, to) = (at.max(page) & !7, end.min(page.saturating_add(PAGE)));
+        let n = to.saturating_sub(from) / 8;
+        let mut q = vec![0u64; n];
+        if n >= 2 && crate::host::read_kernel(from as *const u8, q.as_mut_ptr().cast(), 8 * n) {
+            hits.extend((0..n).filter(|&i| {
+                q[i] == u64::MAX && (q.get(i + 1).is_some_and(|&b| infinities(b)) || (i > 0 && infinities(q[i - 1])))
+            }).map(|i| from + 8 * i));
+        }
+        let Some(next) = page.checked_add(PAGE) else { break };
+        page = next;
+    }
+    hits
 }
 
 /// The last writes of the page holding `at` ([`wrote`]), oldest first.
@@ -171,7 +238,8 @@ fn writes(at: usize) -> Option<String> {
 /// if it has none, or another thread holds them (a crash on several threads
 /// at once).
 pub fn note(at: u64) -> Option<String> {
-    let parts: Vec<String> = [loaded(at), writes(at as usize), crate::shadow::holding(at)].into_iter().flatten().collect();
+    let parts: Vec<String> =
+        [loaded(at), writes(at as usize), crate::shadow::holding(at), crate::inplace::physical(at)].into_iter().flatten().collect();
     (!parts.is_empty()).then(|| parts.join("\n    "))
 }
 
@@ -289,6 +357,47 @@ mod tests {
         );
         assert!(note((page + PAGE) as u64).is_none());
         drop(memory);
+    }
+
+    #[test]
+    fn a_write_of_empty_bounds_is_noted() {
+        // Only read: plain host memory will do.
+        let mut mem = vec![0u64; 3 * PAGE / 8];
+        let base = mem.as_ptr() as usize;
+        let page = base.next_multiple_of(PAGE);
+        let at = |offset: usize| (page + offset - base) / 8;
+        mem[at(0x50)] = u64::MAX;
+        mem[at(0x58)] = 0x7f80_0000_ff80_0000;
+        mem[at(PAGE + 0x100)] = 0xfc00_fc00_7c00_7c00;
+        mem[at(PAGE + 0x108)] = u64::MAX;
+        mem[at(PAGE + 0x200)] = u64::MAX;
+        scan_empty_bounds(page + 8, 2 * PAGE - 64, "test: empty bounds");
+        let n = note((page + 0x50) as u64).expect("a note");
+        assert!(n.contains("test: empty bounds +0x50..+0x60"), "floats after -1: {n}");
+        let n = note((page + PAGE) as u64).expect("a note");
+        assert!(n.contains("test: empty bounds +0x108..+0x118"), "halves before -1: {n}");
+        assert!(!n.contains("+0x200"), "-1 alone is not one: {n}");
+        drop(mem);
+    }
+
+    #[test]
+    fn only_empty_bounds_that_appeared_are_noted() {
+        // Only read: plain host memory will do.
+        let mut mem = vec![0u64; 2 * PAGE / 8];
+        let base = mem.as_ptr() as usize;
+        let page = base.next_multiple_of(PAGE);
+        let at = |offset: usize| (page + offset - base) / 8;
+        mem[at(0x40)] = u64::MAX;
+        mem[at(0x48)] = 0x7f80_0000_7f80_0000;
+        let before = empty_bounds(page, PAGE);
+        assert_eq!(before, [page + 0x40]);
+        mem[at(0x300)] = u64::MAX;
+        mem[at(0x308)] = 0xff80_0000_ff80_0000;
+        scan_new_empty_bounds(page, PAGE, &before, "test: appeared");
+        let n = note((page + 0x40) as u64).expect("a note");
+        assert!(n.contains("test: appeared +0x300..+0x310"), "the new one: {n}");
+        assert!(!n.contains("+0x40..+0x50"), "not the one there before: {n}");
+        drop(mem);
     }
 
     #[test]
