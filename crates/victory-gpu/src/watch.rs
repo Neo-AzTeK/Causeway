@@ -340,9 +340,10 @@ fn fill_from(g: &mut Guards, page: usize, (load, at): (Arc<crate::lazy::Load>, u
     use crate::ledger::{Owner, add};
     add(Owner::LazyPages, -(PAGE as i64));
     add(Owner::LazyFilled, PAGE as i64);
-    // The bytes are read before the page opens: once it is read-write the
-    // title's threads read it without faulting, and a disk read or a
-    // decode takes milliseconds (invariant(a_fill_reads_its_bytes_before_the_page_opens)).
+    // invariant(a_fill_reads_its_bytes_before_the_page_opens): the bytes
+    // are read before the page opens: once it is read-write the title's
+    // threads use it without faulting, and a disk read or a decode takes
+    // milliseconds.
     let mut fetched = Vec::new();
     let (bytes, ok) = match read {
         Some(read) => read,
@@ -357,9 +358,10 @@ fn fill_from(g: &mut Guards, page: usize, (load, at): (Arc<crate::lazy::Load>, u
     }
     // SAFETY: a committed page we just made read-write.
     let out = unsafe { std::slice::from_raw_parts_mut((page * PAGE) as *mut u8, PAGE) };
-    // shortcut: a thread touching the page during this one copy of 64 KiB
-    // reads it part filled; writing it while it stays without access
-    // would need a second address showing the page.
+    // shortcut: during this one copy of 64 KiB a title thread reads the
+    // page part filled, and its write is copied over (with `fill_unlocked`
+    // also not seen by trackers until `settle`); writing the page while it
+    // stays without access would need a second address showing it.
     if ok {
         out.copy_from_slice(bytes);
     } else {

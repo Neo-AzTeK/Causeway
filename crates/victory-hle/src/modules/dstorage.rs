@@ -454,7 +454,11 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
+        let list = page_list(&job.request);
         let result = execute(&job.request);
+        if let Some(before) = list {
+            list_changed(&before, &job.request);
+        }
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -1237,6 +1241,36 @@ fn into_destination(
         "dstorage: a destination's physical pages could not be written; its request fails"
     );
     Err(E_INVALIDARG)
+}
+
+/// A page destination's list of page numbers as it is now.
+fn page_list(request: &Request) -> Option<Vec<usize>> {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
+        return None;
+    }
+    let len = if request.options & (ZLIB | BCPACK) != 0 { request.destination_size } else { request.source_size };
+    let count = ((request.page_offset & 0xffff) as usize + len as usize).div_ceil(PAGE);
+    // SAFETY: the title passes a page number per 64 KiB of destination.
+    Some(unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), count) }.to_vec())
+}
+
+/// The title wrote a request's page list while the request ran: the bytes
+/// went to the pages the list named when it was read, which may be another
+/// request's (a list buffer used again).
+fn list_changed(before: &[usize], request: &Request) {
+    let Some(after) = page_list(request) else {
+        return;
+    };
+    if after == before {
+        return;
+    }
+    static CHANGED: AtomicU32 = AtomicU32::new(0);
+    let changed = CHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+    if changed <= 16 || changed.is_power_of_two() {
+        let differ = before.iter().zip(&after).filter(|(b, a)| b != a).count();
+        let zeros = before.iter().filter(|&&p| p == 0).count();
+        tracing::warn!(changed, pages = before.len(), differ, zeros, "dstorage: a page list changed while its request ran");
+    }
 }
 
 /// Milliseconds a page list naming page 0 is read again for.
