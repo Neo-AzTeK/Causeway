@@ -554,6 +554,17 @@ impl Lanes {
 
     /// Moves a queue's enqueued commands to the workers.
     fn submit(&mut self, id: u64) {
+        self.submit_but(id, false);
+    }
+
+    /// [`Lanes::submit`] for a queue half full: a read into physical pages
+    /// enqueued last stays until the next command, `Submit`, or a full
+    /// queue.
+    fn submit_held(&mut self, id: u64) {
+        self.submit_but(id, true);
+    }
+
+    fn submit_but(&mut self, id: u64, newest_page_read: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -572,7 +583,18 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        for command in std::mem::take(&mut lane.unsubmitted) {
+        let mut commands = std::mem::take(&mut lane.unsubmitted);
+        // invariant(the_newest_page_list_waits_for_the_next_command): the
+        // title writes a request's page list after enqueueing it; a read
+        // started before names the pages of the request that used the list
+        // before, and its bytes land in another load's memory.
+        if newest_page_read
+            && let Some(Command::Read(r)) = commands.last()
+            && r.options & PAGE_DESTINATION != 0
+        {
+            lane.unsubmitted.extend(commands.pop());
+        }
+        for command in commands {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
@@ -744,7 +766,8 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// submits on its own once half of it is enqueued, as the console does
+/// (holding back a page read enqueued last: [`Lanes::submit_held`]).
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -760,6 +783,13 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        // A read held back ([`Lanes::submit_held`]) goes now: the title
+        // has moved on to its next command, and the full queue frees
+        // slots only as reads finish.
+        if !lane.unsubmitted.is_empty() {
+            lanes.submit(id);
+            scheduler.work.notify_all();
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -770,7 +800,7 @@ fn queue(this: QueueRef, command: Command) {
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
+        lanes.submit_held(id);
         scheduler.work.notify_all();
     }
 }
@@ -1865,6 +1895,59 @@ mod tests {
         // SAFETY: the page is mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
+    }
+
+    /// A queue half full submits itself, but a read into physical pages
+    /// enqueued last waits for the next command: the title writes its page
+    /// list after enqueueing it, and the list still names the pages of the
+    /// request that used it before.
+    #[test]
+    fn the_newest_page_list_waits_for_the_next_command() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (2usize, [0usize; 2]);
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()), 1);
+        assert_eq!(given, 2);
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, page.as_ptr()), mapped);
+        // SAFETY: both pages are mapped read-write.
+        let shown = |k: usize| unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(k * PAGE), 4096) };
+
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc { source_type: 1, capacity: 4, priority: 1, name: c"pages".as_ptr(), unknown: 1 };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(1);
+        let plain = pattern(4096);
+        let mut first = [0u8; 16];
+        enqueue(queue, &request(MEMORY_SOURCE, first.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
+        // The list names the old request's page (the first) when enqueued.
+        let list = Box::leak(Box::new([page[0]]));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        enqueue(queue, &r); // the second of four: half full
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: the leaked list, alive for the whole test.
+        unsafe { std::ptr::write_volatile(list.as_mut_ptr(), page[1]) };
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(first, plain[..16]);
+        assert_eq!(shown(1), plain, "written to the page the list names");
+        assert!(shown(0).iter().all(|&b| b == 0), "the old request's page was written");
     }
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
