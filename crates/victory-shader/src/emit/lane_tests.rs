@@ -1421,7 +1421,7 @@ fn a_wave_of_a_wider_group_writes_no_shared_memory_where_it_is_off() {
     }
 }
 
-/// The two halves' slots take 132 dwords for 128 threads with a lane read:
+/// The two halves' slots take 134 dwords for 128 threads:
 /// past the program's own with 62 blocks of 128, in its top where it takes
 /// all 64 (the host's 32 KiB). Each lane writes its id + 1 to two dwords of
 /// the program's top 256, which hold every slot; reads its wave's lane mask

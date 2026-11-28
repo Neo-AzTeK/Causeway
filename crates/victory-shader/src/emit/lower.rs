@@ -707,17 +707,15 @@ impl<'a> Lower<'a> {
                     } else {
                         apart_steps()
                     };
-                    // Per console wave: 2 pair slots, then, where a lane is
-                    // read across the halves (`share_lane`), 64 lane slots.
-                    // A group vote uses the pair slots. All of it comes
+                    // Per console wave: 2 pair slots, then 64 lane slots.
+                    // Several waves also vote: a slot each. All of it comes
                     // after the program's own, in the host's 32 KiB; where
                     // that leaves too little, in the top of the program's
                     // own, which each exchange keeps and puts back
                     // (`borrow_slot`). A program whose own is larger than
                     // the host's would not be created.
                     let waves = threads.div_ceil(64);
-                    let lane_reads = insts().any(|i| i.name() == "v_readlane_b32");
-                    let extra = waves * if lane_reads { 66 } else { 2 };
+                    let extra = waves * if waves > 1 { 67 } else { 66 };
                     let borrow = s.lds_dwords + extra > HOST_LDS_DWORDS;
                     let steps = steps.and_then(|at| {
                         if s.lds_dwords > HOST_LDS_DWORDS {

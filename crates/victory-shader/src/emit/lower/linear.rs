@@ -326,26 +326,31 @@ impl Lower<'_> {
     }
 
     /// Whether `mine`, the same in every lane of a console wave, holds in any
-    /// wave of the group: the first pair slot of each wave, which both its
-    /// halves write alike (the exchanges' barriers keep them apart). Every
-    /// thread runs it.
+    /// wave of the group: a group-shared slot per wave. Every thread runs it.
     fn group_vote(&mut self, mine: V) -> Result<V, Why> {
         let at = self.cur;
         let (_, slot0) = self.halves.ok_or("a group vote")?;
         let [x, y, z] = self.s.threads.ok_or("a group vote")?;
         let waves = (x * y * z).div_ceil(64);
         let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+        // Past the pair slots (2 per wave) and the lane slots (64 per wave).
+        let first = self.xbase + waves * 66;
+        let base = self.s.m.i32(self.xbase);
+        let pairs = self.s.m.bin(at, Bin::Sub, slot0, base);
+        let wave = self.s.m.bin(at, Bin::LShr, pairs, one);
+        let k = self.s.m.i32(first);
+        let slot = self.s.m.bin(at, Bin::Add, k, wave);
         let mine = self.s.m.select(at, mine, one, zero);
-        let kept = self.borrow_slot(at, slot0);
+        let kept = self.borrow_slot(at, slot);
         let lds = self.s.lds();
-        let p = self.s.m.element(at, lds, slot0);
+        let p = self.s.m.element(at, lds, slot);
         self.s.m.store(at, p, mine);
         let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         let mut any = zero;
         for w in 0..waves {
-            let slot = self.s.m.i32(self.xbase + 2 * w);
+            let slot = self.s.m.i32(first + w);
             let p = self.s.m.element(at, lds, slot);
             let v = self.s.m.load(at, p);
             any = self.s.m.bin(at, Bin::Or, any, v);
@@ -353,7 +358,7 @@ impl Lower<'_> {
         // Reads done before the next vote writes.
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
-        self.return_slot(at, slot0, kept);
+        self.return_slot(at, slot, kept);
         Ok(self.s.m.cmp(at, pred::NE, any, zero))
     }
 
