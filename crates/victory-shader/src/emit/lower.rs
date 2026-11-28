@@ -125,9 +125,10 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
                     ShaderError::Unsupported { what, .. } => what,
                     _ => "two halves that do not lower",
                 };
-                // The failure may surface at a later use of the value the
-                // refused exchange left missing: name the exchange's own
-                // instruction.
+                // The failure may surface at a later use of the value a
+                // refused exchange left missing: name the first exchange
+                // refused for that reason (the one that failed, unless an
+                // earlier one's value went unused).
                 let name = refused.borrow().iter().find(|r| r.0 == what).map(|r| r.1);
                 failed = Some(match name {
                     Some(name) => format!("{what}: {name}"),

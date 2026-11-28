@@ -1545,6 +1545,8 @@ fn a_first_lane_read_in_a_loop_lanes_leave_apart_is_not_taken_per_half() {
 /// read is the console's; even lanes leave with the sum of the waves before
 /// their own, odd lanes, a round later, with their own wave's total added;
 /// the first wave stores 0.
+// shortcut: the load's result is unused, so nothing here shows that a wave
+// that is on gets it after the guarded code.
 #[test]
 fn a_first_lane_read_in_a_loop_lanes_leave_apart_and_a_load_take_both_halves_together() {
     let (mut body, _) = wave_prefix(&[

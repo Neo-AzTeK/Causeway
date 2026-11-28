@@ -108,6 +108,13 @@ fn layout(p: &Program) -> Result<Layout, &'static str> {
     Ok(Layout { order, loops })
 }
 
+/// Code [`Lower::linear_memory`] began: where it started and its join, and
+/// the lane masks read as data before it.
+pub(super) struct Memory {
+    at: Option<(usize, usize)>,
+    ballots: std::collections::HashSet<ir::Value>,
+}
+
 pub(crate) struct Linear {
     layout: Layout,
     /// By IR block: some wave of the group may be off in it.
@@ -353,26 +360,32 @@ impl Lower<'_> {
         Ok(self.s.m.cmp(at, pred::NE, any, zero))
     }
 
-    /// An instruction's guard `g`, which holds only in a wave that is on.
     /// Before the instruction with `fields` in block `b`: where some wave
     /// may be off in it and the instruction accesses memory other than LDS,
     /// the code that runs only where this wave is on (module notes); end it
     /// with [`Self::linear_memory_end`].
-    pub(super) fn linear_memory(&mut self, b: usize, fields: &Fields) -> Option<(usize, usize)> {
+    pub(super) fn linear_memory(&mut self, b: usize, fields: &Fields) -> Option<Memory> {
         let memory = matches!(
             fields,
             Fields::Smem { .. } | Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
         );
         let on = self.linear.as_ref().filter(|l| memory && l.skipped[b])?.on?;
-        self.begin_guarded(Some(on))
+        let ballots = self.ballots.keys().copied().collect();
+        Some(Memory {
+            at: self.begin_guarded(Some(on)),
+            ballots,
+        })
     }
 
     /// After the instruction `inst` that [`Self::linear_memory`] began:
     /// what it wrote is 0 where this wave is off.
-    pub(super) fn linear_memory_end(&mut self, at: Option<(usize, usize)>, inst: &Inst) {
-        if at.is_none() {
+    pub(super) fn linear_memory_end(&mut self, memory: Option<Memory>, inst: &Inst) {
+        let Some(Memory { at, ballots }) = memory else {
             return;
-        }
+        };
+        // Lane masks read as data inside, kept by value: made there, they
+        // would be used outside it.
+        self.ballots.retain(|v, _| ballots.contains(v));
         let mut written = Vec::new();
         let mut pairs = Vec::new();
         for &(_, v) in &inst.writes {
@@ -397,6 +410,7 @@ impl Lower<'_> {
         }
     }
 
+    /// An instruction's guard `g`, which holds only in a wave that is on.
     pub(super) fn linear_guard(&mut self, g: Option<V>) -> Option<V> {
         let Some(on) = self.linear.as_ref().and_then(|l| l.on) else {
             return g;
