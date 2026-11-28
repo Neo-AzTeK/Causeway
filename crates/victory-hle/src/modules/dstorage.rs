@@ -941,6 +941,13 @@ impl victory_gpu::lazy::Source for Disk {
         self.options & (ZLIB | BCPACK) != 0
     }
 
+    fn describe(&self) -> String {
+        format!(
+            "file offset {:#x}, {:#x} bytes read, {:#x} decoded, options {:#x}",
+            self.offset, self.source_size, self.len, self.options
+        )
+    }
+
     fn read(&self, at: usize, out: &mut [u8]) -> bool {
         if !self.whole() {
             return self.read_file(at, out);

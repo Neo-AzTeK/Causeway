@@ -765,7 +765,7 @@ fn register_memory(c: &CONTEXT) -> Vec<String> {
         ("r15", c.R15),
     ];
     // One at a time: a read that runs into unreadable memory fails whole.
-    let word = |at: u64| {
+    let read = |at: u64| {
         let mut word = 0u64;
         let mut read = 0;
         // SAFETY: fails, rather than faults, where `at` is not readable;
@@ -779,8 +779,9 @@ fn register_memory(c: &CONTEXT) -> Vec<String> {
                 &mut read,
             )
         };
-        (ok != 0).then(|| format!("{word:#x}"))
+        (ok != 0).then_some(word)
     };
+    let word = |at: u64| read(at).map(|w| format!("{w:#x}"));
     let line = |(name, at): (&str, u64)| {
         if module_of(at as usize).is_some() {
             return None;
@@ -788,7 +789,37 @@ fn register_memory(c: &CONTEXT) -> Vec<String> {
         let words: Vec<_> = (0..8).map_while(|i| word(at.checked_add(8 * i)?)).collect();
         (!words.is_empty()).then(|| format!("  [{name}] {}", words.join(" ")))
     };
-    registers.into_iter().filter_map(line).collect()
+    let mut out: Vec<String> = registers.into_iter().filter_map(line).collect();
+    // What the runtime knows of the memory each register points at, and
+    // of the memory the first words there point at.
+    if let Some(note) = NOTE.get() {
+        for (name, at) in registers {
+            if let Some(n) = note(at) {
+                out.push(format!("  [{name}] {n}"));
+            }
+            for i in 0..8u64 {
+                let Some(pointed) = at.checked_add(8 * i).and_then(read) else {
+                    break;
+                };
+                if let Some(n) = note(pointed) {
+                    out.push(format!("  [[{name}+{:#x}]] {n}", 8 * i));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What the runtime knows of title memory at an address, for the crash
+/// report ([`note_memory_on_crash`]).
+#[cfg(any(feature = "diagnostics", test))]
+static NOTE: std::sync::OnceLock<fn(u64) -> Option<String>> = std::sync::OnceLock::new();
+
+/// Has the crash report add `note`'s line for each address registers point
+/// at, and the words there point at, where it gives one (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub fn note_memory_on_crash(note: fn(u64) -> Option<String>) {
+    let _ = NOTE.set(note);
 }
 
 /// Return addresses of the faulting thread's frames, from the faulting

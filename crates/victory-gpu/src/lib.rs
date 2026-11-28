@@ -81,6 +81,8 @@ mod twin;
 mod vram;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod vramcopy;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod trail;
 #[cfg(windows)]
 mod watch;
 

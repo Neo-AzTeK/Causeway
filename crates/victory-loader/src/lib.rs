@@ -43,7 +43,7 @@ pub use crash::{
     report_unhandled,
 };
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use crash::save_on_crash;
+pub use crash::{note_memory_on_crash, save_on_crash};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]

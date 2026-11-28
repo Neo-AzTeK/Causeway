@@ -27,6 +27,10 @@ pub trait Source: Send + Sync {
     /// Fills `out` with decoded bytes `[at, at + out.len())`; false if the
     /// file cannot be read or decoded.
     fn read(&self, at: usize, out: &mut [u8]) -> bool;
+    /// Where the bytes come from, for diagnostics (a file and offset).
+    fn describe(&self) -> String {
+        String::new()
+    }
 }
 
 /// One load: its source, named by a number for the decode cache.
@@ -39,6 +43,11 @@ impl Load {
     pub fn new(source: Box<dyn Source>) -> Arc<Load> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Arc::new(Load { id: NEXT.fetch_add(1, Relaxed), source })
+    }
+
+    /// Its number and where its bytes come from, for diagnostics.
+    pub fn name(&self) -> String {
+        format!("{} {}", self.id, self.source.describe())
     }
 
     /// Decoded bytes `[at, at + out.len())`.

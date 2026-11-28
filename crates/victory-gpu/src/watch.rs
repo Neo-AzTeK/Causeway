@@ -302,6 +302,8 @@ fn open(g: &mut Guards, page: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     // A write is coming: the page takes its load's bytes first.
     if let Some(entry) = g.lazy.remove(&page) {
+        #[cfg(feature = "diagnostics")]
+        crate::trail::step(page, "filled before a write", Some((&entry.0, entry.1)));
         fill(g, page, entry);
     }
     if !g.protected.remove(&page) {
@@ -365,12 +367,16 @@ fn fill_from(g: &mut Guards, page: usize, (load, at): (Arc<crate::lazy::Load>, u
     if ok {
         out.copy_from_slice(bytes);
     } else {
+        #[cfg(feature = "diagnostics")]
+        crate::trail::step(page, "filled with zeros: the load could not be read", Some((&load, at)));
         tracing::warn!(page = format_args!("{:#x}", page * PAGE), "a disk load's bytes could not be read again: zeros");
         out.fill(0);
     }
     let others = g.alias_of.get(&page).cloned().unwrap_or_default();
     for other in others {
         if g.lazy.get(&other).is_some_and(|(l, a)| Arc::ptr_eq(l, &load) && *a == at) {
+            #[cfg(feature = "diagnostics")]
+            crate::trail::step(other, "filled at another address", Some((&load, at)));
             g.lazy.remove(&other);
             add(Owner::LazyPages, -(PAGE as i64));
             settle(g, other);
@@ -431,6 +437,8 @@ pub fn title_memory_lazy(load: &Arc<crate::lazy::Load>, at: usize, offset: usize
     }
     g.protected.insert(page);
     g.lazy.insert(page, (load.clone(), offset));
+    #[cfg(feature = "diagnostics")]
+    crate::trail::step(page, "left without bytes", Some((load, offset)));
     crate::ledger::add(crate::ledger::Owner::LazyPages, PAGE as i64);
     true
 }
@@ -456,6 +464,8 @@ pub fn title_memory_freed(at: usize) {
     let mut g = guards();
     let pages: Vec<usize> = g.lazy.range(at / PAGE..end.div_ceil(PAGE)).map(|(&p, _)| p).collect();
     for page in pages {
+        #[cfg(feature = "diagnostics")]
+        crate::trail::step(page, "freed without a fill", None);
         g.lazy.remove(&page);
         g.protected.remove(&page);
         crate::ledger::add(crate::ledger::Owner::LazyPages, -(PAGE as i64));
@@ -536,6 +546,8 @@ fn fill_unlocked(page: usize) -> bool {
             Some(_) => continue,
         }
         g.lazy.remove(&page);
+        #[cfg(feature = "diagnostics")]
+        crate::trail::step(page, "filled on access", Some((&load, at)));
         fill_from(&mut g, page, (load, at), Some((&bytes, ok)));
         settle(&mut g, page);
         return true;
@@ -913,6 +925,8 @@ impl Drop for Writing {
 pub fn kernel_will_write(at: usize, len: usize) -> Writing {
     #[cfg(feature = "diagnostics")]
     crate::memclass::wrote(crate::memclass::Writer::Kernel, at, len);
+    #[cfg(feature = "diagnostics")]
+    crate::trail::step_if_seen(at / PAGE, at.saturating_add(len).div_ceil(PAGE), "written by the runtime or the kernel");
     writing(at, len)
 }
 
@@ -921,6 +935,8 @@ pub fn kernel_will_write(at: usize, len: usize) -> Writing {
 pub(crate) fn gpu_writing(at: usize, len: usize) -> Writing {
     #[cfg(feature = "diagnostics")]
     crate::memclass::wrote(crate::memclass::Writer::Gpu, at, len);
+    #[cfg(feature = "diagnostics")]
+    crate::trail::step_if_seen(at / PAGE, at.saturating_add(len).div_ceil(PAGE), "written by GPU work");
     writing(at, len)
 }
 
@@ -943,6 +959,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::shadow::let_go(at as u64, len as u64);
     crate::inplace::forget(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    crate::trail::step_if_seen(first, last, "mapped or unmapped");
     let mut g = guards();
     // A page a disk load left without bytes that another address still
     // shows, left so by the same load, keeps its bytes there; the others
@@ -958,6 +976,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             })
         });
         if shown {
+            #[cfg(feature = "diagnostics")]
+            crate::trail::step(page, "unmapped without a fill: shown at another address", Some((&load, offset)));
             g.lazy.remove(&page);
             g.protected.remove(&page);
             crate::ledger::add(crate::ledger::Owner::LazyPages, -(PAGE as i64));
@@ -998,6 +1018,8 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     let lazy = others.iter().find_map(|&o| g.lazy.get(&(o / PAGE)).cloned());
     if let Some(entry) = lazy {
         use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
+        #[cfg(feature = "diagnostics")]
+        crate::trail::step(page, "mapped where a load left the page without bytes", Some((&entry.0, entry.1)));
         if set_protection(page, PAGE_NOACCESS) {
             g.protected.insert(page);
             if g.lazy.insert(page, entry).is_none() {
@@ -1005,6 +1027,8 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             }
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::trail::step(page, "its protection failed: readable without bytes", None);
     }
     if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
         protect(&mut g, &[page]);
@@ -1062,6 +1086,8 @@ fn install() {
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             #[cfg(feature = "diagnostics")]
             crate::memclass::wrote(crate::memclass::Writer::Cpu, at, 1);
+            #[cfg(feature = "diagnostics")]
+            crate::trail::step_if_seen(at / PAGE, at / PAGE + 1, "written by the title");
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
