@@ -340,20 +340,29 @@ fn fill_from(g: &mut Guards, page: usize, (load, at): (Arc<crate::lazy::Load>, u
     use crate::ledger::{Owner, add};
     add(Owner::LazyPages, -(PAGE as i64));
     add(Owner::LazyFilled, PAGE as i64);
+    // The bytes are read before the page opens: once it is read-write the
+    // title's threads read it without faulting, and a disk read or a
+    // decode takes milliseconds (invariant(a_fill_reads_its_bytes_before_the_page_opens)).
+    let mut fetched = Vec::new();
+    let (bytes, ok) = match read {
+        Some(read) => read,
+        None => {
+            fetched.resize(PAGE, 0);
+            let ok = load.bytes(at, &mut fetched);
+            (&fetched[..], ok)
+        }
+    };
     if !set_protection(page, PAGE_READWRITE) {
         return;
     }
-    // SAFETY: a committed page we just made read-write; the title's
-    // threads that touch it wait in our handler for the guard lock.
+    // SAFETY: a committed page we just made read-write.
     let out = unsafe { std::slice::from_raw_parts_mut((page * PAGE) as *mut u8, PAGE) };
-    let ok = match read {
-        Some((bytes, ok)) => {
-            out.copy_from_slice(bytes);
-            ok
-        }
-        None => load.bytes(at, out),
-    };
-    if !ok {
+    // shortcut: a thread touching the page during this one copy of 64 KiB
+    // reads it part filled; writing it while it stays without access
+    // would need a second address showing the page.
+    if ok {
+        out.copy_from_slice(bytes);
+    } else {
         tracing::warn!(page = format_args!("{:#x}", page * PAGE), "a disk load's bytes could not be read again: zeros");
         out.fill(0);
     }
@@ -1285,6 +1294,42 @@ pub(crate) mod tests {
         title_memory_freed(p);
         assert!(!guards().lazy.range(p / PAGE..p / PAGE + 3).any(|_| true));
         drop(t);
+        free(p);
+    }
+
+    /// A page our write fills from its load stays without access while the
+    /// load's bytes are read (a disk read or a decode, milliseconds): open
+    /// before, the title's threads would read it unfilled, without faulting.
+    #[test]
+    fn a_fill_reads_its_bytes_before_the_page_opens() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
+        struct Checking(usize, Arc<std::sync::atomic::AtomicU32>);
+        impl crate::lazy::Source for Checking {
+            fn size(&self) -> usize {
+                PAGE
+            }
+            fn whole(&self) -> bool {
+                false
+            }
+            fn read(&self, _: usize, out: &mut [u8]) -> bool {
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                unsafe { VirtualQuery(self.0 as *const _, &mut info, size_of_val(&info)) };
+                self.1.store(info.Protect, Relaxed);
+                out.fill(7);
+                true
+            }
+        }
+        let p = pool(2);
+        let seen = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let load = crate::lazy::Load::new(Box::new(Checking(p + PAGE, seen.clone())));
+        assert!(title_memory_lazy(&load, p + PAGE, 0));
+        drop(writing(p + PAGE + 1, 1));
+        assert_eq!(seen.load(Relaxed), PAGE_NOACCESS, "the page opened before its bytes were read");
+        // SAFETY: filled and open now.
+        assert_eq!(unsafe { ((p + PAGE + 2) as *const u8).read_volatile() }, 7);
         free(p);
     }
 
