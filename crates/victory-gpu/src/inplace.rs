@@ -340,8 +340,9 @@ pub(crate) struct Lending {
 /// `DXGI_ERROR_INVALID_CALL` and removes the device).
 ///
 /// shortcut: the old page is the title's memory too. Where another title
-/// address shows it, the title's threads see the lent bytes during the run,
-/// and what they write there meanwhile is lost (counted in the log line).
+/// address shows it, the title's threads and the submission's other lists
+/// reaching it there see the lent bytes during the run, and what they write
+/// there meanwhile is lost (counted as `elsewhere` in the log line).
 pub(crate) fn lend<'a>(
     uses: impl Iterator<Item = (&'a crate::shadow::Shadow, &'a std::collections::HashSet<(u64, u64)>)>,
 ) -> Lending {
