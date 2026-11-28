@@ -1256,6 +1256,44 @@ mod tests {
         assert_eq!(pages.page_byte(1, 256), 0x22, "the old page keeps its bytes");
     }
 
+    /// One section page shown at two title addresses (the title maps its
+    /// pages twice): what a list writes in place at the first is a write
+    /// for a tracker of the second (a host copy or a texture there), as a
+    /// copy-back's is.
+    #[test]
+    fn a_write_in_place_is_seen_where_else_the_page_is_shown() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let p = Pages::P;
+        let pages = Pages::new(2);
+        pages.map(0, 0);
+        pages.map(1, 0);
+        crate::watch::title_memory_aliased(pages.slot(1) as usize, &[pages.slot(0) as usize]);
+        let copy = crate::shadow::find(pages.slot(0), 512).expect("a copy");
+        if copy.placed_run().is_none() {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        }
+        let other = pages.slot(1) as usize;
+        let t = crate::watch::track(other, p, true).expect("a view is tracked");
+        t.take(other, other + p);
+        assert!(t.take(other, other + p).is_empty(), "taken");
+        let (src, src_data) = host.shared_buffer(p as u64).expect("a host buffer");
+        // SAFETY: inside the host buffer.
+        unsafe { std::ptr::write_bytes(src_data, 0x44, 256) };
+        let list = host.new_list().unwrap();
+        copy.gpu_writes(&list, pages.slot(0) + 256, 256, false);
+        // SAFETY: an open list; ranges inside the buffers.
+        unsafe { list.list.CopyBufferRegion(&copy.buffer, 256, &src, 0, 256) };
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(pages.slot_byte(1, 256), 0x44, "the other address shows the write");
+        assert_eq!(t.take(other, other + p), [(other, other + p)], "and its tracker sees it");
+        drop(t);
+    }
+
     /// A disk load's bytes, all `0x77`.
     struct Loaded;
 

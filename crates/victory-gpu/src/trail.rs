@@ -170,7 +170,13 @@ pub(crate) fn scan_empty_bounds(at: usize, len: usize, what: &'static str) {
                 q[i] == u64::MAX && (q.get(i + 1).is_some_and(|&b| infinities(b)) || (i > 0 && infinities(q[i - 1])))
             });
             if let Some(i) = hit {
-                wrote(from + 8 * i, 16, what, None);
+                let at = from + 8 * i;
+                wrote(at, 16, what, None);
+                // Also where else the title shows the page: the address its
+                // code reads may be another mapping of it.
+                for other in crate::watch::shown_elsewhere(at) {
+                    wrote(other + at % PAGE, 16, what, None);
+                }
             }
         }
         let Some(next) = page.checked_add(PAGE) else { break };

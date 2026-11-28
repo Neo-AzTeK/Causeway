@@ -971,6 +971,36 @@ pub(crate) fn gpu_writing(at: usize, len: usize) -> Writing {
     w
 }
 
+/// After GPU work wrote `[at, at + len)` where it lies (copies used in
+/// place, `crate::inplace`): trackers of those pages and of the other
+/// addresses showing them (`alias_of`) see a write, as [`gpu_writing`]
+/// shows them a copy-back's. Without it a host copy or a texture over
+/// another mapping of the pages keeps the bytes from before the GPU's.
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::memclass::wrote(crate::memclass::Writer::Gpu, at, len);
+        crate::trail::step_if_seen(first, last, "written by GPU work in place");
+        crate::trail::wrote(at, len, "written by GPU work in place", None);
+    }
+    changed(&mut guards(), first, last, false);
+    // Scanned as far as a root view declares (1 MiB): bigger ranges are
+    // whole buffers the shaders write a part of.
+    #[cfg(feature = "diagnostics")]
+    crate::trail::scan_empty_bounds(at, len.min(1 << 20), "GPU work in place wrote -1 beside infinities (empty bounds)");
+}
+
+/// Diagnostics: the other addresses (page starts) the title shows the page
+/// holding `at` at (`alias_of`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shown_elsewhere(at: usize) -> Vec<usize> {
+    guards().alias_of.get(&(at / PAGE)).map_or_else(Vec::new, |o| o.iter().map(|p| p * PAGE).collect())
+}
+
 /// What [`kernel_will_write`] and [`gpu_writing`] do.
 fn writing(at: usize, len: usize) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).

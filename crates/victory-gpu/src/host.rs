@@ -1159,6 +1159,9 @@ struct Deferred {
     /// ranges it uses there (address, bytes): held until the list is reset,
     /// with nothing to refresh (`crate::inplace::lend` reads the ranges).
     in_place: std::collections::HashMap<usize, InPlaceUse>,
+    /// Of those, the ranges its shaders write (address, bytes): marked
+    /// written once it has run ([`crate::watch::gpu_wrote`]).
+    in_place_written: std::collections::BTreeSet<(u64, u64)>,
 }
 
 impl Host {
@@ -1497,6 +1500,16 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         lending.give_back();
+        // What shaders wrote in place is written for trackers too, at the
+        // addresses and wherever else the title shows those pages (a host
+        // copy or a texture over another mapping of them): a copy-back
+        // marks its writes so, and the console's caches see the memory.
+        // Each range once, outside the list locks.
+        let written_in_place: std::collections::BTreeSet<(u64, u64)> =
+            runs.iter().flat_map(|l| l.deferred().in_place_written.iter().copied().collect::<Vec<_>>()).collect();
+        for (at, len) in written_in_place {
+            crate::watch::gpu_wrote(at as usize, len as usize);
+        }
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
@@ -2164,6 +2177,13 @@ impl HostList {
             .or_insert_with(|| (shadow.clone(), Default::default()))
             .1
             .insert((address, len));
+    }
+
+    /// The list's shaders write `[address, address + len)` of a copy the
+    /// GPU uses in place ([`HostList::keep_in_place`] too).
+    pub(crate) fn keep_in_place_write(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) {
+        self.keep_in_place(shadow, address, len);
+        self.deferred().in_place_written.insert((address, len.min(shadow.left(address))));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date

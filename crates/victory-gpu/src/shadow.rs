@@ -389,7 +389,7 @@ impl Shadow {
             // A GPU write lands past the guard: the load's bytes go in
             // first, or a later fill would cover what the GPU wrote.
             crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
-            list.keep_in_place(self, address, len);
+            list.keep_in_place_write(self, address, len);
             return;
         }
         let len = len.min(self.left(address));
