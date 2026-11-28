@@ -52,9 +52,10 @@ Each item names its problem in the ranked table below.
       remap read and wrote the old section page through their in-place
       buffer, and the title moves pages, so the GPU wrote into another
       resource's page; now the old page is lent the address's bytes for
-      the run. 6 of 6 default runs of 300 s clean on it (rb-h6-1..6),
-      report areas as before; waits for the owner's merge. Open: uses of
-      addresses unmapped since the list was recorded stay on the old page
+      the run. 8 of 12 default runs of 300 s clean on it (1 of 8 before),
+      report areas as before; not proven: one crash read -1 over half
+      floats in memory not used in place (another path, H8). Open: uses
+      of addresses unmapped since the list was recorded stay on the old page
 - [ ] Every run with in-place sections left about the size of the title's
       sections (7.5 GB) charged to system commit after the process exited,
       held by no process until a restart (`inplace-commit-leak`): over a
@@ -253,7 +254,7 @@ measure what the picture loses.
 | 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charges the rest of the list to its last timed command, so slow-command lines mislead on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list |
 | 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay (rank not confirmed by the owner) | seen three times on 2026-11-27 on the GTX 1070, each right after a GPU reset or stall; dumps: `dxgmms2!VIDMM_GLOBAL::EnsureLockedPages` after a failed lock of our process's pages, during an eviction from a system-memory segment; which pages, not known; no reset and no stop in 56 runs since 2026-11-27 17:50 (on watch) |
 | 17 | `image-uncommitted-write` | the title's code wrote to an address reserved but never committed and the run stopped with an access violation (rank not confirmed by the owner) | seen once on 2026-11-27, in a quiet run of `main`; a wild index in the title's interpreter, its source unknown; crash report extended to catch it |
-| 18 | `title-read-minus-one` | the title's code reads a pointer of all ones (or zero) from a loaded resource's memory and the run stops; most world runs on `main` since lazy disk loads (rank not confirmed by the owner) | four holes fixed (lazy fill order, stale page lists, slots over in-place memory after a remap, lists recorded before a remap); the first three merged into main, then crashes again in 7 of 8 runs; the fourth on `claude/inplace-page-tables`: 6 of 6 default 300 s runs clean, waits for merge |
+| 18 | `title-read-minus-one` | the title's code reads a pointer of all ones (or zero) from a loaded resource's memory and the run stops; most world runs on `main` since lazy disk loads (rank not confirmed by the owner) | four holes fixed (lazy fill order, stale page lists, slots over in-place memory after a remap, lists recorded before a remap); the first three merged into main, then crashes again in 7 of 8 runs; the fourth on `claude/inplace-page-tables`: 8 of 12 default 300 s runs clean (1 of 8 before), not proven: another path writes half floats over memory not used in place |
 | 19 | `inplace-commit-leak` | each run with in-place sections leaves the sections' size charged to system commit after it exits, so a session's later runs fail to allocate (rank not confirmed by the owner) | cause shown by a probe (a section opened for the GPU by handle stays charged after exit); fixed by opening a view of it by address (e28cfd7, merged); two title runs left commit flat |
 
 ## Finding what keeps the 3D scene from showing
