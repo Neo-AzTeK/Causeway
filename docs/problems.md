@@ -29,6 +29,14 @@ Each item names its problem in the ranked table below.
       in how long that content stays on screen (same commit: short in one
       run, long in the next). Refused work without them is the same on
       both sides (problem notes, "Confirm: refusal shift")
+- [ ] The title's code reads a pointer of all ones from a loaded resource
+      and the run stops, in most world runs on `main` since lazy disk loads
+      (`title-read-minus-one`). The resource's page holds another load's
+      bytes. Two holes are fixed on the problem's branch, each with a test:
+      a lazy page was opened before its bytes were written, and a half-full
+      DirectStorage queue started a read whose page list the title had not
+      written yet (old page numbers: another load's memory written). The
+      crash still came in one of two runs with both: a third hole is left
 - [ ] The title's code wrote to memory reserved but never committed and the
       run stopped (0xc0000005 in the title's image, one quiet run of `main`
       before the `descriptor-slots` merge; `image-uncommitted-write`). Not a
@@ -215,6 +223,7 @@ measure what the picture loses.
 | 15 | `gpu-timing-stamps` | with `VICTORY_GPU_TIMING`, a list of more than 4,095 noted commands charges the rest of the list to its last timed command, so slow-command lines mislead on long lists (rank not confirmed by the owner) | seen once: a dropped dispatch charged 4.9 s of a 5 s list |
 | 16 | `host-bugcheck` | Windows itself stops (bug check 0x10E, VIDEO_MEMORY_MANAGEMENT_INTERNAL, first parameter 0x37: the video memory manager's own check) during GPU runs, ending every session on the machine; seen during a game run and during a frame replay (rank not confirmed by the owner) | seen twice on 2026-11-27 on the GTX 1070; both dumps: `dxgmms2!VIDMM_GLOBAL::EnsureLockedPages` after a failed lock of our process's pages, during an eviction from a system-memory segment; which pages, not known |
 | 17 | `image-uncommitted-write` | the title's code wrote to an address reserved but never committed and the run stopped with an access violation (rank not confirmed by the owner) | seen once on 2026-11-27, in a quiet run of `main`; a wild index in the title's interpreter, its source unknown; crash report extended to catch it |
+| 18 | `title-read-minus-one` | the title's code reads a pointer of all ones (or zero) from a loaded resource's memory and the run stops; most world runs on `main` since lazy disk loads (rank not confirmed by the owner) | lazy loads off: no crash (one run); two holes fixed on the problem's branch, but the crash still came in one of two runs with both fixes |
 
 ## Finding what keeps the 3D scene from showing
 
