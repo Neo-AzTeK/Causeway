@@ -3,7 +3,10 @@
 //! that reads a bad pointer from such a page shows whether the page holds
 //! its load's bytes there (the load itself, or where it was read from, is
 //! wrong), or other bytes (something wrote it after, or it was filled from
-//! another load), and every step that page went through.
+//! another load), and every step that page went through. For every page,
+//! also the last writes the title's code did not make itself (write-backs
+//! of host copies, kernel reads) and remaps: who last wrote memory a bad
+//! pointer came from.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -93,12 +96,89 @@ pub(crate) fn step_if_seen(first: usize, last: usize, what: &'static str) {
     }
 }
 
-/// For the crash report: the trail of the page holding `at`, and, for the
-/// newest step naming a load, the eight quadwords at `at` in memory and in
-/// that load. `None` if the page has no trail (no disk load ever left it
-/// without bytes), or another thread holds the trail (a crash on several
-/// threads at once).
+/// Writes kept per page, newest last.
+const WRITES: usize = 4;
+
+/// Pages one write is kept for at most: a title's lengths may be saturated
+/// (`fread`'s size times count).
+const WRITE_PAGES: usize = 1024;
+
+/// A write into title memory that the title's own code did not make, or a
+/// change of what an address shows.
+struct Write {
+    at: f32,
+    what: &'static str,
+    /// Where in the page, and how many bytes there.
+    from: u32,
+    len: u32,
+    /// The host copy whose bytes went there: its title address and length.
+    copy: Option<(u64, u64)>,
+}
+
+/// Every page's last writes, whether or not a disk load left it: a title
+/// that reads a bad pointer shows who last wrote the memory it came from.
+static WRITTEN: Mutex<Option<HashMap<usize, Vec<Write>>>> = Mutex::new(None);
+
+/// `what` wrote `[at, at + len)` of title memory (from host copy `copy`
+/// where given), or changed what it shows.
+pub(crate) fn wrote(at: usize, len: usize, what: &'static str, copy: Option<(u64, u64)>) {
+    let now = seconds();
+    let end = at.saturating_add(len);
+    let first = at / PAGE;
+    let last = end.div_ceil(PAGE).min(first + WRITE_PAGES);
+    let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let written = written.get_or_insert_with(HashMap::new);
+    for page in first..last {
+        let from = at.max(page * PAGE);
+        let to = end.min((page + 1) * PAGE);
+        let writes = written.entry(page).or_default();
+        if writes.len() == WRITES {
+            writes.remove(0);
+        }
+        writes.push(Write {
+            at: now,
+            what,
+            from: (from - page * PAGE) as u32,
+            len: (to - from) as u32,
+            copy,
+        });
+    }
+}
+
+/// The last writes of the page holding `at` ([`wrote`]), oldest first.
+fn writes(at: usize) -> Option<String> {
+    let written = WRITTEN.try_lock().ok()?;
+    let writes = written.as_ref()?.get(&(at / PAGE))?;
+    let now = seconds();
+    let text: Vec<String> = writes
+        .iter()
+        .map(|w| {
+            let copy = w.copy.map_or(String::new(), |(a, l)| format!(" from the copy of {a:#x}+{l:#x}"));
+            format!(
+                "{:.1}s ago {} +{:#x}..+{:#x}{copy}",
+                now - w.at,
+                w.what,
+                w.from,
+                w.from + w.len
+            )
+        })
+        .collect();
+    Some(format!("page {:#x} last written: {}", at / PAGE * PAGE, text.join("; ")))
+}
+
+/// For the crash report: [`loaded`] and [`writes`] of the page holding
+/// `at`, and the GPU copies holding it (`crate::shadow::holding`). `None`
+/// if it has none, or another thread holds them (a crash on several threads
+/// at once).
 pub fn note(at: u64) -> Option<String> {
+    let parts: Vec<String> = [loaded(at), writes(at as usize), crate::shadow::holding(at)].into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join("\n    "))
+}
+
+/// The trail of the page holding `at`, and, for the newest step naming a
+/// load, the eight quadwords at `at` in memory and in that load. `None` if
+/// the page has no trail (no disk load ever left it without bytes).
+fn loaded(at: u64) -> Option<String> {
     let at = at as usize;
     let page = at / PAGE;
     let (steps, load) = {
@@ -209,5 +289,22 @@ mod tests {
         );
         assert!(note((page + PAGE) as u64).is_none());
         drop(memory);
+    }
+
+    #[test]
+    fn a_note_tells_the_last_writes_of_any_page() {
+        // An address no test maps: the trail only keeps numbers.
+        let page = 0x7_1234_0000usize;
+        for k in 0..WRITES + 1 {
+            wrote(page + 0x100 * k, 0x10, "written by GPU work", Some((0x7_1230_0000, 0x8_0000)));
+        }
+        wrote(page + PAGE - 8, 16, "written by the runtime or the kernel", None);
+        let n = note((page + 0x40) as u64).expect("writes");
+        assert!(!n.contains("+0x0..+0x10 "), "the oldest write went: {n}");
+        assert!(n.contains("written by GPU work +0x400..+0x410 from the copy of 0x712300000+0x80000"), "{n}");
+        assert!(n.contains("written by the runtime or the kernel +0xfff8..+0x10000"), "{n}");
+        let next = note((page + PAGE) as u64).expect("the write's second page");
+        assert!(next.contains("+0x0..+0x8"), "{next}");
+        assert_eq!(n.matches("ago").count(), WRITES);
     }
 }

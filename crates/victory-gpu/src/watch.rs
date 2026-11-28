@@ -927,6 +927,8 @@ pub fn kernel_will_write(at: usize, len: usize) -> Writing {
     crate::memclass::wrote(crate::memclass::Writer::Kernel, at, len);
     #[cfg(feature = "diagnostics")]
     crate::trail::step_if_seen(at / PAGE, at.saturating_add(len).div_ceil(PAGE), "written by the runtime or the kernel");
+    #[cfg(feature = "diagnostics")]
+    crate::trail::wrote(at, len, "written by the runtime or the kernel", None);
     writing(at, len)
 }
 
@@ -955,12 +957,13 @@ fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     // Copies the GPU uses in place go first, before the runtime unmaps:
     // those opened by address pin the pages, and the addresses will show
-    // other memory.
+    // other memory. Their section views are forgotten with them.
     crate::shadow::let_go(at as u64, len as u64);
-    crate::inplace::forget(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     crate::trail::step_if_seen(first, last, "mapped or unmapped");
+    #[cfg(feature = "diagnostics")]
+    crate::trail::wrote(at, len, "mapped or unmapped", None);
     let mut g = guards();
     // A page a disk load left without bytes that another address still
     // shows, left so by the same load, keeps its bytes there; the others
@@ -1088,6 +1091,8 @@ fn install() {
             crate::memclass::wrote(crate::memclass::Writer::Cpu, at, 1);
             #[cfg(feature = "diagnostics")]
             crate::trail::step_if_seen(at / PAGE, at / PAGE + 1, "written by the title");
+            #[cfg(feature = "diagnostics")]
+            crate::trail::wrote(at, 1, "written by the title", None);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {

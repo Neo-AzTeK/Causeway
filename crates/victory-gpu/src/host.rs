@@ -1115,6 +1115,9 @@ enum Step {
     Memory(usize),
 }
 
+/// An in-place copy a list holds and the ranges it uses there.
+type InPlaceUse = (std::sync::Arc<crate::shadow::Shadow>, std::collections::HashSet<(u64, u64)>);
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1152,9 +1155,10 @@ struct Deferred {
     /// Written-pages bitmaps the list's shaders mark: read back and zeroed
     /// after each submission of the list (`Host::read_marks`).
     marks: Vec<MarkBits>,
-    /// Copies the GPU uses in place that the list reads, by address: held
-    /// until the list is reset, with nothing to refresh.
-    in_place: std::collections::HashMap<usize, std::sync::Arc<crate::shadow::Shadow>>,
+    /// Copies the GPU uses in place that the list reads, by address, and the
+    /// ranges it uses there (address, bytes): held until the list is reset,
+    /// with nothing to refresh (`crate::inplace::lend` reads the ranges).
+    in_place: std::collections::HashMap<usize, InPlaceUse>,
 }
 
 impl Host {
@@ -1325,6 +1329,18 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         drop(touching);
+        // Remapped pages lists reach through in-place copies recorded before
+        // the remap take the bytes their addresses show, after the steps
+        // above wrote title memory (given back once the GPU is done). One
+        // list's lock at a time: a submission may name a list twice.
+        let lending = {
+            let mut let_go: Vec<InPlaceUse> = Vec::new();
+            for list in runs {
+                let deferred = list.deferred();
+                let_go.extend(deferred.in_place.values().filter(|(s, _)| s.is_let_go()).cloned());
+            }
+            crate::inplace::lend(let_go.iter().map(|(s, r)| (&**s, r)))
+        };
         // Last before the lists run: every texture they reach is raised by
         // now (`resource::residency`).
         #[cfg(feature = "diagnostics")]
@@ -1467,6 +1483,7 @@ impl Host {
         let copying = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
+        lending.give_back();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
@@ -2125,9 +2142,15 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
-    /// The list reads a copy the GPU uses in place: held until the reset.
-    pub(crate) fn keep_in_place(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
-        self.deferred().in_place.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| shadow.clone());
+    /// The list uses `[address, address + len)` of a copy the GPU uses in
+    /// place: held until the reset.
+    pub(crate) fn keep_in_place(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) {
+        self.deferred()
+            .in_place
+            .entry(std::sync::Arc::as_ptr(shadow) as usize)
+            .or_insert_with(|| (shadow.clone(), Default::default()))
+            .1
+            .insert((address, len));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2328,11 +2351,12 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        // A list recorded before a remap reads the old pages through the
-        // in-place copies it holds (`crate::shadow::let_go`): how often.
+        // A list recorded before a remap holds in-place copies let go
+        // (`crate::shadow::let_go`; `crate::inplace::lend` gives it the new
+        // pages): how often.
         #[cfg(feature = "diagnostics")]
         {
-            let stale = self.deferred().in_place.values().filter(|s| s.is_let_go()).count();
+            let stale = self.deferred().in_place.values().filter(|(s, _)| s.is_let_go()).count();
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if stale > 0 && SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
                 tracing::info!(stale, "a list submitted holds in-place copies let go since it was recorded");
@@ -2568,6 +2592,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::gpu_writing(dst as usize, len));
+    #[cfg(feature = "diagnostics")]
+    if title_dst {
+        crate::trail::wrote(dst as usize, len, "copied by a title list", None);
+    }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);

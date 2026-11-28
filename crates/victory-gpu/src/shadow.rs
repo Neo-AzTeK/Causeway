@@ -55,6 +55,9 @@ pub(crate) struct Shadow {
     in_place: Option<ID3D12Heap>,
     /// Whether that heap pins the title's view (`crate::inplace::Opened::pins`).
     pins: bool,
+    /// Where the in-place buffer lies in its section
+    /// (`crate::inplace::Opened::place`).
+    place: Option<(usize, u64)>,
     /// An in-place copy the runtime let go before remapping its memory
     /// ([`let_go`]): its buffer shows the section's old pages, no longer
     /// what the title addresses show.
@@ -232,6 +235,8 @@ impl Shadow {
         {
             let _writing = crate::watch::gpu_writing(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
+            #[cfg(feature = "diagnostics")]
+            crate::trail::wrote(from, n, "written back (memory page table)", Some((self.start, self.len)));
         }
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
@@ -248,7 +253,7 @@ impl Shadow {
             // loads left without bytes take them first (the rest of the
             // view, textures read through `host::read`, stays without).
             crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
-            list.keep_in_place(self);
+            list.keep_in_place(self, address, len);
             return;
         }
         let len = len.min(self.start + self.len - address);
@@ -285,6 +290,7 @@ impl Shadow {
             block,
             in_place: None,
             pins: false,
+            place: None,
             let_go: Default::default(),
             home,
         });
@@ -311,9 +317,18 @@ impl Shadow {
             block: None,
             in_place: Some(o.heap),
             pins: o.pins,
+            place: o.place,
             let_go: Default::default(),
             home: None,
         })
+    }
+
+    /// An in-place buffer placed in a section: the title addresses it
+    /// showed when placed (start, bytes) and where it lies (section,
+    /// offset).
+    pub(crate) fn placed_run(&self) -> Option<(u64, u64, usize, u64)> {
+        let (section, offset) = self.place?;
+        Some((self.start, self.len, section, offset))
     }
 
     /// Whether the runtime let it go before remapping its memory
@@ -371,7 +386,7 @@ impl Shadow {
             // A GPU write lands past the guard: the load's bytes go in
             // first, or a later fill would cover what the GPU wrote.
             crate::watch::fill_lazy(address as usize, len.min(self.left(address)) as usize);
-            list.keep_in_place(self);
+            list.keep_in_place(self, address, len);
             return;
         }
         let len = len.min(self.left(address));
@@ -463,6 +478,8 @@ impl Shadow {
             // (views, textures) take the range again. What it computed
             // from memory with no copy (`back` false) stays there too.
             drop(crate::watch::gpu_writing(address, len));
+            #[cfg(feature = "diagnostics")]
+            crate::trail::wrote(address, len, "written by the GPU in place", Some((self.start, self.len)));
             return 0;
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -527,6 +544,8 @@ impl Shadow {
                         #[cfg(feature = "diagnostics")]
                         let t3 = std::time::Instant::now();
                         let _writing = crate::watch::gpu_writing(start + at, n);
+                        #[cfg(feature = "diagnostics")]
+                        crate::trail::wrote(start + at, n, "written back", Some((self.start, self.len)));
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
@@ -630,6 +649,8 @@ impl Shadow {
         if let Some(bytes) = written {
             let _writing = crate::watch::gpu_writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
+            #[cfg(feature = "diagnostics")]
+            crate::trail::wrote(from, n, "written back (marked page)", Some((self.start, self.len)));
             #[cfg(feature = "diagnostics")]
             note_write_back(self, from as u64);
         }
@@ -1079,11 +1100,16 @@ pub(crate) fn let_go_count() -> u64 {
 /// copies over it go: what those addresses show changes. A heap opened from
 /// the view's address also pins its pages (Windows refuses the unmap while
 /// one lives); one opened from its section does not. Buffers there are
-/// opened or copied again on their next use.
+/// opened or copied again on their next use. The section views there are
+/// forgotten under the same lock as the copies go ([`in_place`] opens under
+/// it): a buffer first used meanwhile on another thread found the view
+/// still known and was placed on the page the address stops showing, in a
+/// copy no later call let go.
 pub(crate) fn let_go(at: u64, len: u64) {
     let end = at.saturating_add(len);
     let gone: Vec<Arc<Shadow>> = {
         let mut map = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        crate::inplace::forget(at, len);
         let hit: Vec<u64> = map.range(..end).filter(|(_, s)| s.start + s.len > at).map(|(&k, _)| k).collect();
         hit.iter().filter_map(|k| map.remove(k)).collect()
     };
@@ -1100,9 +1126,11 @@ pub(crate) fn let_go(at: u64, len: u64) {
     // are made again from their records before the next submission
     // (`descriptor::sync_heaps`), as the console's GPU reads a view's
     // address through the page tables when it runs.
-    // shortcut: lists recorded before the remap keep the copy (their root
-    // views and the in-place copies they hold): one submitted after it
-    // reads and writes the old pages.
+    // Lists recorded before the remap keep the copy (their root views and
+    // the in-place copies they hold name its buffer): when one is submitted,
+    // the old section pages it reaches lend it what the addresses show then
+    // (`crate::inplace::lend`). A copy opened by address is not lent: it
+    // pins the view (the warning below).
     for shadow in &gone {
         shadow.let_go.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1175,6 +1203,40 @@ const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// Diagnostics, for the crash report: the copies that hold title address
+/// `at` now (title buffers', loose memory's, in-place ones): whether the
+/// GPU could have written there. None where no copy holds it, or another
+/// thread holds the copies (a crash on several threads at once).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn holding(at: u64) -> Option<String> {
+    let describe = |s: &Shadow| {
+        let kind = match (&s.in_place, s.place) {
+            (None, _) => "host copy",
+            (Some(_), Some(_)) => "in place on its section",
+            (Some(_), None) => "in place by address",
+        };
+        let gone = if s.is_let_go() { ", let go" } else { "" };
+        format!("{kind} of {:#x}+{:#x}{gone}", s.start, s.len)
+    };
+    let holds = |s: &Shadow| s.start <= at && at < s.start + s.len;
+    let mut out = Vec::new();
+    if let Ok(map) = BUFFERS.try_lock() {
+        for ((start, _), e) in map.range(..=(at, usize::MAX)).rev().take(64) {
+            if at < e.end {
+                let copy = e.shadow.as_deref().map_or("no copy".to_string(), describe);
+                out.push(format!("buffer {start:#x}..{:#x}: {copy}", e.end));
+            }
+        }
+    }
+    if let Ok(map) = OPEN.try_lock() {
+        out.extend(map.values().filter(|s| holds(s)).map(|s| describe(s)));
+    }
+    if let Ok(map) = LOOSE.try_lock() {
+        out.extend(map.values().filter(|s| holds(s)).map(|s| describe(s)));
+    }
+    (!out.is_empty()).then(|| format!("held by: {}", out.join("; ")))
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
