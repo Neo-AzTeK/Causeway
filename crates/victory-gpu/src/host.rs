@@ -2424,6 +2424,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // The kernel writes the destination: it must not be guarded meanwhile.
     let _writing = title_dst.then(|| crate::watch::gpu_writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
+    if title_dst {
+        crate::trail::wrote(dst as usize, len, "copied by a title list", None);
+    }
+    #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]

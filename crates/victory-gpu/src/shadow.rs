@@ -235,6 +235,8 @@ impl Shadow {
         {
             let _writing = crate::watch::gpu_writing(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
+            #[cfg(feature = "diagnostics")]
+            crate::trail::wrote(from, n, "written back (memory page table)", Some((self.start, self.len)));
         }
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
@@ -476,6 +478,8 @@ impl Shadow {
             // (views, textures) take the range again. What it computed
             // from memory with no copy (`back` false) stays there too.
             drop(crate::watch::gpu_writing(address, len));
+            #[cfg(feature = "diagnostics")]
+            crate::trail::wrote(address, len, "written by the GPU in place", Some((self.start, self.len)));
             return 0;
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -540,6 +544,8 @@ impl Shadow {
                         #[cfg(feature = "diagnostics")]
                         let t3 = std::time::Instant::now();
                         let _writing = crate::watch::gpu_writing(start + at, n);
+                        #[cfg(feature = "diagnostics")]
+                        crate::trail::wrote(start + at, n, "written back", Some((self.start, self.len)));
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::BackWriteUs, t3.elapsed().as_micros() as u64);
@@ -643,6 +649,8 @@ impl Shadow {
         if let Some(bytes) = written {
             let _writing = crate::watch::gpu_writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
+            #[cfg(feature = "diagnostics")]
+            crate::trail::wrote(from, n, "written back (marked page)", Some((self.start, self.len)));
             #[cfg(feature = "diagnostics")]
             note_write_back(self, from as u64);
         }

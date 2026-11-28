@@ -494,6 +494,8 @@ impl Lending {
             for (from, to) in differing(&page.put, &now) {
                 let at = page.at as usize + from;
                 let _writing = crate::watch::gpu_writing(at, to - from);
+                #[cfg(feature = "diagnostics")]
+                crate::trail::wrote(at, to - from, "given back from a lent page", None);
                 crate::host::write_mapped(at as *mut u8, now[from..].as_ptr(), to - from);
             }
         }
