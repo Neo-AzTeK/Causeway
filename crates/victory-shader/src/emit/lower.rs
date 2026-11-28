@@ -35,8 +35,9 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Why a compute program of waves of 64 asks the host for them.
-    pub wave64_why: Option<Why>,
+    /// Why a compute program of waves of 64 asks the host for them, with
+    /// the instruction whose exchange between host waves was refused.
+    pub wave64_why: Option<String>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -113,21 +114,30 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     loop {
         let l = Lower::new(parts, &bad, virt);
         let tried = l.virt;
+        let refused = l.refused.clone();
         match l.run() {
             Ok(mut l) => {
                 l.wave64_why = failed.or(l.wave64_why);
                 return Ok(l);
             }
             Err(Stop::Fail(e)) if tried => {
-                failed = Some(match e {
+                let what = match e {
                     ShaderError::Unsupported { what, .. } => what,
                     _ => "two halves that do not lower",
+                };
+                // The failure may surface at a later use of the value the
+                // refused exchange left missing: name the exchange's own
+                // instruction.
+                let name = refused.borrow().iter().find(|r| r.0 == what).map(|r| r.1);
+                failed = Some(match name {
+                    Some(name) => format!("{what}: {name}"),
+                    None => what.to_owned(),
                 });
                 virt = false;
                 bad.clear();
             }
             Err(Stop::Retry(v, why)) if tried && bad.contains_key(&v) => {
-                failed = Some(why);
+                failed = Some(why.to_owned());
                 virt = false;
                 bad.clear();
             }
@@ -265,6 +275,11 @@ struct Lower<'a> {
     /// Several console waves per group (module `linear`).
     linear: Option<linear::Linear>,
     wave64_why: Option<Why>,
+    /// The instruction being lowered (its name), and each one whose
+    /// exchange between host waves was refused, with the reason: [`lower`]
+    /// names the first with the reason the program fails for.
+    inst: &'a str,
+    refused: std::rc::Rc<std::cell::RefCell<Vec<(Why, &'a str)>>>,
     /// IR blocks every lane runs exactly once.
     common: Vec<bool>,
     /// With `virt`: VGPR values alike in every lane of a console wave
@@ -810,6 +825,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             virt,
             wave64_why,
+            inst: "",
+            refused: Default::default(),
             linear: linear::new(x.p, x.st, x.native),
             // With the halves together, every thread of a group of one
             // console wave runs every block the same number of times.
@@ -1649,7 +1666,7 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
-            wave64_why: self.wave64_why,
+            wave64_why: self.wave64_why.map(str::to_owned),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3311,14 +3328,14 @@ impl<'a> Lower<'a> {
     fn exchange(&mut self, at: usize, ir: usize, x: V, absent: V) -> Result<(V, V), Why> {
         let (half, slot0) = self.halves.ok_or("an exchange between host waves")?;
         if !self.common[ir] {
-            return Err(if super::lockstep::looped(&self.x.p.blocks, ir) {
+            return Err(self.refuse(if super::lockstep::looped(&self.x.p.blocks, ir) {
                 "an exchange between host waves in a loop"
             } else {
                 "an exchange between host waves in a block a branch skips"
-            });
+            }));
         }
         if at == self.cur && self.guarded > 0 {
-            return Err("an exchange between host waves under a lane's guard");
+            return Err(self.refuse("an exchange between host waves under a lane's guard"));
         }
         let lds = self.s.lds();
         let mine = self.s.m.bin(at, Bin::Add, slot0, half);
@@ -3392,20 +3409,28 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.cmp(c, pred::NE, both, zero))
     }
 
+    /// `why`, an exchange between host waves refused at the instruction
+    /// being lowered, noted so that the reason the program asks for waves
+    /// of 64 can name it ([`lower`]).
+    fn refuse(&self, why: Why) -> Why {
+        self.refused.borrow_mut().push((why, self.inst));
+        why
+    }
+
     /// With `virt`: `x` of console lane `lane` (of this console wave), by a
     /// group-shared slot per lane; the same conditions as [`Self::exchange`].
     fn share_lane(&mut self, ir: usize, x: V, lane: V) -> Result<V, Why> {
         let c = self.cur;
         let (half, slot0) = self.halves.ok_or("a lane read across host waves")?;
         if !self.common[ir] {
-            return Err(if super::lockstep::looped(&self.x.p.blocks, ir) {
+            return Err(self.refuse(if super::lockstep::looped(&self.x.p.blocks, ir) {
                 "a lane read across host waves in a loop"
             } else {
                 "a lane read across host waves in a block a branch skips"
-            });
+            }));
         }
         if self.guarded > 0 {
-            return Err("a lane read across host waves under a lane's guard");
+            return Err(self.refuse("a lane read across host waves under a lane's guard"));
         }
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (base, one, k5, k63) = (k(self, self.xbase), k(self, 1), k(self, 5), k(self, 63));
@@ -3870,6 +3895,7 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        self.inst = name;
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {

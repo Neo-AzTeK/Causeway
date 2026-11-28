@@ -184,7 +184,7 @@ fn translate_form(
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
-        wave64_why: lowered.wave64_why.map(str::to_owned),
+        wave64_why: lowered.wave64_why,
     })
 }
 
