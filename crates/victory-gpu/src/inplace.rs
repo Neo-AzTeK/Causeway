@@ -324,7 +324,27 @@ struct Lent {
 #[derive(Default)]
 pub(crate) struct Lending {
     pages: Vec<Lent>,
+    kept: Vec<Kept>,
 }
+
+/// One page a submitted list reaches through an in-place buffer whose title
+/// address (`at`) is unmapped now: the console's GPU faults there, ours
+/// reaches the buffer's old page (`old`), which other title addresses may
+/// show now (`shown`). What the GPU changes in the ranges the list uses
+/// there (`within`, offsets in the page) gets its bytes (`saved`) back.
+struct Kept {
+    at: u64,
+    old: *mut u8,
+    saved: Vec<u8>,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    shown: Vec<u64>,
+    within: Vec<(usize, usize)>,
+}
+
+/// A page [`lend`] looks at: the page, its old page in our view, whether a
+/// view is known at the page, the title addresses that show the old page
+/// now, and the ranges the lists use in it (offsets in the page).
+type Wanted = (u64, usize, bool, Vec<u64>, Vec<(usize, usize)>);
 
 /// Before a submission runs, for the in-place buffers its lists hold and the
 /// ranges they use there (`uses`): the console's GPU reads a title address
@@ -332,7 +352,11 @@ pub(crate) struct Lending {
 /// remapped an address sees the new page. Ours hold a buffer placed on the
 /// section's old page (`crate::shadow::let_go`): for the run, that page
 /// takes the bytes the address shows now, and what the GPU writes there goes
-/// to the address afterwards ([`Lending::give_back`]).
+/// to the address afterwards ([`Lending::give_back`]). Where the address is
+/// unmapped now, the console's GPU faults and writes nothing; ours reaches
+/// the old page, which the title may show at another address by then: what
+/// the GPU changes there in the ranges the lists use goes back to the bytes
+/// from before the run.
 ///
 /// Not page tables of the host's own (a reserved buffer whose 64 KiB tiles
 /// map section pages, mapped again at each remap): D3D12 refuses tiles over
@@ -343,14 +367,17 @@ pub(crate) struct Lending {
 /// address shows it, the title's threads and the submission's other lists
 /// reaching it there see the lent bytes during the run; what lists write
 /// there meanwhile goes to the lending address instead, and what the title
-/// writes there is lost (counted as `elsewhere` in the log line). Copies
+/// writes there is lost (counted as `elsewhere` in the log line). The same
+/// holds for an unmapped address's old page shown elsewhere: the title's
+/// threads see the GPU's writes there during the run, and what the title or
+/// other lists write there in the ranges used goes back too. Copies
 /// opened by address (`Opened::place` none) are not lent: they pin the
 /// view, so the runtime's unmap fails while lists hold them.
 pub(crate) fn lend<'a>(
     uses: impl Iterator<Item = (&'a crate::shadow::Shadow, &'a std::collections::HashSet<(u64, u64)>)>,
 ) -> Lending {
     let mut lending = Lending::default();
-    let wanted: Vec<(u64, usize, bool)> = {
+    let wanted: Vec<Wanted> = {
         let s = sections();
         let mut wanted = Vec::new();
         let mut taken: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
@@ -375,6 +402,13 @@ pub(crate) fn lend<'a>(
             }
             for page in pages {
                 let page_offset = offset + (page - start);
+                let within: Vec<(usize, usize)> = ranges
+                    .iter()
+                    .filter_map(|&(at, n)| {
+                        let (from, to) = (at.max(page), at.saturating_add(n).min(page + PAGE));
+                        (from < to).then(|| ((from - page) as usize, (to - page) as usize))
+                    })
+                    .collect();
                 // Not lent where the address shows this very page. With no
                 // view known there (memory mapped otherwise, or one the
                 // runtime is mapping right now, between `forget` and
@@ -395,18 +429,26 @@ pub(crate) fn lend<'a>(
                     continue;
                 }
                 taken.insert(old, page);
-                wanted.push((page, old, section, page_offset, known));
+                wanted.push((page, old, section, page_offset, known, within));
             }
         }
         // `page` shows another page now, so a view holding the old one is
         // at another address: one pass over the views for all of them.
-        let elsewhere = s
-            .views
-            .values()
-            .flat_map(|v| wanted.iter().filter(move |w| w.2 == v.section && v.offset <= w.3 && w.3 < v.offset + v.len))
-            .count();
+        let mut shown: Vec<Vec<u64>> = vec![Vec::new(); wanted.len()];
+        for (&base, v) in &s.views {
+            for (w, shown) in wanted.iter().zip(&mut shown) {
+                if w.2 == v.section && v.offset <= w.3 && w.3 < v.offset + v.len {
+                    shown.push(base + (w.3 - v.offset));
+                }
+            }
+        }
+        let elsewhere: usize = shown.iter().map(Vec::len).sum();
         COUNTS.elsewhere.fetch_add(elsewhere as u64, std::sync::atomic::Ordering::Relaxed);
-        wanted.into_iter().map(|(page, old, _, _, known)| (page, old, known)).collect()
+        wanted
+            .into_iter()
+            .zip(shown)
+            .map(|((page, old, _, _, known, within), shown)| (page, old, known, shown, within))
+            .collect()
     };
     // Every page's bytes are read before any old page is written: an
     // address may show another lent page now (pages swapped or moved along
@@ -414,14 +456,19 @@ pub(crate) fn lend<'a>(
     // refuses a page the title decommitted instead of faulting.
     let read: Vec<Lent> = wanted
         .into_iter()
-        .filter_map(|(at, old, known)| {
+        .filter_map(|(at, old, known, shown, within)| {
             let old = old as *mut u8;
             let mut saved = vec![0u8; PAGE as usize];
             let mut put = vec![0u8; PAGE as usize];
-            let ok = crate::host::read_kernel(old, saved.as_mut_ptr(), saved.len())
-                && crate::host::read_into(at as *const u8, &mut put);
+            let kept = crate::host::read_kernel(old, saved.as_mut_ptr(), saved.len());
+            let ok = kept && crate::host::read_into(at as *const u8, &mut put);
             if !ok {
                 count(&COUNTS.unmapped);
+                // The address is unmapped: the GPU still reaches the old
+                // page, where its writes are undone after the run.
+                if kept {
+                    lending.kept.push(Kept { at, old, saved, shown, within });
+                }
                 return None;
             }
             // The same bytes with no view known: maybe this very page, whose
@@ -447,7 +494,7 @@ pub(crate) fn lend<'a>(
             count(&COUNTS.unmapped);
         }
     }
-    if !lending.pages.is_empty() {
+    if !lending.pages.is_empty() || !lending.kept.is_empty() {
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
             let get = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
@@ -459,7 +506,8 @@ pub(crate) fn lend<'a>(
                 unknown = get(&COUNTS.unknown),
                 same = get(&COUNTS.same),
                 conflicts = get(&COUNTS.conflicts),
-                "a submission reaches remapped title pages through in-place buffers recorded before the remap: their old pages lent the new bytes"
+                dropped = get(&COUNTS.dropped),
+                "a submission reaches remapped or unmapped title pages through in-place buffers recorded before: old pages lent the new bytes, or kept from GPU writes"
             );
         }
     }
@@ -478,6 +526,12 @@ impl Lending {
     /// its bytes back, then the writes go to the addresses: an address may
     /// show another lent page, which must hold its own bytes by then.
     fn undo(&mut self, gpu_ran: bool) {
+        // First: a lent page's give-back may write an address that shows
+        // a kept page.
+        let kept = std::mem::take(&mut self.kept);
+        if gpu_ran {
+            drop_writes(kept);
+        }
         let pages = std::mem::take(&mut self.pages);
         let written: Vec<Option<Vec<u8>>> = pages
             .iter()
@@ -506,6 +560,56 @@ impl Drop for Lending {
     /// Pages still lent (a submission that never ran) get their bytes back.
     fn drop(&mut self) {
         self.undo(false);
+    }
+}
+
+/// After the run, for pages lists reached through in-place addresses
+/// unmapped since they were recorded: what changed in the ranges they use
+/// gets its bytes back (the console's GPU faults on an unmapped address and
+/// writes nothing), so the memory other title addresses show there now
+/// keeps its bytes.
+fn drop_writes(kept: Vec<Kept>) {
+    for w in kept {
+        let mut now = vec![0u8; PAGE as usize];
+        if !crate::host::read_kernel(w.old, now.as_mut_ptr(), now.len()) {
+            continue;
+        }
+        let runs: Vec<(usize, usize)> = differing(&w.saved, &now)
+            .into_iter()
+            .flat_map(|(a, b)| w.within.iter().map(move |&(c, d)| (a.max(c), b.min(d))))
+            .filter(|(a, b)| a < b)
+            .collect();
+        if runs.is_empty() {
+            continue;
+        }
+        for &(from, to) in &runs {
+            // SAFETY: inside both pages.
+            crate::host::read_kernel(unsafe { w.saved.as_ptr().add(from) }, unsafe { w.old.add(from) }, to - from);
+        }
+        count(&COUNTS.dropped);
+        #[cfg(feature = "diagnostics")]
+        for &(from, to) in &runs {
+            for &b in &w.shown {
+                crate::trail::wrote(
+                    b as usize + from,
+                    to - from,
+                    "GPU writes undone: through an in-place address unmapped since",
+                    Some((w.at, PAGE)),
+                );
+            }
+        }
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+            let bytes: usize = runs.iter().map(|(a, b)| b - a).sum();
+            tracing::info!(
+                at = format_args!("{:#x}", w.at),
+                shown = format_args!("{:x?}", w.shown),
+                bytes,
+                runs = runs.len(),
+                first = format_args!("+{:#x}", runs[0].0),
+                "a list wrote an in-place address unmapped since it was recorded: its writes undone in the old page, which another address shows"
+            );
+        }
     }
 }
 
@@ -538,6 +642,8 @@ struct Counts {
     /// Not lent: no view known and the same bytes.
     same: std::sync::atomic::AtomicU64,
     conflicts: std::sync::atomic::AtomicU64,
+    /// Kept pages whose GPU writes were undone.
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 static COUNTS: Counts = Counts {
@@ -547,6 +653,7 @@ static COUNTS: Counts = Counts {
     unknown: std::sync::atomic::AtomicU64::new(0),
     same: std::sync::atomic::AtomicU64::new(0),
     conflicts: std::sync::atomic::AtomicU64::new(0),
+    dropped: std::sync::atomic::AtomicU64::new(0),
 };
 
 fn count(c: &std::sync::atomic::AtomicU64) {
@@ -1047,6 +1154,30 @@ mod tests {
         assert_eq!(unsafe { *out_data }, 0x22, "read what the address shows now");
         assert_eq!(pages.slot_byte(0, 256), 0x33, "wrote where the address shows now");
         assert_eq!((pages.page_byte(0, 0), pages.page_byte(0, 256)), (0x11, 0x11), "the old page keeps its bytes");
+    }
+
+    /// A list recorded over a title page used in place, submitted after the
+    /// runtime unmapped that address and mapped its old page at another:
+    /// what the list writes there does not reach the memory the other
+    /// address shows (the console's GPU faults on the unmapped address).
+    #[test]
+    fn a_list_recorded_before_an_unmap_writes_nothing_where_the_old_page_went() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let pages = Pages::new(2);
+        pages.map(0, 0);
+        let Some((list, copy, _out, _out_data, _src)) = record_over(host, &pages, &[0], &[0]) else {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        };
+        pages.unmap(0);
+        pages.map(1, 0);
+        assert!(copy.is_let_go());
+        host.execute(&[&list]);
+        assert_eq!(pages.slot_byte(1, 256), 0x11, "the other address keeps its bytes");
+        assert_eq!(pages.page_byte(0, 256), 0x11, "the old page keeps its bytes");
     }
 
     /// Two pages of one in-place buffer swapped by the runtime, a third left
