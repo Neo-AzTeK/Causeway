@@ -21,48 +21,6 @@ Each item names its problem in the ranked table below.
       without resets). On the next 0x10E or device removal: copy the dump
       and find which allocation the lock lacked before any fix
 
-- [x] `descriptor-slots` confirmed on `main`: two quiet world runs lose no
-      draw for lack of slots. The merge did not raise refusals. The pixel
-      programs refused for "a descriptor read only as data" are counted
-      under their own reason on every path, before and after the merge, and
-      lose the same per frame whenever they are on screen. Runs differ only
-      in how long that content stays on screen (same commit: short in one
-      run, long in the next). Refused work without them is the same on
-      both sides (problem notes, "Confirm: refusal shift")
-- [ ] The title's code reads a pointer of all ones from a loaded resource
-      and the run stops, in most world runs on `main` since lazy disk loads
-      (`title-read-minus-one`). The resource's page holds another load's
-      bytes. Two holes are fixed on the problem's branch, each with a test:
-      a lazy page was opened before its bytes were written, and a half-full
-      DirectStorage queue started a read whose page list the title had not
-      written yet (old page numbers: another load's memory written). A third
-      is fixed too: heap slots made over memory the GPU uses in place kept
-      the section's old pages after the title remapped it (made again only
-      when rewritten), so shaders wrote memory mapped elsewhere since. With
-      in-place sections off, two runs were clean, and lazy loads off still
-      crashed once. With all three fixes: one clean run, one crash of
-      another kind (a stack array indexed by a half float, the title's
-      read past its stack, as in `image-uncommitted-write`), two runs lost
-      to the machine running out of memory (next item). After a restart on
-      2026-11-28: 3 of 3 default runs of 300 s clean (trmo-h7-5,
-      trmo-leakfix-1, trmo-leakfix-2); merged into main. Those 3 were
-      luck: the same code crashed in 7 of 8 later runs, 3 of 3 right after
-      another restart (rb-d36-1..3). A fourth hole, fixed on branch
-      `claude/inplace-page-tables` with a test: lists recorded before a
-      remap read and wrote the old section page through their in-place
-      buffer, and the title moves pages, so the GPU wrote into another
-      resource's page; now the old page is lent the address's bytes for
-      the run. A fifth: lists recorded before an unmap wrote the old page,
-      shown elsewhere since; their writes are undone now (test). A sixth:
-      a copy opened between letting go and forgetting the view stayed on
-      the old page (test). A seventh: only declared ranges were lent, so
-      root views' writes past 1 MiB and heap-indexed views' writes to
-      remapped pages were lost (test). The "-1" reads are faults on
-      pointers the title's code replaced by half or f32 infinities (empty
-      bounding boxes) in memory no copy holds; in-place off: 7 of 8 clean,
-      none of this family. All seven merged into main (273d94d): 7 of 9
-      default 300 s runs clean on the last fixes; the crash left is problem
-      20 (`inplace-float-overwrite`)
 - [ ] With in-place sections on, the title's code still writes half or f32
       infinities (empty bounding boxes, after two -1 quadwords) over its
       own objects, then reads a pointer or an index from them and faults
@@ -76,18 +34,6 @@ Each item names its problem in the ranked table below.
       the title reads before such a write (heap slots over in-place copies
       used by heap-indexed shaders before they are made again, copy-queue
       writes to section memory), compared with in-place off
-- [ ] Every run with in-place sections left about the size of the title's
-      sections (7.5 GB) charged to system commit after the process exited,
-      held by no process until a restart (`inplace-commit-leak`): over a
-      session the machine ran out of commit and runs failed to allocate.
-      Cause shown by the probe `inplace::tests::section_commit_after_exit`
-      (no title): a 1 GiB section opened by handle
-      (`OpenExistingHeapFromFileMapping`) leaves 1 GiB after exit, heap
-      released or not; a view of it opened by address leaves nothing, and
-      both take the same physical memory. Fixed on the problem's branch:
-      section heaps are opened by address over a view of our own; the probe's
-      runtime path now leaves nothing, and two title runs on the fix left
-      system commit flat (trmo-leakfix-1/2); merged into main
 - [ ] The title's code wrote to memory reserved but never committed and the
       run stopped (0xc0000005 in the title's image, one quiet run of `main`
       before the `descriptor-slots` merge; `image-uncommitted-write`). Not a
@@ -96,10 +42,6 @@ Each item names its problem in the ranked table below.
       the stack's top. Find where the bad index came from; the crash report
       now names the reservation, the thread's stack and what the registers
       point at, for the next time it happens
-- [x] `victory-shader` test `direct_barycentrics_weigh_the_second_and_third_vertex`
-      failed on a host without barycentrics (GTX 1070) instead of skipping;
-      fixed on `main` (5ce24f1: `Host::has_barycentrics`, the test skips with
-      a message)
 
 - [ ] Find the pass that should put lit people and ground into the scene's
       colour before tonemap (`scene-blocker`). Traced on the newest build:
@@ -142,11 +84,6 @@ Each item names its problem in the ranked table below.
 - [ ] Refusals with no fix found yet (`untranslated-shaders`): structured
       buffer of unknown stride; a descriptor read as data (may need the
       descriptor heap's contents; that work is ours too)
-- [x] Look for fixes in forks not yet checked: `avatarmanz/VIctory-7900XTX`,
-      `DexNom/VIctory`: done 2026-11-27, best leads are x7900 wave32 shader
-      commits and DexNom `76749ce` (lane mask); list in the fork-scan notes
-      (developer's notes folder, `fork-scan.md`); x7900's `431cab5` is being
-      ported (`wave64-refusals`)
 - [ ] Reach one fixed test scene that every run can repeat (`scene-blocker`)
 - [ ] When shader changes stop: make pipelines ahead of time again, with the
       same build that plays (`compile-backlog`)
@@ -229,6 +166,27 @@ Each item names its problem in the ranked table below.
 
 Not seen to change the picture yet. Where each ran: `docs/adapters.md`.
 
+- [x] Pointers of all ones read from loaded resources (`title-read-minus-one`):
+      seven holes fixed, each with a test (lazy pages opened before their
+      bytes were written, DirectStorage reads started on unwritten page
+      lists, heap slots over in-place memory kept after a remap, lists
+      recorded before a remap or an unmap, a copy opened during an unmap,
+      undeclared writes to remapped pages); all merged into main (273d94d),
+      7 of 9 default 300 s runs clean on them (1 of 8 before). The crash
+      left is problem 20 (`inplace-float-overwrite`)
+- [x] In-place sections left their size charged to system commit after
+      exit (`inplace-commit-leak`): a section opened for the GPU by handle
+      stays charged (probe `inplace::tests::section_commit_after_exit`);
+      section heaps are opened by address over a view of our own (e28cfd7,
+      merged); two title runs left system commit flat
+- [x] `descriptor-slots` confirmed on `main`: two quiet world runs lose no
+      draw for lack of slots, and the merge did not raise refusals (problem
+      notes, "Confirm: refusal shift")
+- [x] `victory-shader` barycentrics test skips on a host without them
+      (5ce24f1, `Host::has_barycentrics`)
+- [x] Forks `avatarmanz/VIctory-7900XTX` and `DexNom/VIctory` scanned
+      (2026-11-27): leads in the developer's `fork-scan.md`; x7900's
+      `431cab5` is being ported (`wave64-refusals`)
 - [x] GPU timing times every command of long lists (`gpu-timing-stamps`):
       timestamps in chunks of 4,096 made as a list notes more commands; a
       command left without an end stamp is counted as not timed, never
