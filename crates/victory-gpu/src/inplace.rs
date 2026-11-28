@@ -341,6 +341,17 @@ struct Kept {
     within: Vec<(usize, usize)>,
 }
 
+/// What reaches one old page in [`lend`]: the title page whose buffer holds
+/// it, its section and offset, whether a view is known at the page, and the
+/// ranges every holder uses in it (offsets in the page).
+struct Reach {
+    page: u64,
+    section: usize,
+    offset: u64,
+    known: bool,
+    within: Vec<(usize, usize)>,
+}
+
 /// A page [`lend`] looks at: the page, its old page in our view, whether a
 /// view is known at the page, the title addresses that show the old page
 /// now, and the ranges the lists use in it (offsets in the page).
@@ -380,8 +391,8 @@ pub(crate) fn lend<'a>(
     let mut lending = Lending::default();
     let wanted: Vec<Wanted> = {
         let s = sections();
-        let mut wanted = Vec::new();
-        let mut taken: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        // By old page.
+        let mut taken: std::collections::BTreeMap<usize, Reach> = std::collections::BTreeMap::new();
         for (shadow, ranges) in uses {
             if !shadow.is_let_go() {
                 continue;
@@ -392,11 +403,14 @@ pub(crate) fn lend<'a>(
             let Some(view) = s.sections.get(&section).map(|x| x.view).filter(|&v| v != 0) else {
                 continue;
             };
-            // Every page of the buffer, not only the ranges the lists
-            // declare: a root view writes past its declared range, a
-            // heap-indexed view is not declared, and the console's GPU
-            // reaches each address through the page tables.
-            for page in (start..start + len).step_by(PAGE as usize) {
+            // From the lowest address the lists use to the buffer's end,
+            // not only the ranges they declare: a root view reaches past its
+            // declared range (the console's GPU reads each address through
+            // the page tables), and nothing below what they use.
+            let Some(lowest) = ranges.iter().map(|&(at, _)| at.max(start)).filter(|&at| at < start + len).min() else {
+                continue;
+            };
+            for page in (lowest / PAGE * PAGE..start + len).step_by(PAGE as usize) {
                 let page_offset = offset + (page - start);
                 let within: Vec<(usize, usize)> = ranges
                     .iter()
@@ -420,25 +434,35 @@ pub(crate) fn lend<'a>(
                     None => false,
                 };
                 let old = view + page_offset as usize;
-                // Two buffers lending one page different bytes: the first
-                // keeps it.
-                if let Some(&other) = taken.get(&old) {
-                    if other != page {
-                        count(&COUNTS.conflicts);
+                match taken.entry(old) {
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(Reach { page, section, offset: page_offset, known, within });
                     }
-                    continue;
+                    // Another holder of the same page: its ranges count too.
+                    std::collections::btree_map::Entry::Occupied(mut e) if e.get().page == page => {
+                        e.get_mut().within.extend(within);
+                    }
+                    // Two addresses reaching one old page: one whose address
+                    // shows another page (lent) goes before one with no view
+                    // (unmapped since, kept); between two lent, the first.
+                    std::collections::btree_map::Entry::Occupied(mut e) => {
+                        if known && !e.get().known {
+                            e.insert(Reach { page, section, offset: page_offset, known, within });
+                        } else if known {
+                            count(&COUNTS.conflicts);
+                        }
+                    }
                 }
-                taken.insert(old, page);
-                wanted.push((page, old, section, page_offset, known, within));
             }
         }
+        let wanted: Vec<(usize, Reach)> = taken.into_iter().collect();
         // `page` shows another page now, so a view holding the old one is
         // at another address: one pass over the views for all of them.
         let mut shown: Vec<Vec<u64>> = vec![Vec::new(); wanted.len()];
         for (&base, v) in &s.views {
-            for (w, shown) in wanted.iter().zip(&mut shown) {
-                if w.2 == v.section && v.offset <= w.3 && w.3 < v.offset + v.len {
-                    shown.push(base + (w.3 - v.offset));
+            for ((_, w), shown) in wanted.iter().zip(&mut shown) {
+                if w.section == v.section && v.offset <= w.offset && w.offset < v.offset + v.len {
+                    shown.push(base + (w.offset - v.offset));
                 }
             }
         }
@@ -447,7 +471,7 @@ pub(crate) fn lend<'a>(
         wanted
             .into_iter()
             .zip(shown)
-            .map(|((page, old, _, _, known, within), shown)| (page, old, known, shown, within))
+            .map(|((old, w), shown)| (w.page, old, w.known, shown, w.within))
             .collect()
     };
     // Every page's bytes are read before any old page is written: an
@@ -1215,6 +1239,51 @@ mod tests {
         host.execute(&[&list]);
         assert_eq!(pages.slot_byte(1, 256), 0x5a, "wrote where the address shows now");
         assert_eq!(pages.page_byte(1, 256), 0x22, "the old page keeps its bytes");
+    }
+
+    /// One section page used in place at two addresses by one list, the
+    /// first unmapped and the second mapped to another page before the
+    /// submission: the read at the second address sees the new page, in
+    /// whichever order the list's copies come (the unmapped address's claim
+    /// on the old page does not keep it from being lent).
+    #[test]
+    fn an_old_page_unmapped_at_one_address_is_still_lent_for_another() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let p = Pages::P as u64;
+        let pages = Pages::new(2);
+        pages.map(0, 0);
+        pages.map(1, 0);
+        let (Some(a), Some(c)) = (crate::shadow::find(pages.slot(0), 512), crate::shadow::find(pages.slot(1), 512)) else {
+            panic!("copies");
+        };
+        if a.placed_run().is_none() || c.placed_run().is_none() {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        }
+        assert_eq!((a.placed_run().unwrap().1, c.placed_run().unwrap().1), (p, p), "one page each");
+        let (out, out_data) = host.shared_buffer(p).expect("a host buffer");
+        // SAFETY: inside the host buffer.
+        unsafe { std::ptr::write_bytes(out_data, 0, 512) };
+        let list = host.new_list().unwrap();
+        a.refresh(&list, pages.slot(0), 256);
+        c.refresh(&list, pages.slot(1), 256);
+        // SAFETY: an open list; ranges inside the buffers.
+        unsafe {
+            list.list.CopyBufferRegion(&out, 0, &a.buffer, 0, 256);
+            list.list.CopyBufferRegion(&out, 256, &c.buffer, 0, 256);
+        }
+        list.close();
+        pages.unmap(0);
+        pages.unmap(1);
+        pages.map(1, 1);
+        assert!(a.is_let_go() && c.is_let_go());
+        host.execute(&[&list]);
+        // SAFETY: inside the host buffer; the GPU finished.
+        assert_eq!(unsafe { *out_data.add(256) }, 0x22, "the second address's read sees its new page");
+        assert_eq!(pages.page_byte(0, 0), 0x11, "the old page keeps its bytes");
     }
 
     /// A buffer first used while the runtime unmaps its view, between the
