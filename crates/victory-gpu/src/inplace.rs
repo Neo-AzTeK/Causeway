@@ -350,9 +350,10 @@ type Wanted = (u64, usize, bool, Vec<u64>, Vec<(usize, usize)>);
 /// ranges they use there (`uses`): the console's GPU reads a title address
 /// through the page tables when it runs, so a list recorded before the title
 /// remapped an address sees the new page. Ours hold a buffer placed on the
-/// section's old page (`crate::shadow::let_go`): for the run, that page
-/// takes the bytes the address shows now, and what the GPU writes there goes
-/// to the address afterwards ([`Lending::give_back`]). Where the address is
+/// section's old page (`crate::shadow::let_go`): for the run, each such
+/// page of the buffer, declared or not, takes the bytes its address shows
+/// now, and what the GPU writes there goes to the address afterwards
+/// ([`Lending::give_back`]). Where the address is
 /// unmapped now, the console's GPU faults and writes nothing; ours reaches
 /// the old page, which the title may show at another address by then: what
 /// the GPU changes there in the ranges the lists use goes back to the bytes
@@ -391,16 +392,11 @@ pub(crate) fn lend<'a>(
             let Some(view) = s.sections.get(&section).map(|x| x.view).filter(|&v| v != 0) else {
                 continue;
             };
-            let mut pages = std::collections::BTreeSet::new();
-            for &(at, n) in ranges {
-                let (from, to) = (at.max(start), at.saturating_add(n).min(start + len));
-                let mut page = from / PAGE * PAGE;
-                while page < to {
-                    pages.insert(page);
-                    page += PAGE;
-                }
-            }
-            for page in pages {
+            // Every page of the buffer, not only the ranges the lists
+            // declare: a root view writes past its declared range, a
+            // heap-indexed view is not declared, and the console's GPU
+            // reaches each address through the page tables.
+            for page in (start..start + len).step_by(PAGE as usize) {
                 let page_offset = offset + (page - start);
                 let within: Vec<(usize, usize)> = ranges
                     .iter()
@@ -414,9 +410,13 @@ pub(crate) fn lend<'a>(
                 // runtime is mapping right now, between `forget` and
                 // `title_memory_section`, which may show this page again)
                 // it is lent only if the address shows other bytes (below).
+                // Pages with no view and no declared use (mostly addresses
+                // unmapped since) are left: their GPU writes are undone only
+                // in the ranges declared (`Kept`).
                 let known = match shown_now(&s.views, page) {
                     Some(now) if now == (section, page_offset) => continue,
                     Some(_) => true,
+                    None if within.is_empty() => continue,
                     None => false,
                 };
                 let old = view + page_offset as usize;
@@ -466,7 +466,7 @@ pub(crate) fn lend<'a>(
                 count(&COUNTS.unmapped);
                 // The address is unmapped: the GPU still reaches the old
                 // page, where its writes are undone after the run.
-                if kept {
+                if kept && !within.is_empty() {
                     lending.kept.push(Kept { at, old, saved, shown, within });
                 }
                 return None;
@@ -1178,6 +1178,43 @@ mod tests {
         host.execute(&[&list]);
         assert_eq!(pages.slot_byte(1, 256), 0x11, "the other address keeps its bytes");
         assert_eq!(pages.page_byte(0, 256), 0x11, "the old page keeps its bytes");
+    }
+
+    /// A list recorded over two pages used in place, whose shader writes a
+    /// page the list did not declare (a root view's write past its declared
+    /// range, a heap-indexed view), submitted after the runtime mapped
+    /// another page there: the write follows the address too.
+    #[test]
+    fn an_undeclared_write_after_a_remap_follows_the_address() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        let p = Pages::P;
+        let pages = Pages::new(3);
+        pages.map(0, 0);
+        pages.map(1, 1);
+        let copy = crate::shadow::find(pages.slot(0), 512).expect("a copy");
+        let Some((start, len, _, _)) = copy.placed_run() else {
+            eprintln!("skipped: the device does not open sections in place");
+            return;
+        };
+        assert_eq!((start, len), (pages.slot(0), 2 * p as u64), "placed over both pages");
+        let (src, src_data) = host.shared_buffer(p as u64).expect("a host buffer");
+        // SAFETY: inside the host buffer.
+        unsafe { std::ptr::write_bytes(src_data, 0x5a, 256) };
+        let list = host.new_list().unwrap();
+        // Declared: page 0 only.
+        copy.gpu_writes(&list, pages.slot(0), 256, false);
+        // SAFETY: an open list; ranges inside the buffers.
+        unsafe { list.list.CopyBufferRegion(&copy.buffer, (p + 256) as u64, &src, 0, 256) };
+        list.close();
+        pages.unmap(1);
+        pages.map(1, 2);
+        assert!(copy.is_let_go());
+        host.execute(&[&list]);
+        assert_eq!(pages.slot_byte(1, 256), 0x5a, "wrote where the address shows now");
+        assert_eq!(pages.page_byte(1, 256), 0x22, "the old page keeps its bytes");
     }
 
     /// A buffer first used while the runtime unmaps its view, between the
