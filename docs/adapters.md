@@ -13,7 +13,7 @@ validator is not an adapter.
 | Adapter | Wave | Mesh shaders | Binding tier | View heap | Title last run | Tests last run |
 |---------|------|--------------|--------------|-----------|----------------|----------------|
 | NVIDIA RTX 2060 SUPER (Turing, 8 GB), driver 32.0.16.1088 | 32 only | native (tier 1) | 3 | large (title's slots kept) | 2026-11-27, diagnostics build, not through smoke; result not recorded | `victory-shader` 2026-11-27; `victory-gpu` not run with that day's changes |
-| NVIDIA GTX 1070 (Pascal, 8 GB) | 32 only | none: made as compute | 3 | capped at 1,000,000 slots | 2026-11-25 (smoke) | none recorded since |
+| NVIDIA GTX 1070 (Pascal, 8 GB), driver 32.0.15.8278 | 32 only | none: made as compute | 3 | capped at 1,000,000 slots | 2026-11-25 (smoke) | `victory-shader` 2026-11-27 |
 
 The RTX 2060 SUPER is the adapter of the current development machine
 (`victory.hardware.toml`, ignored by git, lists a machine's own). The driver
@@ -31,7 +31,7 @@ it shows neither vendor behaviour nor speed.
 | mesh programs made as compute | GTX 1070, while the path was still being built | any other card without mesh shaders |
 | large view heap | RTX 2060 SUPER | whether other drivers accept it |
 | capped view heap and slot pool | GTX 1070 | other small-heap drivers |
-| console wave of 64 as two waves of 32 | RTX 2060 SUPER (shader tests); not recorded for the GTX 1070 | a host with real waves of 64 |
+| console wave of 64 as two waves of 32 | RTX 2060 SUPER and GTX 1070 (shader tests) | a host with real waves of 64 |
 | programs that require a wave of 64 | refused on both | any host that can run them |
 | 64-bit atomics on heap resources | GTX 1070 reports them | inferred for the others: no caps dump of the RTX 2060 SUPER is kept |
 
@@ -78,3 +78,4 @@ run on a new adapter or driver:
 2. Add a change to "Newer changes" with what has **not** been shown.
 3. A new adapter: add its row, and add its caps to `caps::reference` as
    `docs/hardware-range.md` describes ("Testing a path without the hardware").
+| first-lane reads of values alike in a console wave take each host wave's own lane | tests, three of them on the GPU (GTX 1070); validator and census | effect in the title; the RTX 2060 SUPER |
