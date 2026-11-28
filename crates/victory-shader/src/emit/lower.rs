@@ -22,6 +22,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
 pub(super) mod linear;
+mod uniform;
 
 type Why = &'static str;
 
@@ -34,8 +35,9 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Why a compute program of waves of 64 asks the host for them.
-    pub wave64_why: Option<Why>,
+    /// Why a compute program of waves of 64 asks the host for them, with
+    /// the instruction whose exchange between host waves was refused.
+    pub wave64_why: Option<String>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -112,21 +114,31 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     loop {
         let l = Lower::new(parts, &bad, virt);
         let tried = l.virt;
+        let refused = l.refused.clone();
         match l.run() {
             Ok(mut l) => {
                 l.wave64_why = failed.or(l.wave64_why);
                 return Ok(l);
             }
             Err(Stop::Fail(e)) if tried => {
-                failed = Some(match e {
+                let what = match e {
                     ShaderError::Unsupported { what, .. } => what,
                     _ => "two halves that do not lower",
+                };
+                // The failure may surface at a later use of the value a
+                // refused exchange left missing: name the first exchange
+                // refused for that reason (the one that failed, unless an
+                // earlier one's value went unused).
+                let name = refused.borrow().iter().find(|r| r.0 == what).map(|r| r.1);
+                failed = Some(match name {
+                    Some(name) => format!("{what}: {name}"),
+                    None => what.to_owned(),
                 });
                 virt = false;
                 bad.clear();
             }
             Err(Stop::Retry(v, why)) if tried && bad.contains_key(&v) => {
-                failed = Some(why);
+                failed = Some(why.to_owned());
                 virt = false;
                 bad.clear();
             }
@@ -264,8 +276,17 @@ struct Lower<'a> {
     /// Several console waves per group (module `linear`).
     linear: Option<linear::Linear>,
     wave64_why: Option<Why>,
+    /// The instruction being lowered (its name), and each one whose
+    /// exchange between host waves was refused, with the reason: [`lower`]
+    /// names the first with the reason the program fails for.
+    inst: &'a str,
+    refused: std::rc::Rc<std::cell::RefCell<Vec<(Why, &'a str)>>>,
     /// IR blocks every lane runs exactly once.
     common: Vec<bool>,
+    /// With `virt`: VGPR values alike in every lane of a console wave
+    /// ([`uniform::lane_uniform`]); a first-lane read of one needs nothing
+    /// from the other host wave.
+    uniform: uniform::Uniform,
     /// With `virt`, made in the entry block: whether this host wave is the
     /// console wave's upper half (0 or 1), and its first exchange slot.
     halves: Option<(V, V)>,
@@ -274,6 +295,9 @@ struct Lower<'a> {
     has_upper: Option<V>,
     /// Where the exchange slots start in the group-shared memory.
     xbase: u32,
+    /// Whether the exchange slots are the top of the program's own
+    /// group-shared memory, kept and put back by each exchange.
+    borrowed: bool,
     /// Depth of code only some lanes run (`begin_guarded`).
     guarded: u32,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
@@ -606,6 +630,7 @@ impl<'a> Lower<'a> {
         let mut virt = false;
         let mut wave64_why = None;
         let mut xbase = 0;
+        let mut borrowed = false;
         let mut lockstep = HashSet::new();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -684,11 +709,16 @@ impl<'a> Lower<'a> {
                     };
                     // Per console wave: 2 pair slots, then 64 lane slots.
                     // Several waves also vote: a slot each. All of it comes
-                    // after the program's own, in the host's 32 KiB.
+                    // after the program's own, in the host's 32 KiB; where
+                    // that leaves too little, in the top of the program's
+                    // own, which each exchange keeps and puts back
+                    // (`borrow_slot`). A program whose own is larger than
+                    // the host's would not be created.
                     let waves = threads.div_ceil(64);
                     let extra = waves * if waves > 1 { 67 } else { 66 };
+                    let borrow = s.lds_dwords + extra > HOST_LDS_DWORDS;
                     let steps = steps.and_then(|at| {
-                        if s.lds_dwords + extra > HOST_LDS_DWORDS {
+                        if s.lds_dwords > HOST_LDS_DWORDS {
                             Err("no room in shared memory for two halves to exchange")
                         } else {
                             Ok(at)
@@ -699,8 +729,13 @@ impl<'a> Lower<'a> {
                         lockstep.extend(at);
                         virt = true;
                         s.wave_size = Some(32);
-                        xbase = s.lds_dwords;
-                        s.lds_extra = extra;
+                        if borrow {
+                            borrowed = true;
+                            xbase = s.lds_dwords - extra;
+                        } else {
+                            xbase = s.lds_dwords;
+                            s.lds_extra = extra;
+                        }
                     }
                 } else if !enough && wave == 64 && threads > 1024 {
                     wave64_why = Some("a group of more than 1024 threads");
@@ -805,6 +840,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             virt,
             wave64_why,
+            inst: "",
+            refused: Default::default(),
             linear: linear::new(x.p, x.st, x.native),
             // With the halves together, every thread of a group of one
             // console wave runs every block the same number of times.
@@ -813,9 +850,15 @@ impl<'a> Lower<'a> {
             } else {
                 super::lockstep::common(&p.blocks)
             },
+            uniform: if virt {
+                uniform::lane_uniform(p, x.st, uniform::wave_tid(x.native, x.io))
+            } else {
+                uniform::Uniform::none()
+            },
             halves: None,
             has_upper: None,
             xbase,
+            borrowed,
             guarded: 0,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
@@ -1639,7 +1682,7 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
-            wave64_why: self.wave64_why,
+            wave64_why: self.wave64_why.map(str::to_owned),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3301,17 +3344,18 @@ impl<'a> Lower<'a> {
     fn exchange(&mut self, at: usize, ir: usize, x: V, absent: V) -> Result<(V, V), Why> {
         let (half, slot0) = self.halves.ok_or("an exchange between host waves")?;
         if !self.common[ir] {
-            return Err(if super::lockstep::looped(&self.x.p.blocks, ir) {
+            return Err(self.refuse(if super::lockstep::looped(&self.x.p.blocks, ir) {
                 "an exchange between host waves in a loop"
             } else {
                 "an exchange between host waves in a block a branch skips"
-            });
+            }));
         }
         if at == self.cur && self.guarded > 0 {
-            return Err("an exchange between host waves under a lane's guard");
+            return Err(self.refuse("an exchange between host waves under a lane's guard"));
         }
         let lds = self.s.lds();
         let mine = self.s.m.bin(at, Bin::Add, slot0, half);
+        let kept = self.borrow_slot(at, mine);
         let p = self.s.m.element(at, lds, mine);
         self.s.m.store(at, p, x);
         let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
@@ -3330,7 +3374,42 @@ impl<'a> Lower<'a> {
         // Reads done before the next exchange writes.
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.return_slot(at, mine, kept);
         Ok((a, b))
+    }
+
+    /// With `borrowed`: what the program holds in `slot`, which this thread
+    /// is about to write for an exchange; read once every thread's earlier
+    /// accesses are done, and before any thread writes. Every thread runs
+    /// it. Give it back with [`Self::return_slot`] after the exchange's last
+    /// barrier.
+    pub(super) fn borrow_slot(&mut self, at: usize, slot: V) -> Option<V> {
+        if !self.borrowed {
+            return None;
+        }
+        let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let lds = self.s.lds();
+        let p = self.s.m.element(at, lds, slot);
+        let kept = self.s.m.load(at, p);
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        Some(kept)
+    }
+
+    /// What [`Self::borrow_slot`] kept, back in `slot` before the program
+    /// goes on. (Two threads that wrote one slot put back the same value.)
+    pub(super) fn return_slot(&mut self, at: usize, slot: V, kept: Option<V>) {
+        let Some(kept) = kept else {
+            return;
+        };
+        let lds = self.s.lds();
+        let p = self.s.m.element(at, lds, slot);
+        self.s.m.store(at, p, kept);
+        let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// Whether the two host waves must decide the branch on `when` together:
@@ -3382,20 +3461,28 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.cmp(c, pred::NE, both, zero))
     }
 
+    /// `why`, an exchange between host waves refused at the instruction
+    /// being lowered, noted so that the reason the program asks for waves
+    /// of 64 can name it ([`lower`]).
+    fn refuse(&self, why: Why) -> Why {
+        self.refused.borrow_mut().push((why, self.inst));
+        why
+    }
+
     /// With `virt`: `x` of console lane `lane` (of this console wave), by a
     /// group-shared slot per lane; the same conditions as [`Self::exchange`].
     fn share_lane(&mut self, ir: usize, x: V, lane: V) -> Result<V, Why> {
         let c = self.cur;
         let (half, slot0) = self.halves.ok_or("a lane read across host waves")?;
         if !self.common[ir] {
-            return Err(if super::lockstep::looped(&self.x.p.blocks, ir) {
+            return Err(self.refuse(if super::lockstep::looped(&self.x.p.blocks, ir) {
                 "a lane read across host waves in a loop"
             } else {
                 "a lane read across host waves in a block a branch skips"
-            });
+            }));
         }
         if self.guarded > 0 {
-            return Err("a lane read across host waves under a lane's guard");
+            return Err(self.refuse("a lane read across host waves under a lane's guard"));
         }
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (base, one, k5, k63) = (k(self, self.xbase), k(self, 1), k(self, 5), k(self, 63));
@@ -3412,6 +3499,7 @@ impl<'a> Lower<'a> {
         let me = self.s.m.bin(c, Bin::Add, me, up);
         let lds = self.s.lds();
         let mine = self.s.m.bin(c, Bin::Add, first, me);
+        let kept = self.borrow_slot(c, mine);
         let p = self.s.m.element(c, lds, mine);
         self.s.m.store(c, p, x);
         let (mode, void) = (self.s.m.i32(1 | 8), self.s.t.void);
@@ -3423,6 +3511,7 @@ impl<'a> Lower<'a> {
         let r = self.s.m.load(c, p);
         self.s
             .op(c, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.return_slot(c, mine, kept);
         Ok(r)
     }
 
@@ -3860,6 +3949,7 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        self.inst = name;
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
@@ -3882,6 +3972,7 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
+        let off = self.linear_memory(b, &inst.fields);
         if matches!(inst.fields, Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }) {
             self.mark_reads((b, i));
         }
@@ -3912,15 +4003,16 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } => Err("flat memory"),
         };
         match r {
-            Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Ok(()) => {}
+            Err(why) if effect => return Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
-                Ok(())
             }
         }
+        self.linear_memory_end(off, inst);
+        Ok(())
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
@@ -6901,6 +6993,16 @@ impl<'a> Lower<'a> {
                     .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
             {
                 // A waterfall loop's read of a descriptor dword: the lane's own.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
+            "v_readfirstlane_b32"
+                if self.virt
+                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.own_first_lane(x, self.cur_ir))) =>
+            {
+                // Alike in every lane of the console wave: the lane's own
+                // value is its first lane's, in either host wave.
                 let a = s(self, 0)?;
                 int(self, a)
             }

@@ -3,7 +3,8 @@
 
 use super::host::{Host, Stride, View};
 use super::image_tests::{
-    build, check, run, run_on, translate, translate_group, translate_together, translate_with,
+    build, check, run, run_on, translate, translate_group, translate_halves, translate_together,
+    translate_with,
 };
 use crate::native::ResourceType;
 
@@ -846,7 +847,21 @@ fn a_mask_set_to_a_constant_then_a_compare_joins_in_wave64() {
 fn two_halves_with_lds(body: &[u32], threads: u32) -> Option<Vec<u32>> {
     let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
     let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, threads, 1).unwrap();
-    check(&shader);
+    stored_by_halves(&shader, threads)
+}
+
+/// [`two_halves_with_lds`] with the halves on their own conditions only
+/// (never following the console's wave together).
+fn halves_alone_with_lds(body: &[u32], threads: u32) -> Option<Vec<u32>> {
+    let words = [&STORE_SETUP[..], body, &STORE[..]].concat();
+    let shader = translate_halves(&words, threads).unwrap();
+    stored_by_halves(&shader, threads)
+}
+
+/// What each of `threads` threads of `shader` stored, which must ask the
+/// host for waves of 32, on hardware with such waves.
+fn stored_by_halves(shader: &super::HostShader, threads: u32) -> Option<Vec<u32>> {
+    check(shader);
     assert_eq!(
         crate::emit::required_waves(&shader.dxil),
         Some((32, 32)),
@@ -859,7 +874,7 @@ fn two_halves_with_lds(body: &[u32], threads: u32) -> Option<Vec<u32>> {
     }
     let dummy = [[0.0f32; 4]];
     let views = [View::Texture(1, 1, &dummy), View::RawUav(threads.max(64))];
-    let mut out = run_on(&shader, &views, &[("hardware", false)]);
+    let mut out = run_on(shader, &views, &[("hardware", false)]);
     Some(out.remove(0).1.remove(0)[..threads as usize].to_vec())
 }
 
@@ -1253,9 +1268,16 @@ const TRIPS: [u32; 9] = [
 /// different trip counts, the last with its lower half only): v8 of each lane
 /// is `want` of its wave's trip count.
 fn waves_of_different_trips(body: &[u32], want: impl Fn(u32) -> u32) {
+    waves_of_different_trips_in(body, 1, want);
+}
+
+/// [`waves_of_different_trips`] with `blocks` blocks of 128 dwords of LDS.
+fn waves_of_different_trips_in(body: &[u32], blocks: u32, want: impl Fn(u32) -> u32) {
     for threads in [96u32, 160] {
-        let words = [&TRIPS[..], body].concat();
-        if let Some(got) = two_halves_with_lds(&words, threads) {
+        let words = [&STORE_SETUP[..], &TRIPS[..], body, &STORE[..]].concat();
+        let shader =
+            translate_group(&words, (ResourceType::Srv, 8, 0), true, threads, blocks).unwrap();
+        if let Some(got) = stored_by_halves(&shader, threads) {
             let want: Vec<u32> = (0..threads).map(|l| want(l / 64 + 1)).collect();
             assert_eq!(got, want, "{threads} threads");
         }
@@ -1298,6 +1320,45 @@ fn a_wave_of_a_wider_group_breaks_out_of_a_loop() {
         0x4A10_100F, // v_add_nc_u32 v8, s15, v8
     ];
     waves_of_different_trips(&body, |n| n + 5 * (n - 1) + 64 * (n - 1) * n);
+}
+
+/// [`a_wave_of_a_wider_group_breaks_out_of_a_loop`] where the program's LDS
+/// takes all of the host's 32 KiB: the group's vote and the lane reads
+/// borrow its top, and the 7 each lane keeps in two dwords there (which
+/// hold every slot) outlives the loop.
+#[test]
+fn a_wave_of_a_wider_group_breaks_out_of_a_loop_with_full_shared_memory() {
+    let body = [
+        0x7E02_0287, // v_mov_b32 v1, 7
+        0x3422_0081, // v_lshlrev_b32 v17, 1, v0
+        0x4C22_22FF,
+        0x0000_1FFE, // v_sub_nc_u32 v17, 8190, v17 (two top dwords a lane)
+        0x3422_2282, // v_lshlrev_b32 v17, 2, v17
+        0xD834_0000,
+        0x0000_0111, // ds_write_b32 v17, v1
+        0xD834_0004,
+        0x0000_0111, // ds_write_b32 v17, v1 offset:4
+        0xD760_0012,
+        0x0001_0100, // v_readlane_b32 s18, v0, 0 (an exchange in the loop)
+        LANE_SUM,
+        0x8114_8114, // s_add_i32 s20, s20, 1
+        0x4A10_1081, // v_add_nc_u32 v8, 1, v8
+        0xBF06_0E14, // s_cmp_eq_u32 s20, s14
+        0xBF85_0003, // s_cbranch_scc1 -> out
+        0x810F_850F, // s_add_i32 s15, s15, 5
+        0xBF0A_8814, // s_cmp_lt_u32 s20, 8
+        0xBF85_FFF6, // s_cbranch_scc1 -> the pass
+        ADD_LANE_SUM,
+        0x4A10_100F, // v_add_nc_u32 v8, s15, v8
+        0xD8D8_0000,
+        0x0200_0011, // ds_read_b32 v2, v17
+        0xD8D8_0004,
+        0x0300_0011, // ds_read_b32 v3, v17 offset:4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A10_1102, // v_add_nc_u32 v8, v2, v8
+        0x4A10_1103, // v_add_nc_u32 v8, v3, v8
+    ];
+    waves_of_different_trips_in(&body, 64, |n| n + 5 * (n - 1) + 64 * (n - 1) * n + 14);
 }
 
 /// Three passes of an outer loop, an inner one of each wave's own length in
@@ -1360,31 +1421,261 @@ fn a_wave_of_a_wider_group_writes_no_shared_memory_where_it_is_off() {
     }
 }
 
-/// A program whose shared memory leaves no room for the two halves'
-/// exchanges asks for waves of 64: a larger one would not be created.
+/// The two halves' slots take 134 dwords for 128 threads:
+/// past the program's own with 62 blocks of 128, in its top where it takes
+/// all 64 (the host's 32 KiB). Each lane writes its id + 1 to two dwords of
+/// the program's top 256, which hold every slot; reads its wave's lane mask
+/// of `id < 64` as a number (the halves exchange their parts) and lane 0's
+/// id (a lane read across them); then reads both dwords back: the program's
+/// values outlive both either way. With 65 blocks the program's own is over
+/// the host's 32 KiB: it is not run as two halves.
 #[test]
-fn a_wave64_program_with_full_shared_memory_asks_for_waves_of_64() {
+fn a_wave64_program_keeps_its_shared_memory_across_exchanges() {
+    let threads = 128;
+    for blocks in [62, 64, 65] {
+        let body = [
+            0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+            0x3422_0081, // v_lshlrev_b32 v17, 1, v0
+            0x4C22_22FF,
+            blocks * 128 - 2, // v_sub_nc_u32 v17, top - 1, v17 (two dwords a lane)
+            0x3422_2282,      // v_lshlrev_b32 v17, 2, v17
+            0xD834_0000,
+            0x0000_0111, // ds_write_b32 v17, v1
+            0xD834_0004,
+            0x0000_0111, // ds_write_b32 v17, v1 offset:4
+            0x7D88_00C0, // v_cmp_gt_u32 vcc, 64, v0
+            0xBE8F_106A, // s_bcnt1_i32_b64 s15, vcc (the mask as a number)
+            0xD760_000E,
+            0x0001_0100, // v_readlane_b32 s14, v0, 0 (the console wave's first id)
+            0xD8D8_0000,
+            0x0800_0011, // ds_read_b32 v8, v17
+            0xD8D8_0004,
+            0x0200_0011, // ds_read_b32 v2, v17 offset:4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A10_1102, // v_add_nc_u32 v8, v2, v8
+            0x4A10_100E, // v_add_nc_u32 v8, s14, v8
+            0x4A10_100F, // v_add_nc_u32 v8, s15, v8
+        ];
+        let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+        let shader =
+            translate_group(&words, (ResourceType::Srv, 8, 0), true, threads, blocks).unwrap();
+        if blocks > 64 {
+            // (The validator refuses that size whatever the halves do.)
+            assert_eq!(
+                crate::emit::required_waves(&shader.dxil),
+                Some((64, 64)),
+                "{:?}",
+                shader.wave64_why
+            );
+            assert!(shader.wave64_why.is_some());
+            continue;
+        }
+        if let Some(got) = stored_by_halves(&shader, threads) {
+            let want: Vec<u32> = (0..threads)
+                .map(|l| 2 * (l + 1) + l / 64 * 64 + if l < 64 { 64 } else { 0 })
+                .collect();
+            assert_eq!(got, want, "{blocks} blocks");
+        }
+    }
+}
+
+/// The prefix of wave totals the console's structure builder computes: each
+/// console wave of a 256-thread group writes its total (10 + its index) to
+/// LDS, then, under `if (id >> 6 != 0)`, loops over the totals of the waves
+/// before it with lanes leaving at their own wave's index, reading the
+/// running sum's first lane (`v_readfirstlane`) every iteration. The total is
+/// read from the wave's last lane first, a read across the two host waves.
+/// `region` goes first under the `if`. Every thread stores the sum of the
+/// waves before its own: 0, 10, 10 + 11, 10 + 11 + 12.
+/// Adapted from avatarmanz/VIctory-7900XTX 431cab5.
+fn wave_prefix(region: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let skip = 0x11 + region.len() as u32;
     let body = [
-        0xD760_000E,
-        0x0001_0100, // v_readlane_b32 s14, v0, 0
-        0x4A10_100E, // v_add_nc_u32 v8, s14, v8
+        &[
+            0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0     (the console wave's index)
+            0x3410_0E82, // v_lshlrev_b32 v8, 2, v7
+            0x4A12_0E8A, // v_add_nc_u32 v9, 10, v7
+            0xD760_0013,
+            0x0201_7F09, // v_readlane_b32 s19, v9, 63 (the wave's last lane)
+            0x7E12_0213, // v_mov_b32 v9, s19
+            0xD834_0000,
+            0x0000_0908,        // ds_write_b32 v8, v9
+            0xBF8C_C07F,        // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000,        // s_barrier
+            0x7E10_0280,        // v_mov_b32 v8, 0
+            0xBE80_047E,        // s_mov_b64 s[0:1], exec
+            0x7DAA_0E80,        // v_cmpx_ne_u32 0, v7
+            0xBF88_0000 | skip, // s_cbranch_execz END
+        ][..],
+        region,
+        &[
+            0xBE86_047E, // s_mov_b64 s[6:7], exec
+            0xBE92_0380, // s_mov_b32 s18, 0
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xBF82_0002, // s_branch BODY
+            0x87FE_0614, // LOOPTOP: s_and_b64 exec, s[20:21], s[6:7]
+            0x7E22_0508, // v_readfirstlane_b32 s17, v8
+            0x8F10_8212, // BODY: s_lshl_b32 s16, s18, 2
+            0x8112_8112, // s_add_i32 s18, s18, 1
+            0x7E10_0210, // v_mov_b32 v8, s16
+            0xD8D8_0000,
+            0x0800_0008, // ds_read_b32 v8, v8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A10_1011, // v_add_nc_u32 v8, s17, v8
+            0xBE94_047E, // s_mov_b64 s[20:21], exec
+            0x7DA4_0E12, // v_cmpx_eq_u32 s18, v7
+            0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+            0xBF85_FFF3, // s_cbranch_scc1 LOOPTOP
+            0xBEFE_0400, // END: s_mov_b64 exec, s[0:1]
+        ],
+    ]
+    .concat();
+    let want = (0..256u32)
+        .map(|t| (0..t / 64).map(|w| 10 + w).sum())
+        .collect();
+    (body, want)
+}
+
+/// The condition and the sum are alike in every lane of a console wave, so
+/// each host wave takes its own first lane, where an exchange (in a loop)
+/// would be refused. With both halves following the console's wave.
+#[test]
+fn a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop() {
+    let (body, want) = wave_prefix(&[]);
+    if let Some(got) = two_halves_with_lds(&body, 256) {
+        assert_eq!(got, want);
+    }
+}
+
+/// [`a_first_lane_read_of_a_wave_alike_sum_under_a_wave_alike_loop`] with
+/// the halves on their own conditions (not following the console's wave), as
+/// in the console's structure builder when it took that form: each lane on
+/// its own conditions.
+#[test]
+fn a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own() {
+    let (body, want) = wave_prefix(&[]);
+    if let Some(got) = halves_alone_with_lds(&body, 256) {
+        assert_eq!(got, want);
+    }
+}
+
+/// [`a_first_lane_read_of_a_wave_alike_sum_in_a_loop_of_lanes_on_their_own`]
+/// (the halves on their own) with the sum kept in v11 (no first-lane read in
+/// the loop) and odd lanes
+/// going round once more (to their own wave's total), then a first-lane read
+/// of the sum after the loop: the halves exchange there, and the console's
+/// first lane (an even one) gives every lane the sum of the waves before its
+/// own. (The sum needs itself, so it is never proven alike.)
+#[test]
+fn a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane() {
+    let (mut body, want) = wave_prefix(&[
+        0x3614_0081, // v_and_b32 v10, 1, v0
+        0x4A14_0F0A, // v_add_nc_u32 v10, v10, v7
+    ]);
+    for (old, new) in [
+        (0x7E10_0280, 0x7E16_0280), // v_mov_b32 v11, 0 (for v8)
+        (0x7E22_0508, 0xBF80_0000), // s_nop 0 (for the first-lane read)
+        (0x4A10_1011, 0x4A16_110B), // v_add_nc_u32 v11, v11, v8
+        (0x7DA4_0E12, 0x7DA4_1412), // v_cmpx_eq_u32 s18, v10
+    ] {
+        let at = body.iter().position(|&w| w == old).unwrap();
+        body[at] = new;
+    }
+    body.extend([
+        0x7E3C_050B, // v_readfirstlane_b32 s30, v11
+        0x7E10_021E, // v_mov_b32 v8, s30
+    ]);
+    if let Some(got) = halves_alone_with_lds(&body, 256) {
+        assert_eq!(got, want);
+    }
+}
+
+/// The loop of [`a_first_lane_read_after_a_loop_lanes_leave_apart_takes_the_first_lane`]
+/// alone, the halves on their own: its first-lane read is not taken per host
+/// wave, since each half would carry its own last result out of a loop its
+/// lanes leave apart; the exchange it needs cannot be in a loop there, so
+/// that form asks for waves of 64.
+#[test]
+fn a_first_lane_read_in_a_loop_lanes_leave_apart_is_not_taken_per_half() {
+    let (mut body, _) = wave_prefix(&[
+        0x3614_0081, // v_and_b32 v10, 1, v0
+        0x4A14_0F0A, // v_add_nc_u32 v10, v10, v7
+    ]);
+    let exit = body.iter().position(|&w| w == 0x7DA4_0E12).unwrap();
+    body[exit] = 0x7DA4_1412; // v_cmpx_eq_u32 s18, v10
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    let shader = translate_halves(&words, 256).unwrap();
+    assert_eq!(
+        crate::emit::required_waves(&shader.dxil),
+        Some((64, 64)),
+        "{:?}",
+        shader.wave64_why
+    );
+}
+
+/// The loop of [`a_first_lane_read_in_a_loop_lanes_leave_apart_is_not_taken_per_half`]
+/// with a scalar load in the block the first console wave skips: the halves
+/// on their own refuse it, so the group runs every block, the first wave off
+/// in that one (module `linear`), its load not made. Each lane's first-lane
+/// read is the console's; even lanes leave with the sum of the waves before
+/// their own, odd lanes, a round later, with their own wave's total added;
+/// the first wave stores 0.
+// shortcut: the load's result is unused, so nothing here shows that a wave
+// that is on gets it after the guarded code.
+#[test]
+fn a_first_lane_read_in_a_loop_lanes_leave_apart_and_a_load_take_both_halves_together() {
+    let (mut body, _) = wave_prefix(&[
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20 (unused)
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3614_0081, // v_and_b32 v10, 1, v0
+        0x4A14_0F0A, // v_add_nc_u32 v10, v10, v7
+    ]);
+    let exit = body.iter().position(|&w| w == 0x7DA4_0E12).unwrap();
+    body[exit] = 0x7DA4_1412; // v_cmpx_eq_u32 s18, v10
+    let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
+    assert_eq!(
+        crate::emit::required_waves(&translate_halves(&words, 256).unwrap().dxil),
+        Some((64, 64)),
+        "the halves on their own"
+    );
+    let want: Vec<u32> = (0..256u32)
+        .map(|t| match t / 64 {
+            0 => 0,
+            w => (0..w + t % 2).map(|j| 10 + j).sum(),
+        })
+        .collect();
+    if let Some(got) = two_halves_with_lds(&body, 256) {
+        assert_eq!(got, want);
+    }
+}
+
+/// A value a loop's head writes from its counter, with the upper 32 lanes
+/// going round once more, then a first-lane read of it after the loop: each
+/// lane holds its own last iteration's value, and the console's first lane
+/// (lane 0, which left first) gives every lane 0, the upper host wave too.
+/// (A lane read first makes the console wave two halves of one wave.)
+#[test]
+fn a_loop_counter_copy_read_after_lanes_leave_apart_takes_the_first_lane() {
+    let body = [
+        0xD760_0013,
+        0x0201_7F00, // v_readlane_b32 s19, v0, 63 (unused)
+        0x2C06_0085, // v_lshrrev_b32 v3, 5, v0
+        0x4A06_0681, // v_add_nc_u32 v3, 1, v3
+        0xBE82_0380, // s_mov_b32 s2, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7E02_0202, // L: v_mov_b32 v1, s2
+        0x8002_8102, // s_add_u32 s2, s2, 1
+        0x7DA2_0602, // v_cmpx_lt_u32 s2, v3
+        0xBF89_FFFC, // s_cbranch_execnz L
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E3C_0501, // v_readfirstlane_b32 s30, v1
+        0x7E10_021E, // v_mov_b32 v8, s30
     ];
     let words = [&STORE_SETUP[..], &body, &STORE[..]].concat();
-    // 96 threads take 134 dwords: 62 blocks of 128 leave room, 63 do not.
-    for (blocks, waves) in [(62, (32, 32)), (63, (64, 64))] {
-        let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 96, blocks).unwrap();
-        check(&shader);
-        assert_eq!(
-            crate::emit::required_waves(&shader.dxil),
-            Some(waves),
-            "{blocks} blocks: {:?}",
-            shader.wave64_why
-        );
-        assert_eq!(
-            shader.wave64_why.is_some(),
-            waves == (64, 64),
-            "{blocks} blocks: {:?}",
-            shader.wave64_why
-        );
+    let shader = translate_group(&words, (ResourceType::Srv, 8, 0), true, 64, 0).unwrap();
+    assert_eq!(crate::emit::required_waves(&shader.dxil), Some((32, 32)));
+    if let Some(got) = on_waves_of_32(&body, 64) {
+        assert_eq!(got, vec![0; 64]);
     }
 }

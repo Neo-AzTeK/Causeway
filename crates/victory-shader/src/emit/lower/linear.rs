@@ -12,16 +12,22 @@
 //! Loops (reducible ones) are laid out contiguously, and the whole group goes
 //! round again while any of its waves takes a back edge: the one group vote.
 //! A header's joins keep their value in a wave that did not take a back edge.
-// shortcut: no memory access but LDS in a block some wave may be off in (it
-// is not guarded yet, and an address a branch protects may fault).
+//!
+//! An off wave's scalars in a block were never computed, so in a block some
+//! wave may be off in, its memory accesses other than LDS (scalar, image,
+//! buffer, global) run only where it is on: none of their results would be
+//! used, and an address a branch protects may fault. What they write is 0
+//! in an off wave.
+// shortcut: an off wave's LDS accesses run at whatever address it holds, as
+// a lane outside a guard's does; LDS has no fault.
 
 use std::collections::HashMap;
 
-use super::{Lower, Stop, Why, unsupported};
+use super::{Lower, Stop, Val, Why, unsupported};
 use crate::emit::bitcode::hold::HeldLoop;
 use crate::emit::bitcode::{Attr, Bin, Term, V, pred};
 use crate::gfx10::Fields;
-use crate::ir::{self, Program};
+use crate::ir::{self, Inst, Program};
 use crate::native::{NativeProgram, StageIo};
 use crate::structure::{LaneExit, Structured};
 
@@ -102,8 +108,17 @@ fn layout(p: &Program) -> Result<Layout, &'static str> {
     Ok(Layout { order, loops })
 }
 
+/// Code [`Lower::linear_memory`] began: where it started and its join, and
+/// the lane masks read as data before it.
+pub(super) struct Memory {
+    at: Option<(usize, usize)>,
+    ballots: std::collections::HashSet<ir::Value>,
+}
+
 pub(crate) struct Linear {
     layout: Layout,
+    /// By IR block: some wave of the group may be off in it.
+    skipped: Vec<bool>,
     /// By (from, to) block: whether this wave went that way.
     took: HashMap<(usize, usize), V>,
     /// Whether this wave is on in the block being lowered; `None`: all are.
@@ -137,6 +152,7 @@ pub(super) fn new(p: &Program, st: &Structured, native: &NativeProgram) -> Optio
     // (A program with no layout is never asked to run this way: `supports`.)
     Some(Linear {
         layout: layout(p).ok()?,
+        skipped: crate::emit::lockstep::common(&p.blocks).iter().map(|c| !c).collect(),
         took: HashMap::new(),
         on: None,
         header_on: HashMap::new(),
@@ -150,19 +166,7 @@ pub(super) fn new(p: &Program, st: &Structured, native: &NativeProgram) -> Optio
 
 /// Whether a program can run this way: `Err` names why not.
 pub(crate) fn supports(p: &Program) -> Result<(), &'static str> {
-    let common = crate::emit::lockstep::common(&p.blocks);
-    for b in layout(p)?.order {
-        let guarded = |f: &Fields| {
-            matches!(
-                f,
-                Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Valu(_) | Fields::Ds { .. }
-            )
-        };
-        if !common[b] && !p.blocks[b].insts.iter().all(|i| guarded(&i.fields)) {
-            return Err("memory access in a block some waves of the group skip");
-        }
-    }
-    Ok(())
+    layout(p).map(|_| ())
 }
 
 impl Lower<'_> {
@@ -337,6 +341,7 @@ impl Lower<'_> {
         let k = self.s.m.i32(first);
         let slot = self.s.m.bin(at, Bin::Add, k, wave);
         let mine = self.s.m.select(at, mine, one, zero);
+        let kept = self.borrow_slot(at, slot);
         let lds = self.s.lds();
         let p = self.s.m.element(at, lds, slot);
         self.s.m.store(at, p, mine);
@@ -353,7 +358,58 @@ impl Lower<'_> {
         // Reads done before the next vote writes.
         self.s
             .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.return_slot(at, slot, kept);
         Ok(self.s.m.cmp(at, pred::NE, any, zero))
+    }
+
+    /// Before the instruction with `fields` in block `b`: where some wave
+    /// may be off in it and the instruction accesses memory other than LDS,
+    /// the code that runs only where this wave is on (module notes); end it
+    /// with [`Self::linear_memory_end`].
+    pub(super) fn linear_memory(&mut self, b: usize, fields: &Fields) -> Option<Memory> {
+        let memory = matches!(
+            fields,
+            Fields::Smem { .. } | Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
+        );
+        let on = self.linear.as_ref().filter(|l| memory && l.skipped[b])?.on?;
+        let ballots = self.ballots.keys().copied().collect();
+        Some(Memory {
+            at: self.begin_guarded(Some(on)),
+            ballots,
+        })
+    }
+
+    /// After the instruction `inst` that [`Self::linear_memory`] began:
+    /// what it wrote is 0 where this wave is off.
+    pub(super) fn linear_memory_end(&mut self, memory: Option<Memory>, inst: &Inst) {
+        let Some(Memory { at, ballots }) = memory else {
+            return;
+        };
+        // Lane masks read as data inside, kept by value: made there, they
+        // would be used outside it.
+        self.ballots.retain(|v, _| ballots.contains(v));
+        let mut written = Vec::new();
+        let mut pairs = Vec::new();
+        for &(_, v) in &inst.writes {
+            // Kept forms of the value made inside would be used outside it.
+            self.floats.remove(&v);
+            self.low16.remove(&v);
+            let off = match self.vals.get(&v) {
+                Some(&Val::I32(x)) => (x, self.s.m.i32(0)),
+                Some(&Val::Bit(x)) => (x, self.s.m.bool(false)),
+                _ => continue,
+            };
+            written.push(v);
+            pairs.push(off);
+        }
+        let phis = self.end_guarded(at, &pairs);
+        for (v, phi) in written.into_iter().zip(phis) {
+            let val = match self.vals[&v] {
+                Val::Bit(_) => Val::Bit(phi),
+                _ => Val::I32(phi),
+            };
+            self.vals.insert(v, val);
+        }
     }
 
     /// An instruction's guard `g`, which holds only in a wave that is on.

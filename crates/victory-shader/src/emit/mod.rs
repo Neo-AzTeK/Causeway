@@ -718,7 +718,7 @@ fn emit_once(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
-        wave64_why: l.wave64_why.map(str::to_owned),
+        wave64_why: l.wave64_why,
     })
 }
 
